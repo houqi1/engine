@@ -79,4 +79,6 @@ private:
   bool imguiReady_ = false;
   bool showUi_ = true;
   bool showShadows_ = true;
+  // Positive bias samples lower-res mips sooner (shader bias; MoltenVK lacks samplerMipLodBias).
+  float mipLodBias_ = 0.5f;
 };

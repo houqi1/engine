@@ -19,6 +19,9 @@ layout(set = 0, binding = 0, std140) uniform FrameUBO {
     float lightIntensity;
     vec3 ambientColor;
     float shadowBias;
+    float mipLodBias;
+    float _pad2;
+    float _pad3;
 } frame;
 
 layout(set = 0, binding = 1) uniform sampler2D shadowMap;
@@ -87,9 +90,8 @@ float ShadowPCF(vec4 lightSpacePos) {
 
 void main() {
     // Positive bias picks lower mips sooner — reduces ground moiré on grazing angles.
-    // (Sampler mipLodBias is unavailable under MoltenVK portability.)
-    const float kMipLodBias = 0.5;
-    vec4 albedoSample = texture(albedoMap, vUV, kMipLodBias) * material.baseColorFactor;
+    // (Sampler mipLodBias is unavailable under MoltenVK portability; bias comes from FrameUBO.)
+    vec4 albedoSample = texture(albedoMap, vUV, frame.mipLodBias) * material.baseColorFactor;
     vec3 albedo = albedoSample.rgb;
     float metallic = material.metallic;
     float roughness = max(material.roughness, 0.04);

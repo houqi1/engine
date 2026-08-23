@@ -470,6 +470,7 @@ void Renderer::updateFrameUBO(Scene& scene, uint32_t frameIndex) {
   ubo.lightIntensity = scene.light().intensity;
   writeVec3(ubo.ambientColor, scene.light().ambient);
   ubo.shadowBias = scene.light().shadowBias;
+  ubo.mipLodBias = mipLodBias_;
   std::memcpy(frames_[frameIndex].frameUBO.info.pMappedData, &ubo, sizeof(ubo));
 }
 
@@ -735,6 +736,7 @@ void Renderer::recordImGui(VkCommandBuffer cmd, const FrameContext& /*frame*/, S
   ImGui::Text("FPS: %.1f", fps);
   ImGui::Text("GPU: Apple / MoltenVK path");
   ImGui::Checkbox("Shadows", &showShadows_);
+  ImGui::DragFloat("Mip LOD Bias", &mipLodBias_, 0.01f, -2.0f, 4.0f);
   ImGui::Separator();
   ImGui::Text("Light");
   ImGui::DragFloat3("Direction", &scene.light().direction.x, 0.01f);

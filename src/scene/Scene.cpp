@@ -9,7 +9,7 @@
 void Scene::init(GfxDevice& gfx) {
   cube_ = MeshFactory::createCube(gfx);
   plane_ = MeshFactory::createPlane(gfx, 24.0f);
-  sphere_ = MeshFactory::createSphere(gfx, 0.75f, 32);
+  sphere_ = MeshFactory::createSphere(gfx, 0.75f, 48);
 
   checker_ = TextureFactory::createCheckerboard(gfx, 512, 32);
   white_ = TextureFactory::createSolid(gfx, 0.85f, 0.85f, 0.88f);

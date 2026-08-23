@@ -109,12 +109,13 @@ Mesh createSphere(GfxDevice& gfx, float radius, int segments) {
       const uint32_t i1 = i0 + 1;
       const uint32_t i2 = i0 + (segments + 1);
       const uint32_t i3 = i2 + 1;
+      // CCW when viewed from outside (matches cube/plane; +theta then +phi).
       indices.push_back(i0);
-      indices.push_back(i2);
-      indices.push_back(i1);
       indices.push_back(i1);
       indices.push_back(i2);
+      indices.push_back(i1);
       indices.push_back(i3);
+      indices.push_back(i2);
     }
   }
 

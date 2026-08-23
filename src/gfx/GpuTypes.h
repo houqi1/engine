@@ -40,6 +40,9 @@ struct FrameUBO {
   float lightIntensity;
   float ambientColor[3];
   float shadowBias;
+  float mipLodBias;
+  float pad2;
+  float pad3;
 };
 
 struct MaterialUBO {
