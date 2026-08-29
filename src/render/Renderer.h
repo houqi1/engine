@@ -18,9 +18,10 @@ public:
 
   void init(Scene& scene);
   void resize();
-  void draw(Scene& scene, float dt, float fps);
+  void draw(Scene& scene, float dt, float displayFps);
 
   bool showUi() const { return showUi_; }
+  const FrameStats& frameStats() const { return stats_; }
 
 private:
   struct FrameResources {
@@ -43,11 +44,18 @@ private:
   void shutdownImGui();
   void ensureMaterialSet(Material* material);
   void updateFrameUBO(Scene& scene, uint32_t frameIndex);
-  void recordImGui(VkCommandBuffer cmd, const FrameContext& frame, Scene& scene, float fps);
+  void recordGrass(VkCommandBuffer cmd, VkPipeline pipeline, VkPipelineLayout layout,
+                   VkDescriptorSet frameSet, Scene& scene, bool shadowPass);
+  void recordImGui(VkCommandBuffer cmd, const FrameContext& frame, Scene& scene);
+  void createTimestampPool();
+  void destroyTimestampPool();
+  void writeTimestamp(VkCommandBuffer cmd, uint32_t queryIndex, VkPipelineStageFlags2 stage) const;
+  void collectGpuTiming(uint32_t frameIndex);
 
   glm::mat4 computeLightViewProj(const Scene& scene) const;
 
   GfxDevice& gfx_;
+  FrameStats stats_{};
 
   VkDescriptorSetLayout frameLayout_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout materialLayout_ = VK_NULL_HANDLE;
@@ -57,9 +65,13 @@ private:
   VkPipelineLayout meshPipelineLayout_ = VK_NULL_HANDLE;
   VkPipelineLayout shadowPipelineLayout_ = VK_NULL_HANDLE;
   VkPipelineLayout tonemapPipelineLayout_ = VK_NULL_HANDLE;
+  VkPipelineLayout grassPipelineLayout_ = VK_NULL_HANDLE;
+  VkPipelineLayout grassShadowPipelineLayout_ = VK_NULL_HANDLE;
   VkPipeline meshPipeline_ = VK_NULL_HANDLE;
   VkPipeline shadowPipeline_ = VK_NULL_HANDLE;
   VkPipeline tonemapPipeline_ = VK_NULL_HANDLE;
+  VkPipeline grassPipeline_ = VK_NULL_HANDLE;
+  VkPipeline grassShadowPipeline_ = VK_NULL_HANDLE;
 
   AllocatedImage depthImage_{};
   AllocatedImage hdrImage_{};
@@ -81,4 +93,8 @@ private:
   bool showShadows_ = true;
   // Positive bias samples lower-res mips sooner (shader bias; MoltenVK lacks samplerMipLodBias).
   float mipLodBias_ = 0.5f;
+
+  VkQueryPool timestampPool_ = VK_NULL_HANDLE;
+  float timestampPeriodNs_ = 1.0f;
+  std::array<bool, GfxDevice::kFramesInFlight> timestampPending_{};
 };

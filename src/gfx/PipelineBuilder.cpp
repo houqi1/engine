@@ -24,7 +24,16 @@ PipelineBuilder& PipelineBuilder::setShaders(VkShaderModule vert, VkShaderModule
 PipelineBuilder& PipelineBuilder::setVertexInput(
     const VkVertexInputBindingDescription& binding,
     const std::vector<VkVertexInputAttributeDescription>& attrs) {
-  binding_ = binding;
+  bindings_ = {binding};
+  attributes_ = attrs;
+  hasVertexInput_ = true;
+  return *this;
+}
+
+PipelineBuilder& PipelineBuilder::setVertexInput(
+    const std::vector<VkVertexInputBindingDescription>& bindings,
+    const std::vector<VkVertexInputAttributeDescription>& attrs) {
+  bindings_ = bindings;
   attributes_ = attrs;
   hasVertexInput_ = true;
   return *this;
@@ -87,8 +96,8 @@ VkPipeline PipelineBuilder::build(VkDevice device) const {
   VkPipelineVertexInputStateCreateInfo vertexInput{};
   vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
   if (hasVertexInput_) {
-    vertexInput.vertexBindingDescriptionCount = 1;
-    vertexInput.pVertexBindingDescriptions = &binding_;
+    vertexInput.vertexBindingDescriptionCount = static_cast<uint32_t>(bindings_.size());
+    vertexInput.pVertexBindingDescriptions = bindings_.data();
     vertexInput.vertexAttributeDescriptionCount = static_cast<uint32_t>(attributes_.size());
     vertexInput.pVertexAttributeDescriptions = attributes_.data();
   }

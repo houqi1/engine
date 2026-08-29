@@ -1,9 +1,13 @@
 cmake_minimum_required(VERSION 3.20)
 project(vulkan_engine LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+
+if(MSVC)
+  add_compile_options(/utf-8)
+endif()
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(VE_ENABLE_VALIDATION "Enable Vulkan validation layers in Debug builds" ON)
@@ -47,6 +51,7 @@ set(VE_SOURCES
   src/gfx/Mesh.cpp
   src/gfx/Texture.cpp
   src/scene/Scene.cpp
+  src/scene/GrassSystem.cpp
   src/render/Renderer.cpp
   ${imgui_SOURCE_DIR}/imgui.cpp
   ${imgui_SOURCE_DIR}/imgui_draw.cpp
@@ -57,6 +62,11 @@ set(VE_SOURCES
 )
 
 add_executable(vulkan_engine ${VE_SOURCES})
+
+# Windows: use GUI subsystem so closing a console window does not kill the app.
+if(MSVC)
+  target_link_options(vulkan_engine PRIVATE "/SUBSYSTEM:WINDOWS" "/ENTRY:mainCRTStartup")
+endif()
 
 target_include_directories(vulkan_engine PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -98,6 +108,10 @@ set(VE_SHADER_SOURCES
   shadow.frag
   fullscreen.vert
   tonemap.frag
+  grass.vert
+  grass.frag
+  grass_shadow.vert
+  grass_shadow.frag
 )
 
 set(VE_SPV_FILES "")
@@ -119,9 +133,11 @@ add_dependencies(vulkan_engine ve_shaders)
 
 target_compile_definitions(vulkan_engine PRIVATE VE_SHADER_DIR="${VE_SHADER_OUTPUT_DIR}")
 
-add_custom_command(TARGET vulkan_engine POST_BUILD
-  COMMAND ${CMAKE_COMMAND} -E copy_if_different
-    ${CMAKE_BINARY_DIR}/compile_commands.json
-    ${CMAKE_SOURCE_DIR}/compile_commands.json
-  COMMENT "Updating compile_commands.json"
-)
+if(CMAKE_EXPORT_COMPILE_COMMANDS AND EXISTS "${CMAKE_BINARY_DIR}/compile_commands.json")
+  add_custom_command(TARGET vulkan_engine POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      ${CMAKE_BINARY_DIR}/compile_commands.json
+      ${CMAKE_SOURCE_DIR}/compile_commands.json
+    COMMENT "Updating compile_commands.json"
+  )
+endif()

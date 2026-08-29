@@ -141,17 +141,80 @@ void GfxDevice::selectDevice() {
   features.fillModeNonSolid = VK_TRUE;
 
   vkb::PhysicalDeviceSelector selector{instance_};
-  auto physRet = selector.set_surface(surface_)
-                     .set_minimum_version(1, 3)
-                     .set_required_features(features)
-                     .set_required_features_13(features13)
-                     .prefer_gpu_device_type(vkb::PreferredDeviceType::discrete)
-                     .allow_any_gpu_device_type(true)
-                     .select();
-  if (!physRet) {
-    fail(std::string("Failed to select physical device: ") + physRet.error().message());
+  auto devicesRet = selector.set_surface(surface_)
+                        .set_minimum_version(1, 3)
+                        .set_required_features(features)
+                        .set_required_features_13(features13)
+                        .prefer_gpu_device_type(vkb::PreferredDeviceType::discrete)
+                        .allow_any_gpu_device_type(true)
+                        .select_devices();
+  if (!devicesRet) {
+    fail(std::string("Failed to enumerate suitable GPUs: ") + devicesRet.error().message());
   }
-  physicalDevice_ = physRet.value();
+
+  const auto& devices = devicesRet.value();
+  if (devices.empty()) {
+    fail("No suitable Vulkan 1.3 GPU found");
+  }
+
+  std::cout << "Available GPUs (" << devices.size() << "):\n";
+  for (size_t i = 0; i < devices.size(); ++i) {
+    const auto& d = devices[i];
+    const char* type = "other";
+    switch (d.properties.deviceType) {
+      case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:
+        type = "discrete";
+        break;
+      case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU:
+        type = "integrated";
+        break;
+      case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU:
+        type = "virtual";
+        break;
+      case VK_PHYSICAL_DEVICE_TYPE_CPU:
+        type = "cpu";
+        break;
+      default:
+        break;
+    }
+    std::cout << "  [" << i << "] " << d.properties.deviceName << " (" << type << ")\n";
+  }
+
+  auto scoreDevice = [](const vkb::PhysicalDevice& d) {
+    int score = 0;
+    const std::string name = d.properties.deviceName ? d.properties.deviceName : "";
+    if (d.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
+      score += 1000;
+    }
+    // Prefer NVIDIA RTX on this machine when multiple devices are suitable.
+    if (name.find("NVIDIA") != std::string::npos || name.find("RTX") != std::string::npos ||
+        name.find("GeForce") != std::string::npos) {
+      score += 500;
+    }
+    if (name.find("4060") != std::string::npos) {
+      score += 100;
+    }
+    // Deprioritize Intel iGPU when a discrete option exists.
+    if (name.find("Intel") != std::string::npos &&
+        d.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
+      score -= 200;
+    }
+    return score;
+  };
+
+  size_t bestIndex = 0;
+  int bestScore = scoreDevice(devices[0]);
+  for (size_t i = 1; i < devices.size(); ++i) {
+    const int s = scoreDevice(devices[i]);
+    if (s > bestScore) {
+      bestScore = s;
+      bestIndex = i;
+    }
+  }
+
+  physicalDevice_ = devices[bestIndex];
+  deviceName_ = physicalDevice_.properties.deviceName ? physicalDevice_.properties.deviceName
+                                                       : "Unknown GPU";
 
   auto devRet = vkb::DeviceBuilder{physicalDevice_}.build();
   if (!devRet) {
@@ -171,7 +234,13 @@ void GfxDevice::selectDevice() {
   }
   graphicsQueueFamily_ = familyRet.value();
 
-  std::cout << "Using GPU: " << physicalDevice_.properties.deviceName << std::endl;
+  std::cout << "Using GPU: " << deviceName_ << std::endl;
+  {
+    std::ofstream log("vulkan_engine.log", std::ios::app);
+    if (log) {
+      log << "Using GPU: " << deviceName_ << '\n';
+    }
+  }
 }
 
 void GfxDevice::createAllocator() {

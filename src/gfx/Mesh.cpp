@@ -124,6 +124,64 @@ Mesh createSphere(GfxDevice& gfx, float radius, int segments) {
   return mesh;
 }
 
+Mesh createGrassBlade(GfxDevice& gfx, int segments) {
+  segments = std::max(segments, 2);
+  std::vector<Vertex> verts;
+  std::vector<uint32_t> indices;
+  verts.reserve(static_cast<size_t>(segments + 1) * 2);
+  indices.reserve(static_cast<size_t>(segments) * 6);
+
+  constexpr float height = 1.0f;
+  constexpr float halfWidth = 0.045f;
+
+  for (int i = 0; i <= segments; ++i) {
+    const float t = static_cast<float>(i) / static_cast<float>(segments);
+    const float y = t * height;
+    const float widthScale = (1.0f - t) * (1.0f - t * 0.35f);
+    const float x = halfWidth * widthScale;
+
+    Vertex left{};
+    left.position[0] = -x;
+    left.position[1] = y;
+    left.position[2] = 0.0f;
+    left.normal[0] = 0.0f;
+    left.normal[1] = 0.0f;
+    left.normal[2] = 1.0f;
+    left.uv[0] = 0.0f;
+    left.uv[1] = t;
+
+    Vertex right{};
+    right.position[0] = x;
+    right.position[1] = y;
+    right.position[2] = 0.0f;
+    right.normal[0] = 0.0f;
+    right.normal[1] = 0.0f;
+    right.normal[2] = 1.0f;
+    right.uv[0] = 1.0f;
+    right.uv[1] = t;
+
+    verts.push_back(left);
+    verts.push_back(right);
+  }
+
+  for (int i = 0; i < segments; ++i) {
+    const uint32_t i0 = static_cast<uint32_t>(i * 2);
+    const uint32_t i1 = i0 + 1;
+    const uint32_t i2 = i0 + 2;
+    const uint32_t i3 = i0 + 3;
+    indices.push_back(i0);
+    indices.push_back(i2);
+    indices.push_back(i1);
+    indices.push_back(i1);
+    indices.push_back(i2);
+    indices.push_back(i3);
+  }
+
+  Mesh mesh;
+  uploadMesh(gfx, mesh, verts, indices);
+  return mesh;
+}
+
 void destroy(GfxDevice& gfx, Mesh& mesh) {
   gfx.destroyBuffer(mesh.vertexBuffer);
   gfx.destroyBuffer(mesh.indexBuffer);

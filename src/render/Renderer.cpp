@@ -9,6 +9,7 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
 
+#include <chrono>
 #include <cstring>
 #include <stdexcept>
 
@@ -47,6 +48,7 @@ Renderer::Renderer(GfxDevice& gfx) : gfx_(gfx) {}
 Renderer::~Renderer() {
   gfx_.waitIdle();
   shutdownImGui();
+  destroyTimestampPool();
 
   for (auto& frame : frames_) {
     gfx_.destroyBuffer(frame.frameUBO);
@@ -66,6 +68,12 @@ Renderer::~Renderer() {
   if (tonemapPipeline_) {
     vkDestroyPipeline(gfx_.device(), tonemapPipeline_, nullptr);
   }
+  if (grassPipeline_) {
+    vkDestroyPipeline(gfx_.device(), grassPipeline_, nullptr);
+  }
+  if (grassShadowPipeline_) {
+    vkDestroyPipeline(gfx_.device(), grassShadowPipeline_, nullptr);
+  }
   if (meshPipelineLayout_) {
     vkDestroyPipelineLayout(gfx_.device(), meshPipelineLayout_, nullptr);
   }
@@ -74,6 +82,12 @@ Renderer::~Renderer() {
   }
   if (tonemapPipelineLayout_) {
     vkDestroyPipelineLayout(gfx_.device(), tonemapPipelineLayout_, nullptr);
+  }
+  if (grassPipelineLayout_) {
+    vkDestroyPipelineLayout(gfx_.device(), grassPipelineLayout_, nullptr);
+  }
+  if (grassShadowPipelineLayout_) {
+    vkDestroyPipelineLayout(gfx_.device(), grassShadowPipelineLayout_, nullptr);
   }
   if (frameLayout_) {
     vkDestroyDescriptorSetLayout(gfx_.device(), frameLayout_, nullptr);
@@ -96,10 +110,63 @@ Renderer::~Renderer() {
   }
 }
 
+void Renderer::createTimestampPool() {
+  VkPhysicalDeviceProperties props{};
+  vkGetPhysicalDeviceProperties(gfx_.physicalDevice(), &props);
+  timestampPeriodNs_ = props.limits.timestampPeriod;
+
+  VkQueryPoolCreateInfo info{};
+  info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+  info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+  info.queryCount = GfxDevice::kFramesInFlight * 2;
+  if (vkCreateQueryPool(gfx_.device(), &info, nullptr, &timestampPool_) != VK_SUCCESS) {
+    throw std::runtime_error("Failed to create timestamp query pool");
+  }
+  timestampPending_.fill(false);
+}
+
+void Renderer::destroyTimestampPool() {
+  if (timestampPool_) {
+    vkDestroyQueryPool(gfx_.device(), timestampPool_, nullptr);
+    timestampPool_ = VK_NULL_HANDLE;
+  }
+}
+
+void Renderer::writeTimestamp(VkCommandBuffer cmd, uint32_t queryIndex,
+                              VkPipelineStageFlags2 stage) const {
+  if (!timestampPool_) {
+    return;
+  }
+  vkCmdWriteTimestamp2(cmd, stage, timestampPool_, queryIndex);
+}
+
+void Renderer::collectGpuTiming(uint32_t frameIndex) {
+  if (!timestampPool_ || !timestampPending_[frameIndex]) {
+    return;
+  }
+
+  const uint32_t firstQuery = frameIndex * 2;
+  uint64_t stamps[2] = {0, 0};
+  const VkResult result =
+      vkGetQueryPoolResults(gfx_.device(), timestampPool_, firstQuery, 2, sizeof(stamps), stamps,
+                            sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
+  if (result != VK_SUCCESS) {
+    return;
+  }
+
+  const double deltaTicks = static_cast<double>(stamps[1] - stamps[0]);
+  const float gpuMs = static_cast<float>(deltaTicks * static_cast<double>(timestampPeriodNs_) * 1e-6);
+  // EMA so the UI is readable.
+  constexpr float alpha = 0.1f;
+  stats_.gpuFrameMs = stats_.gpuFrameMs * (1.0f - alpha) + gpuMs * alpha;
+  timestampPending_[frameIndex] = false;
+}
+
 void Renderer::init(Scene& scene) {
   createDescriptors();
   createRenderTargets();
   createShadowResources();
+  createTimestampPool();
   createPipelines();
 
   for (auto& frame : frames_) {
@@ -317,11 +384,20 @@ void Renderer::createPipelines() {
   VkShaderModule shadowFrag = gfx_.loadShaderModule(shaderDir + "/shadow.frag.spv");
   VkShaderModule fsVert = gfx_.loadShaderModule(shaderDir + "/fullscreen.vert.spv");
   VkShaderModule tonemapFrag = gfx_.loadShaderModule(shaderDir + "/tonemap.frag.spv");
+  VkShaderModule grassVert = gfx_.loadShaderModule(shaderDir + "/grass.vert.spv");
+  VkShaderModule grassFrag = gfx_.loadShaderModule(shaderDir + "/grass.frag.spv");
+  VkShaderModule grassShadowVert = gfx_.loadShaderModule(shaderDir + "/grass_shadow.vert.spv");
+  VkShaderModule grassShadowFrag = gfx_.loadShaderModule(shaderDir + "/grass_shadow.frag.spv");
 
   VkPushConstantRange pushRange{};
   pushRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
   pushRange.offset = 0;
   pushRange.size = sizeof(PushConstants);
+
+  VkPushConstantRange grassPush{};
+  grassPush.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+  grassPush.offset = 0;
+  grassPush.size = sizeof(GrassPushConstants);
 
   {
     VkDescriptorSetLayout layouts[] = {frameLayout_, materialLayout_};
@@ -349,6 +425,17 @@ void Renderer::createPipelines() {
     info.setLayoutCount = 1;
     info.pSetLayouts = &tonemapLayout_;
     vkCreatePipelineLayout(gfx_.device(), &info, nullptr, &tonemapPipelineLayout_);
+  }
+  {
+    VkDescriptorSetLayout layouts[] = {frameLayout_};
+    VkPipelineLayoutCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    info.setLayoutCount = 1;
+    info.pSetLayouts = layouts;
+    info.pushConstantRangeCount = 1;
+    info.pPushConstantRanges = &grassPush;
+    vkCreatePipelineLayout(gfx_.device(), &info, nullptr, &grassPipelineLayout_);
+    vkCreatePipelineLayout(gfx_.device(), &info, nullptr, &grassShadowPipelineLayout_);
   }
 
   const auto binding = vertexBinding();
@@ -386,12 +473,50 @@ void Renderer::createPipelines() {
                          .setLayout(tonemapPipelineLayout_)
                          .build(gfx_.device());
 
+  const std::vector<VkVertexInputBindingDescription> grassBindings = {
+      binding,
+      {1, static_cast<uint32_t>(sizeof(GrassInstance)), VK_VERTEX_INPUT_RATE_INSTANCE},
+  };
+  const std::vector<VkVertexInputAttributeDescription> grassAttrs = {
+      {0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, position)},
+      {1, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, normal)},
+      {2, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(Vertex, uv)},
+      {3, 1, VK_FORMAT_R32G32B32_SFLOAT, offsetof(GrassInstance, position)},
+      {4, 1, VK_FORMAT_R32_SFLOAT, offsetof(GrassInstance, yaw)},
+      {5, 1, VK_FORMAT_R32G32B32_SFLOAT, offsetof(GrassInstance, color)},
+      {6, 1, VK_FORMAT_R32_SFLOAT, offsetof(GrassInstance, scale)},
+  };
+
+  grassPipeline_ = PipelineBuilder()
+                       .setShaders(grassVert, grassFrag)
+                       .setVertexInput(grassBindings, grassAttrs)
+                       .setCullMode(VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE)
+                       .setDepthTest(true, true, VK_COMPARE_OP_GREATER_OR_EQUAL)
+                       .setColorFormat(kHdrFormat)
+                       .setDepthFormat(kDepthFormat)
+                       .setLayout(grassPipelineLayout_)
+                       .build(gfx_.device());
+
+  grassShadowPipeline_ = PipelineBuilder()
+                             .setShaders(grassShadowVert, grassShadowFrag)
+                             .setVertexInput(grassBindings, grassAttrs)
+                             .setCullMode(VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE)
+                             .setDepthTest(true, true, VK_COMPARE_OP_LESS_OR_EQUAL)
+                             .disableColorWrite()
+                             .setDepthFormat(kDepthFormat)
+                             .setLayout(grassShadowPipelineLayout_)
+                             .build(gfx_.device());
+
   vkDestroyShaderModule(gfx_.device(), meshVert, nullptr);
   vkDestroyShaderModule(gfx_.device(), meshFrag, nullptr);
   vkDestroyShaderModule(gfx_.device(), shadowVert, nullptr);
   vkDestroyShaderModule(gfx_.device(), shadowFrag, nullptr);
   vkDestroyShaderModule(gfx_.device(), fsVert, nullptr);
   vkDestroyShaderModule(gfx_.device(), tonemapFrag, nullptr);
+  vkDestroyShaderModule(gfx_.device(), grassVert, nullptr);
+  vkDestroyShaderModule(gfx_.device(), grassFrag, nullptr);
+  vkDestroyShaderModule(gfx_.device(), grassShadowVert, nullptr);
+  vkDestroyShaderModule(gfx_.device(), grassShadowFrag, nullptr);
 }
 
 void Renderer::ensureMaterialSet(Material* material) {
@@ -474,10 +599,53 @@ void Renderer::updateFrameUBO(Scene& scene, uint32_t frameIndex) {
   std::memcpy(frames_[frameIndex].frameUBO.info.pMappedData, &ubo, sizeof(ubo));
 }
 
-void Renderer::draw(Scene& scene, float /*dt*/, float fps) {
+void Renderer::recordGrass(VkCommandBuffer cmd, VkPipeline pipeline, VkPipelineLayout layout,
+                           VkDescriptorSet frameSet, Scene& scene, bool shadowPass) {
+  GrassSystem& grass = scene.grass();
+  if (!grass.params().enabled || !grass.ready()) {
+    return;
+  }
+
+  const std::vector<GrassDrawBatch>& batches =
+      shadowPass ? grass.shadowBatches() : grass.colorBatches();
+  if (batches.empty()) {
+    return;
+  }
+
+  GrassPushConstants pc{};
+  pc.time = scene.time();
+  pc.windStrength = grass.params().windStrength;
+  pc.windFrequency = grass.params().windFrequency;
+
+  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &frameSet, 0, nullptr);
+  vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(pc), &pc);
+
+  const Mesh& blade = grass.bladeMesh();
+  VkBuffer vertexBuffers[] = {blade.vertexBuffer.buffer, grass.instanceBuffer()};
+  VkDeviceSize offsets[] = {0, 0};
+  vkCmdBindVertexBuffers(cmd, 0, 2, vertexBuffers, offsets);
+  vkCmdBindIndexBuffer(cmd, blade.indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT32);
+
+  for (const GrassDrawBatch& batch : batches) {
+    if (batch.instanceCount == 0) {
+      continue;
+    }
+    vkCmdDrawIndexed(cmd, blade.indexCount, batch.instanceCount, 0, 0, batch.firstInstance);
+  }
+}
+
+void Renderer::draw(Scene& scene, float /*dt*/, float displayFps) {
   if (gfx_.swapchainWasRecreated()) {
     resize();
     gfx_.clearSwapchainRecreatedFlag();
+  }
+
+  scene.grass().rebuildIfNeeded(gfx_);
+  {
+    const glm::mat4 cameraViewProj = scene.camera().proj() * scene.camera().view();
+    const glm::mat4 lightViewProj = computeLightViewProj(scene);
+    scene.grass().cull(scene.camera().position(), cameraViewProj, lightViewProj);
   }
 
   FrameContext frame{};
@@ -485,8 +653,23 @@ void Renderer::draw(Scene& scene, float /*dt*/, float fps) {
     return;
   }
 
+  // Fence wait in beginFrame means this slot's previous GPU work is done.
+  collectGpuTiming(frame.frameIndex);
+
+  stats_.displayFps = displayFps;
+  stats_.displayFrameMs = (displayFps > 1e-3f) ? (1000.0f / displayFps) : 0.0f;
+
+  const auto cpuRecordStart = std::chrono::steady_clock::now();
+
   updateFrameUBO(scene, frame.frameIndex);
   VkDescriptorSet frameSet = frames_[frame.frameIndex].frameSet;
+
+  const uint32_t tsBegin = frame.frameIndex * 2;
+  const uint32_t tsEnd = tsBegin + 1;
+  if (timestampPool_) {
+    vkCmdResetQueryPool(frame.cmd, timestampPool_, tsBegin, 2);
+    writeTimestamp(frame.cmd, tsBegin, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT);
+  }
 
   // ---- Shadow pass ----
   if (showShadows_) {
@@ -534,6 +717,9 @@ void Renderer::draw(Scene& scene, float /*dt*/, float fps) {
       vkCmdBindIndexBuffer(frame.cmd, obj.mesh->indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT32);
       vkCmdDrawIndexed(frame.cmd, obj.mesh->indexCount, 1, 0, 0, 0);
     }
+
+    recordGrass(frame.cmd, grassShadowPipeline_, grassShadowPipelineLayout_, frameSet, scene, true);
+
     vkCmdEndRendering(frame.cmd);
 
     gfx_.transitionImage(frame.cmd, shadowImage_.image, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
@@ -609,6 +795,9 @@ void Renderer::draw(Scene& scene, float /*dt*/, float fps) {
     vkCmdBindIndexBuffer(frame.cmd, obj.mesh->indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT32);
     vkCmdDrawIndexed(frame.cmd, obj.mesh->indexCount, 1, 0, 0, 0);
   }
+
+  recordGrass(frame.cmd, grassPipeline_, grassPipelineLayout_, frameSet, scene, false);
+
   vkCmdEndRendering(frame.cmd);
 
   // ---- Tonemap to swapchain ----
@@ -647,7 +836,7 @@ void Renderer::draw(Scene& scene, float /*dt*/, float fps) {
   vkCmdDraw(frame.cmd, 3, 1, 0, 0);
 
   if (showUi_ && imguiReady_) {
-    recordImGui(frame.cmd, frame, scene, fps);
+    recordImGui(frame.cmd, frame, scene);
   }
   vkCmdEndRendering(frame.cmd);
 
@@ -656,6 +845,17 @@ void Renderer::draw(Scene& scene, float /*dt*/, float fps) {
                        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
                        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
                        0);
+
+  if (timestampPool_) {
+    writeTimestamp(frame.cmd, tsEnd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT);
+    timestampPending_[frame.frameIndex] = true;
+  }
+
+  const float cpuMs = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() -
+                                                              cpuRecordStart)
+                          .count();
+  constexpr float cpuAlpha = 0.1f;
+  stats_.cpuRecordMs = stats_.cpuRecordMs * (1.0f - cpuAlpha) + cpuMs * cpuAlpha;
 
   gfx_.endFrame(frame);
 }
@@ -726,15 +926,25 @@ void Renderer::shutdownImGui() {
   imguiReady_ = false;
 }
 
-void Renderer::recordImGui(VkCommandBuffer cmd, const FrameContext& /*frame*/, Scene& scene,
-                           float fps) {
+void Renderer::recordImGui(VkCommandBuffer cmd, const FrameContext& /*frame*/, Scene& scene) {
   ImGui_ImplVulkan_NewFrame();
   ImGui_ImplGlfw_NewFrame();
   ImGui::NewFrame();
 
   ImGui::Begin("Vulkan Engine");
-  ImGui::Text("FPS: %.1f", fps);
-  ImGui::Text("GPU: Apple / MoltenVK path");
+  ImGui::TextWrapped("GPU: %s", gfx_.deviceName().c_str());
+  ImGui::Separator();
+  ImGui::Text("Timing (VSync ON)");
+  ImGui::Text("Display FPS: %.1f  (%.2f ms)", stats_.displayFps, stats_.displayFrameMs);
+  ImGui::Text("CPU record:  %.2f ms", stats_.cpuRecordMs);
+  ImGui::Text("GPU work:    %.2f ms", stats_.gpuFrameMs);
+  if (stats_.gpuFrameMs > 1e-3f) {
+    ImGui::Text("GPU estimate: %.0f FPS  (if uncapped)", 1000.0f / stats_.gpuFrameMs);
+  } else {
+    ImGui::Text("GPU estimate: n/a");
+  }
+  ImGui::TextDisabled("Display FPS is capped by refresh rate; GPU estimate is actual work cost.");
+  ImGui::Separator();
   ImGui::Checkbox("Shadows", &showShadows_);
   ImGui::DragFloat("Mip LOD Bias", &mipLodBias_, 0.01f, -2.0f, 4.0f);
   ImGui::Separator();
@@ -745,7 +955,43 @@ void Renderer::recordImGui(VkCommandBuffer cmd, const FrameContext& /*frame*/, S
   ImGui::ColorEdit3("Light Color", &scene.light().color.x);
   ImGui::ColorEdit3("Ambient", &scene.light().ambient.x);
   ImGui::Separator();
-  ImGui::TextWrapped("Controls: WASD orbit, Q/E zoom, Right-drag rotate, Esc quit");
+  ImGui::Text("Grass (Phase 1.5 cull)");
+  GrassParams& gp = scene.grass().params();
+  const GrassCullStats& gs = scene.grass().cullStats();
+  ImGui::Checkbox("Enable Grass", &gp.enabled);
+  ImGui::Text("Stored instances: %u", scene.grass().instanceCount());
+  ImGui::Text("Chunks: %u", gs.chunkCount);
+  ImGui::Text("Color draw:  %u chunks / %u inst", gs.colorChunks, gs.colorInstances);
+  ImGui::Text("Shadow draw: %u chunks / %u inst", gs.shadowChunks, gs.shadowInstances);
+  ImGui::Checkbox("Frustum / Distance Cull", &gp.enableCulling);
+  if (ImGui::SliderInt("Grid Resolution", &gp.gridResolution, 50, 700)) {
+    scene.grass().markDirty();
+  }
+  if (ImGui::SliderInt("Chunk Size", &gp.chunkSize, 4, 64)) {
+    scene.grass().markDirty();
+  }
+  if (ImGui::DragFloat("Area Half Extent", &gp.areaHalfExtent, 0.1f, 2.0f, 30.0f)) {
+    scene.grass().markDirty();
+  }
+  ImGui::DragFloat("Full Density Dist", &gp.fullDensityDistance, 0.1f, 1.0f, 80.0f);
+  ImGui::DragFloat("Half Density Dist", &gp.halfDensityDistance, 0.1f, 1.0f, 100.0f);
+  ImGui::DragFloat("Max Draw Dist", &gp.maxDrawDistance, 0.1f, 2.0f, 150.0f);
+  if (ImGui::DragFloat("Height Scale", &gp.heightScale, 0.01f, 0.1f, 2.0f)) {
+    scene.grass().markDirty();
+  }
+  if (ImGui::DragFloat("Height Variance", &gp.heightVariance, 0.01f, 0.0f, 1.0f)) {
+    scene.grass().markDirty();
+  }
+  ImGui::DragFloat("Wind Strength", &gp.windStrength, 0.01f, 0.0f, 2.0f);
+  ImGui::DragFloat("Wind Frequency", &gp.windFrequency, 0.01f, 0.1f, 5.0f);
+  if (ImGui::ColorEdit3("Base Color", &gp.baseColor.x)) {
+    scene.grass().markDirty();
+  }
+  if (ImGui::ColorEdit3("Tip Color", &gp.tipColor.x)) {
+    scene.grass().markDirty();
+  }
+  ImGui::Separator();
+  ImGui::TextWrapped("Controls: WASD move, Q/E up/down, Right-drag look, Esc quit");
   ImGui::End();
 
   ImGui::Render();

@@ -10,6 +10,7 @@ public:
   void setOrbitTarget(const glm::vec3& target);
   void setOrbitDistance(float distance);
   void setYawPitch(float yawRad, float pitchRad);
+  void setPosition(const glm::vec3& position);
 
   void update(float aspect);
   void handleInput(GLFWwindow* window, float dt);
@@ -21,6 +22,10 @@ public:
   float farZ() const { return farZ_; }
 
 private:
+  void syncPositionFromOrbit();
+  glm::vec3 forward() const;
+  glm::vec3 right() const;
+
   float fovY_ = 60.0f;
   float nearZ_ = 0.1f;
   float farZ_ = 200.0f;

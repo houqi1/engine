@@ -42,10 +42,13 @@ void Scene::init(GfxDevice& gfx) {
   camera_.setOrbitTarget(glm::vec3(0.0f, 1.0f, 0.0f));
   camera_.setOrbitDistance(11.0f);
   camera_.setYawPitch(0.7f, 0.4f);
+
+  grass_.init(gfx);
 }
 
 void Scene::cleanup(GfxDevice& gfx) {
   objects_.clear();
+  grass_.cleanup(gfx);
   TextureFactory::destroy(gfx, checker_);
   TextureFactory::destroy(gfx, white_);
   TextureFactory::destroy(gfx, rust_);

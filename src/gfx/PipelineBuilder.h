@@ -9,6 +9,9 @@ public:
   PipelineBuilder& setShaders(VkShaderModule vert, VkShaderModule frag);
   PipelineBuilder& setVertexInput(const VkVertexInputBindingDescription& binding,
                                   const std::vector<VkVertexInputAttributeDescription>& attrs);
+  PipelineBuilder& setVertexInput(
+      const std::vector<VkVertexInputBindingDescription>& bindings,
+      const std::vector<VkVertexInputAttributeDescription>& attrs);
   PipelineBuilder& setTopology(VkPrimitiveTopology topology);
   PipelineBuilder& setPolygonMode(VkPolygonMode mode);
   PipelineBuilder& setCullMode(VkCullModeFlags cull, VkFrontFace front);
@@ -24,7 +27,7 @@ public:
 
 private:
   std::vector<VkPipelineShaderStageCreateInfo> stages_;
-  VkVertexInputBindingDescription binding_{};
+  std::vector<VkVertexInputBindingDescription> bindings_;
   std::vector<VkVertexInputAttributeDescription> attributes_;
   bool hasVertexInput_ = false;
 

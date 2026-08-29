@@ -56,3 +56,25 @@ struct MaterialUBO {
 struct PushConstants {
   float model[16];
 };
+
+// Per-instance grass blade (vertex buffer, VK_VERTEX_INPUT_RATE_INSTANCE).
+struct GrassInstance {
+  float position[3];
+  float yaw;
+  float color[3];
+  float scale;
+};
+
+struct GrassPushConstants {
+  float time;
+  float windStrength;
+  float windFrequency;
+  float pad;
+};
+
+struct FrameStats {
+  float displayFps = 0.0f;     // includes VSync wait
+  float displayFrameMs = 0.0f; // 1000 / displayFps
+  float cpuRecordMs = 0.0f;    // CPU time to record + submit prep (no present wait)
+  float gpuFrameMs = 0.0f;     // GPU timestamp delta for the rendered frame
+};

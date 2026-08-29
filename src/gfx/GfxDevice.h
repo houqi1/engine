@@ -77,6 +77,7 @@ public:
   uint32_t framesInFlight() const { return kFramesInFlight; }
   bool swapchainWasRecreated() const { return swapchainRecreated_; }
   void clearSwapchainRecreatedFlag() { swapchainRecreated_ = false; }
+  const std::string& deviceName() const { return deviceName_; }
 
 private:
   struct FrameData {
@@ -105,6 +106,7 @@ private:
 
   vkb::PhysicalDevice physicalDevice_{};
   vkb::Device device_{};
+  std::string deviceName_;
   VkQueue graphicsQueue_ = VK_NULL_HANDLE;
   uint32_t graphicsQueueFamily_ = 0;
   VmaAllocator allocator_ = VK_NULL_HANDLE;

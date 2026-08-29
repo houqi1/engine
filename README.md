@@ -13,6 +13,7 @@ Modern Vulkan 1.3 forward renderer on macOS (MoltenVK) / desktop.
 - HDR color target + ACES tonemap
 - Dear ImGui debug panel
 - Frequency-based descriptor sets (frame / material)
+- Instanced procedural grass (Phase 1: CPU instances + VS wind + shadow)
 
 ## Prerequisites (macOS)
 
@@ -38,10 +39,12 @@ cmake --build build -j
 
 | Input | Action |
 |-------|--------|
-| WASD | Orbit camera |
-| Q / E | Zoom |
-| Right-drag | Orbit |
+| WASD | Move camera |
+| Q / E | Down / Up |
+| Right-drag | Look |
 | Esc | Quit |
+
+ImGui panel: grass density, wind, colors, enable/disable.
 
 ## Layout
 

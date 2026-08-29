@@ -3,6 +3,7 @@
 #include "core/Camera.h"
 #include "gfx/Mesh.h"
 #include "gfx/Texture.h"
+#include "scene/GrassSystem.h"
 
 #include <glm/glm.hpp>
 
@@ -41,10 +42,14 @@ public:
   DirectionalLight& light() { return light_; }
   const DirectionalLight& light() const { return light_; }
   const std::vector<RenderObject>& objects() const { return objects_; }
+  GrassSystem& grass() { return grass_; }
+  const GrassSystem& grass() const { return grass_; }
+  float time() const { return time_; }
 
 private:
   Camera camera_;
   DirectionalLight light_;
+  GrassSystem grass_;
 
   Mesh cube_{};
   Mesh plane_{};

@@ -5,17 +5,64 @@
 
 #include <GLFW/glfw3.h>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#define GLFW_EXPOSE_NATIVE_WIN32
+#include <GLFW/glfw3native.h>
+#include <windows.h>
+#endif
+
 #include <chrono>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
+
+#ifdef _WIN32
+// Ask Windows laptop GPU switching (Optimus) to prefer the discrete NVIDIA GPU.
+extern "C" {
+__declspec(dllexport) DWORD NvOptimusEnablement = 1;
+__declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+}
+#endif
+
+namespace {
+
+void appendCrashLog(const char* message) {
+  std::ofstream log("vulkan_engine_crash.log", std::ios::app);
+  if (!log) {
+    return;
+  }
+  log << message << '\n';
+}
+
+void showFatal(const char* message) {
+  std::cerr << "Fatal: " << message << '\n';
+  appendCrashLog(message);
+#ifdef _WIN32
+  MessageBoxA(nullptr, message, "Vulkan Engine", MB_OK | MB_ICONERROR);
+#endif
+}
+
+}  // namespace
 
 int main() {
   try {
     Window window(WindowConfig{
-        .title = "Vulkan Engine — Forward PBR + Shadows",
+        .title = "Vulkan Engine - Grass Demo",
         .width = 1280,
         .height = 720,
     });
+
+#ifdef _WIN32
+    // Make the first launch obvious on multi-monitor setups.
+    if (HWND hwnd = glfwGetWin32Window(window.handle())) {
+      SetWindowPos(hwnd, HWND_TOPMOST, 120, 120, 1280, 720, SWP_SHOWWINDOW);
+      SetForegroundWindow(hwnd);
+      SetWindowPos(hwnd, HWND_NOTOPMOST, 120, 120, 1280, 720, SWP_SHOWWINDOW);
+    }
+#endif
 
     GfxDevice gfx(window);
     Scene scene;
@@ -24,7 +71,7 @@ int main() {
     Renderer renderer(gfx);
     renderer.init(scene);
 
-    std::cout << "Engine running. WASD orbit, Q/E zoom, right-drag rotate, Esc quit." << std::endl;
+    std::cout << "Engine running. WASD move, Q/E up/down, right-drag look, Esc quit." << std::endl;
 
     auto last = std::chrono::steady_clock::now();
     float fps = 60.0f;
@@ -54,7 +101,7 @@ int main() {
     gfx.waitIdle();
     scene.cleanup(gfx);
   } catch (const std::exception& ex) {
-    std::cerr << "Fatal: " << ex.what() << '\n';
+    showFatal(ex.what());
     return 1;
   }
   return 0;
