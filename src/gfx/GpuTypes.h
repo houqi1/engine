@@ -41,15 +41,17 @@ struct FrameUBO {
   float ambientColor[3];
   float shadowBias;
   float mipLodBias;
-  float pad2;
-  float pad3;
+  float skyYaw;
+  float skyIntensity;
+  float ambientScale;     // scales SH irradiance for grass
+  float ambientSH[9][4];  // L2 irradiance coeffs (std140 vec4 each)
 };
 
 struct MaterialUBO {
   float baseColorFactor[4];
   float metallic;
   float roughness;
-  float pad0;
+  float shOnly;  // 1 = raw sky SH visualization
   float pad1;
 };
 
@@ -70,6 +72,13 @@ struct GrassPushConstants {
   float windStrength;
   float windFrequency;
   float pad;
+};
+
+struct SkyPushConstants {
+  float intensity;
+  float yaw;
+  float pad0;
+  float pad1;
 };
 
 struct FrameStats {

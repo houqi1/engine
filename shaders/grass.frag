@@ -22,8 +22,10 @@ layout(set = 0, binding = 0, std140) uniform FrameUBO {
     vec3 ambientColor;
     float shadowBias;
     float mipLodBias;
-    float _pad2;
-    float _pad3;
+    float skyYaw;
+    float skyIntensity;
+    float ambientScale;
+    vec4 ambientSH[9];
 } frame;
 
 layout(set = 0, binding = 1) uniform sampler2D shadowMap;
@@ -50,6 +52,51 @@ float ShadowPCF(vec4 lightSpacePos) {
     return shadow / 9.0;
 }
 
+vec3 rotateYaw(vec3 v, float yaw) {
+    float cy = cos(yaw);
+    float sy = sin(yaw);
+    return vec3(cy * v.x + sy * v.z, v.y, -sy * v.x + cy * v.z);
+}
+
+// Matches CPU ShIrradiance basis; ambientSH already includes cosine lobe.
+vec3 evalSHIrradiance(vec3 n) {
+    float x = n.x;
+    float y = n.y;
+    float z = n.z;
+
+    float Y0 = 0.282095;
+    float Y1 = 0.488603 * y;
+    float Y2 = 0.488603 * z;
+    float Y3 = 0.488603 * x;
+    float Y4 = 1.092548 * x * y;
+    float Y5 = 1.092548 * y * z;
+    float Y6 = 0.315392 * (3.0 * z * z - 1.0);
+    float Y7 = 1.092548 * x * z;
+    float Y8 = 0.546274 * (x * x - y * y);
+
+    vec3 e = frame.ambientSH[0].rgb * Y0
+           + frame.ambientSH[1].rgb * Y1
+           + frame.ambientSH[2].rgb * Y2
+           + frame.ambientSH[3].rgb * Y3
+           + frame.ambientSH[4].rgb * Y4
+           + frame.ambientSH[5].rgb * Y5
+           + frame.ambientSH[6].rgb * Y6
+           + frame.ambientSH[7].rgb * Y7
+           + frame.ambientSH[8].rgb * Y8;
+    return max(e, vec3(0.0));
+}
+
+vec3 grassAmbient(vec3 worldN) {
+    // Same yaw as sky.frag: evaluate unrotated SH in environment space.
+    if (frame.ambientScale <= 0.0) {
+        return frame.ambientColor;
+    }
+    vec3 nEnv = rotateYaw(normalize(worldN), frame.skyYaw);
+    vec3 aPos = evalSHIrradiance(nEnv);
+    vec3 aNeg = evalSHIrradiance(-nEnv);
+    return max(aPos, aNeg) * frame.skyIntensity * frame.ambientScale;
+}
+
 void main() {
     // Blade silhouette comes from tapered geometry — no discard (keeps Early-Z).
     vec3 N = normalize(vWorldNormal);
@@ -60,7 +107,10 @@ void main() {
 
     float shadow = ShadowPCF(vLightSpacePos);
     vec3 albedo = mix(vColor * 0.75, vColor * 1.15, vHeight);
-    vec3 lit = albedo * (frame.ambientColor + frame.lightColor * frame.lightIntensity * wrap * shadow);
+
+    // Slight root darkening so blades sit better on the ground.
+    vec3 ambient = grassAmbient(N) * mix(0.55, 1.0, vHeight);
+    vec3 lit = albedo * (ambient + frame.lightColor * frame.lightIntensity * wrap * shadow);
 
     // Cheap tip translucency.
     float back = pow(1.0 - wrap, 2.0) * vHeight;

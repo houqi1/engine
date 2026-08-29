@@ -46,6 +46,7 @@ private:
   void updateFrameUBO(Scene& scene, uint32_t frameIndex);
   void recordGrass(VkCommandBuffer cmd, VkPipeline pipeline, VkPipelineLayout layout,
                    VkDescriptorSet frameSet, Scene& scene, bool shadowPass);
+  void recordSky(VkCommandBuffer cmd, VkDescriptorSet frameSet, Scene& scene);
   void recordImGui(VkCommandBuffer cmd, const FrameContext& frame, Scene& scene);
   void createTimestampPool();
   void destroyTimestampPool();
@@ -59,6 +60,7 @@ private:
 
   VkDescriptorSetLayout frameLayout_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout materialLayout_ = VK_NULL_HANDLE;
+  VkDescriptorSetLayout skyLayout_ = VK_NULL_HANDLE;
   VkDescriptorPool descriptorPool_ = VK_NULL_HANDLE;
   VkDescriptorPool imguiPool_ = VK_NULL_HANDLE;
 
@@ -67,11 +69,14 @@ private:
   VkPipelineLayout tonemapPipelineLayout_ = VK_NULL_HANDLE;
   VkPipelineLayout grassPipelineLayout_ = VK_NULL_HANDLE;
   VkPipelineLayout grassShadowPipelineLayout_ = VK_NULL_HANDLE;
+  VkPipelineLayout skyPipelineLayout_ = VK_NULL_HANDLE;
   VkPipeline meshPipeline_ = VK_NULL_HANDLE;
   VkPipeline shadowPipeline_ = VK_NULL_HANDLE;
   VkPipeline tonemapPipeline_ = VK_NULL_HANDLE;
   VkPipeline grassPipeline_ = VK_NULL_HANDLE;
   VkPipeline grassShadowPipeline_ = VK_NULL_HANDLE;
+  VkPipeline skyPipeline_ = VK_NULL_HANDLE;
+  VkDescriptorSet skySet_ = VK_NULL_HANDLE;
 
   AllocatedImage depthImage_{};
   AllocatedImage hdrImage_{};
@@ -91,6 +96,11 @@ private:
   bool imguiReady_ = false;
   bool showUi_ = true;
   bool showShadows_ = true;
+  bool showSky_ = true;
+  float skyIntensity_ = 1.0f;
+  float skyYaw_ = 0.0f;
+  float ambientScale_ = 0.35f;  // SH irradiance scale for grass
+  bool useSkyAmbient_ = true;
   // Positive bias samples lower-res mips sooner (shader bias; MoltenVK lacks samplerMipLodBias).
   float mipLodBias_ = 0.5f;
 

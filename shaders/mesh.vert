@@ -21,8 +21,10 @@ layout(set = 0, binding = 0, std140) uniform FrameUBO {
     vec3 ambientColor;
     float shadowBias;
     float mipLodBias;
-    float _pad2;
-    float _pad3;
+    float skyYaw;
+    float skyIntensity;
+    float ambientScale;
+    vec4 ambientSH[9];
 } frame;
 
 layout(location = 0) out vec3 vWorldPos;

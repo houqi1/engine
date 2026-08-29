@@ -1,0 +1,5 @@
+autumn_field_puresky (2K HDR)
+Source: https://polyhaven.com/a/autumn_field_puresky
+License: CC0 1.0 (public domain) — https://creativecommons.org/publicdomain/zero/1.0/
+Authors: Sergej Majboroda (original), Jarod Guest (sky edits)
+Downloaded for use as an equirectangular skybox.

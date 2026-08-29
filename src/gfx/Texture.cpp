@@ -2,6 +2,11 @@
 
 #include "gfx/GfxDevice.h"
 
+#define STB_IMAGE_IMPLEMENTATION
+#include <stb_image.h>
+
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace TextureFactory {
@@ -49,6 +54,63 @@ Texture createCheckerboard(GfxDevice& gfx, uint32_t size, uint32_t checkSize) {
   tex.sampler =
       gfx.createSampler(VK_FILTER_LINEAR, VK_SAMPLER_ADDRESS_MODE_REPEAT, true, mipLevels);
   return tex;
+}
+
+EquirectHdrData loadHdrEquirectData(const std::string& path) {
+  stbi_set_flip_vertically_on_load(0);
+  int width = 0;
+  int height = 0;
+  int components = 0;
+  float* pixels = stbi_loadf(path.c_str(), &width, &height, &components, 4);
+  if (!pixels || width <= 0 || height <= 0) {
+    const char* reason = stbi_failure_reason();
+    throw std::runtime_error("Failed to load HDR equirect '" + path + "': " +
+                             (reason ? reason : "unknown"));
+  }
+
+  EquirectHdrData data;
+  data.width = width;
+  data.height = height;
+  const size_t count = static_cast<size_t>(width) * static_cast<size_t>(height) * 4u;
+  data.rgba.assign(pixels, pixels + count);
+  stbi_image_free(pixels);
+  return data;
+}
+
+Texture createEquirectTexture(GfxDevice& gfx, const EquirectHdrData& data) {
+  if (data.rgba.empty() || data.width <= 0 || data.height <= 0) {
+    throw std::runtime_error("createEquirectTexture: empty HDR data");
+  }
+
+  const VkDeviceSize bytes = data.rgba.size() * sizeof(float);
+  Texture tex;
+  tex.image = gfx.createImage(
+      {static_cast<uint32_t>(data.width), static_cast<uint32_t>(data.height), 1},
+      VK_FORMAT_R32G32B32A32_SFLOAT,
+      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
+  gfx.uploadToImage(tex.image, data.rgba.data(), bytes,
+                    {static_cast<uint32_t>(data.width), static_cast<uint32_t>(data.height), 1});
+
+  // Equirect: wrap horizontally, clamp vertically to avoid pole seams.
+  VkSamplerCreateInfo info{};
+  info.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+  info.magFilter = VK_FILTER_LINEAR;
+  info.minFilter = VK_FILTER_LINEAR;
+  info.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+  info.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+  info.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  info.minLod = 0.0f;
+  info.maxLod = 1.0f;
+  if (vkCreateSampler(gfx.device(), &info, nullptr, &tex.sampler) != VK_SUCCESS) {
+    gfx.destroyImage(tex.image);
+    throw std::runtime_error("Failed to create sky sampler");
+  }
+  return tex;
+}
+
+Texture loadHdrEquirect(GfxDevice& gfx, const std::string& path) {
+  return createEquirectTexture(gfx, loadHdrEquirectData(path));
 }
 
 void destroy(GfxDevice& gfx, Texture& texture) {

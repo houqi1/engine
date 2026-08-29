@@ -74,6 +74,9 @@ Renderer::~Renderer() {
   if (grassShadowPipeline_) {
     vkDestroyPipeline(gfx_.device(), grassShadowPipeline_, nullptr);
   }
+  if (skyPipeline_) {
+    vkDestroyPipeline(gfx_.device(), skyPipeline_, nullptr);
+  }
   if (meshPipelineLayout_) {
     vkDestroyPipelineLayout(gfx_.device(), meshPipelineLayout_, nullptr);
   }
@@ -89,6 +92,9 @@ Renderer::~Renderer() {
   if (grassShadowPipelineLayout_) {
     vkDestroyPipelineLayout(gfx_.device(), grassShadowPipelineLayout_, nullptr);
   }
+  if (skyPipelineLayout_) {
+    vkDestroyPipelineLayout(gfx_.device(), skyPipelineLayout_, nullptr);
+  }
   if (frameLayout_) {
     vkDestroyDescriptorSetLayout(gfx_.device(), frameLayout_, nullptr);
   }
@@ -97,6 +103,9 @@ Renderer::~Renderer() {
   }
   if (tonemapLayout_) {
     vkDestroyDescriptorSetLayout(gfx_.device(), tonemapLayout_, nullptr);
+  }
+  if (skyLayout_) {
+    vkDestroyDescriptorSetLayout(gfx_.device(), skyLayout_, nullptr);
   }
   if (descriptorPool_) {
     vkDestroyDescriptorPool(gfx_.device(), descriptorPool_, nullptr);
@@ -237,6 +246,32 @@ void Renderer::init(Scene& scene) {
     vkUpdateDescriptorSets(gfx_.device(), 1, &write, 0, nullptr);
   }
 
+  // Sky set
+  if (scene.hasSky()) {
+    VkDescriptorSetAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    allocInfo.descriptorPool = descriptorPool_;
+    allocInfo.descriptorSetCount = 1;
+    allocInfo.pSetLayouts = &skyLayout_;
+    if (vkAllocateDescriptorSets(gfx_.device(), &allocInfo, &skySet_) != VK_SUCCESS) {
+      throw std::runtime_error("Failed to allocate sky descriptor set");
+    }
+
+    VkDescriptorImageInfo imageInfo{};
+    imageInfo.sampler = scene.sky().sampler;
+    imageInfo.imageView = scene.sky().image.view;
+    imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+    VkWriteDescriptorSet write{};
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstSet = skySet_;
+    write.dstBinding = 0;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    write.descriptorCount = 1;
+    write.pImageInfo = &imageInfo;
+    vkUpdateDescriptorSets(gfx_.device(), 1, &write, 0, nullptr);
+  }
+
   initImGui();
 }
 
@@ -315,6 +350,21 @@ void Renderer::createDescriptors() {
     vkCreateDescriptorSetLayout(gfx_.device(), &info, nullptr, &tonemapLayout_);
   }
 
+  // Sky equirect layout (set 1)
+  {
+    VkDescriptorSetLayoutBinding binding{};
+    binding.binding = 0;
+    binding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    binding.descriptorCount = 1;
+    binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+    VkDescriptorSetLayoutCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    info.bindingCount = 1;
+    info.pBindings = &binding;
+    vkCreateDescriptorSetLayout(gfx_.device(), &info, nullptr, &skyLayout_);
+  }
+
   VkDescriptorPoolSize sizes[] = {
       {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 64},
       {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 64},
@@ -388,6 +438,7 @@ void Renderer::createPipelines() {
   VkShaderModule grassFrag = gfx_.loadShaderModule(shaderDir + "/grass.frag.spv");
   VkShaderModule grassShadowVert = gfx_.loadShaderModule(shaderDir + "/grass_shadow.vert.spv");
   VkShaderModule grassShadowFrag = gfx_.loadShaderModule(shaderDir + "/grass_shadow.frag.spv");
+  VkShaderModule skyFrag = gfx_.loadShaderModule(shaderDir + "/sky.frag.spv");
 
   VkPushConstantRange pushRange{};
   pushRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
@@ -398,6 +449,11 @@ void Renderer::createPipelines() {
   grassPush.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
   grassPush.offset = 0;
   grassPush.size = sizeof(GrassPushConstants);
+
+  VkPushConstantRange skyPush{};
+  skyPush.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+  skyPush.offset = 0;
+  skyPush.size = sizeof(SkyPushConstants);
 
   {
     VkDescriptorSetLayout layouts[] = {frameLayout_, materialLayout_};
@@ -436,6 +492,16 @@ void Renderer::createPipelines() {
     info.pPushConstantRanges = &grassPush;
     vkCreatePipelineLayout(gfx_.device(), &info, nullptr, &grassPipelineLayout_);
     vkCreatePipelineLayout(gfx_.device(), &info, nullptr, &grassShadowPipelineLayout_);
+  }
+  {
+    VkDescriptorSetLayout layouts[] = {frameLayout_, skyLayout_};
+    VkPipelineLayoutCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    info.setLayoutCount = 2;
+    info.pSetLayouts = layouts;
+    info.pushConstantRangeCount = 1;
+    info.pPushConstantRanges = &skyPush;
+    vkCreatePipelineLayout(gfx_.device(), &info, nullptr, &skyPipelineLayout_);
   }
 
   const auto binding = vertexBinding();
@@ -507,6 +573,16 @@ void Renderer::createPipelines() {
                              .setLayout(grassShadowPipelineLayout_)
                              .build(gfx_.device());
 
+  // Reverse-Z: far/cleared depth is 0. Draw sky only into empty pixels.
+  skyPipeline_ = PipelineBuilder()
+                     .setShaders(fsVert, skyFrag)
+                     .setCullMode(VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE)
+                     .setDepthTest(true, false, VK_COMPARE_OP_EQUAL)
+                     .setColorFormat(kHdrFormat)
+                     .setDepthFormat(kDepthFormat)
+                     .setLayout(skyPipelineLayout_)
+                     .build(gfx_.device());
+
   vkDestroyShaderModule(gfx_.device(), meshVert, nullptr);
   vkDestroyShaderModule(gfx_.device(), meshFrag, nullptr);
   vkDestroyShaderModule(gfx_.device(), shadowVert, nullptr);
@@ -517,6 +593,7 @@ void Renderer::createPipelines() {
   vkDestroyShaderModule(gfx_.device(), grassFrag, nullptr);
   vkDestroyShaderModule(gfx_.device(), grassShadowVert, nullptr);
   vkDestroyShaderModule(gfx_.device(), grassShadowFrag, nullptr);
+  vkDestroyShaderModule(gfx_.device(), skyFrag, nullptr);
 }
 
 void Renderer::ensureMaterialSet(Material* material) {
@@ -535,6 +612,7 @@ void Renderer::ensureMaterialSet(Material* material) {
   ubo.baseColorFactor[3] = material->baseColor.a;
   ubo.metallic = material->metallic;
   ubo.roughness = material->roughness;
+  ubo.shOnly = material->shOnly ? 1.0f : 0.0f;
   std::memcpy(res.materialUBO.info.pMappedData, &ubo, sizeof(ubo));
 
   VkDescriptorSetAllocateInfo allocInfo{};
@@ -596,6 +674,21 @@ void Renderer::updateFrameUBO(Scene& scene, uint32_t frameIndex) {
   writeVec3(ubo.ambientColor, scene.light().ambient);
   ubo.shadowBias = scene.light().shadowBias;
   ubo.mipLodBias = mipLodBias_;
+  ubo.skyYaw = skyYaw_;
+  ubo.skyIntensity = skyIntensity_;
+
+  const bool useSh = useSkyAmbient_ && scene.hasSkyIrradianceSH();
+  ubo.ambientScale = useSh ? ambientScale_ : 0.0f;
+  if (useSh) {
+    const Sh9& sh = scene.skyIrradianceSH();
+    for (int i = 0; i < 9; ++i) {
+      ubo.ambientSH[i][0] = sh.c[i].r;
+      ubo.ambientSH[i][1] = sh.c[i].g;
+      ubo.ambientSH[i][2] = sh.c[i].b;
+      ubo.ambientSH[i][3] = 0.0f;
+    }
+  }
+
   std::memcpy(frames_[frameIndex].frameUBO.info.pMappedData, &ubo, sizeof(ubo));
 }
 
@@ -633,6 +726,24 @@ void Renderer::recordGrass(VkCommandBuffer cmd, VkPipeline pipeline, VkPipelineL
     }
     vkCmdDrawIndexed(cmd, blade.indexCount, batch.instanceCount, 0, 0, batch.firstInstance);
   }
+}
+
+void Renderer::recordSky(VkCommandBuffer cmd, VkDescriptorSet frameSet, Scene& scene) {
+  if (!showSky_ || !scene.hasSky() || skySet_ == VK_NULL_HANDLE || !skyPipeline_) {
+    return;
+  }
+
+  SkyPushConstants pc{};
+  pc.intensity = skyIntensity_;
+  pc.yaw = skyYaw_;
+
+  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, skyPipeline_);
+  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, skyPipelineLayout_, 0, 1, &frameSet,
+                          0, nullptr);
+  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, skyPipelineLayout_, 1, 1, &skySet_,
+                          0, nullptr);
+  vkCmdPushConstants(cmd, skyPipelineLayout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
+  vkCmdDraw(cmd, 3, 1, 0, 0);
 }
 
 void Renderer::draw(Scene& scene, float /*dt*/, float displayFps) {
@@ -797,6 +908,7 @@ void Renderer::draw(Scene& scene, float /*dt*/, float displayFps) {
   }
 
   recordGrass(frame.cmd, grassPipeline_, grassPipelineLayout_, frameSet, scene, false);
+  recordSky(frame.cmd, frameSet, scene);
 
   vkCmdEndRendering(frame.cmd);
 
@@ -946,6 +1058,12 @@ void Renderer::recordImGui(VkCommandBuffer cmd, const FrameContext& /*frame*/, S
   ImGui::TextDisabled("Display FPS is capped by refresh rate; GPU estimate is actual work cost.");
   ImGui::Separator();
   ImGui::Checkbox("Shadows", &showShadows_);
+  ImGui::Checkbox("Skybox", &showSky_);
+  ImGui::DragFloat("Sky Intensity", &skyIntensity_, 0.01f, 0.0f, 8.0f);
+  ImGui::DragFloat("Sky Yaw", &skyYaw_, 0.01f, -3.14159f, 3.14159f);
+  ImGui::Checkbox("Grass Sky Ambient (SH)", &useSkyAmbient_);
+  ImGui::DragFloat("Grass Ambient Scale", &ambientScale_, 0.01f, 0.0f, 4.0f);
+  ImGui::TextDisabled("SH from sky HDR; yaw/intensity match skybox.");
   ImGui::DragFloat("Mip LOD Bias", &mipLodBias_, 0.01f, -2.0f, 4.0f);
   ImGui::Separator();
   ImGui::Text("Light");

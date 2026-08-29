@@ -2,6 +2,7 @@
 
 #include "core/Camera.h"
 #include "gfx/Mesh.h"
+#include "gfx/ShIrradiance.h"
 #include "gfx/Texture.h"
 #include "scene/GrassSystem.h"
 
@@ -14,6 +15,7 @@ struct Material {
   glm::vec4 baseColor{1.0f};
   float metallic = 0.0f;
   float roughness = 0.5f;
+  bool shOnly = false;  // debug: output raw sky SH, no direct/specular/diffuse BRDF
 };
 
 struct RenderObject {
@@ -44,6 +46,11 @@ public:
   const std::vector<RenderObject>& objects() const { return objects_; }
   GrassSystem& grass() { return grass_; }
   const GrassSystem& grass() const { return grass_; }
+  Texture& sky() { return sky_; }
+  const Texture& sky() const { return sky_; }
+  bool hasSky() const { return sky_.image.image != VK_NULL_HANDLE; }
+  const Sh9& skyIrradianceSH() const { return skyIrradianceSH_; }
+  bool hasSkyIrradianceSH() const { return skyIrradianceSH_.valid; }
   float time() const { return time_; }
 
 private:
@@ -54,15 +61,19 @@ private:
   Mesh cube_{};
   Mesh plane_{};
   Mesh sphere_{};
+  Mesh probeSphere_{};
   Texture checker_{};
   Texture white_{};
   Texture rust_{};
   Texture gold_{};
+  Texture sky_{};
+  Sh9 skyIrradianceSH_{};
 
   Material matFloor_{};
   Material matCube_{};
   Material matSphere_{};
   Material matGold_{};
+  Material matProbe_{};
 
   std::vector<RenderObject> objects_;
   float time_ = 0.0f;

@@ -50,6 +50,7 @@ set(VE_SOURCES
   src/gfx/PipelineBuilder.cpp
   src/gfx/Mesh.cpp
   src/gfx/Texture.cpp
+  src/gfx/ShIrradiance.cpp
   src/scene/Scene.cpp
   src/scene/GrassSystem.cpp
   src/render/Renderer.cpp
@@ -70,6 +71,7 @@ endif()
 
 target_include_directories(vulkan_engine PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/third_party
   ${vma_SOURCE_DIR}/include
   ${imgui_SOURCE_DIR}
   ${imgui_SOURCE_DIR}/backends
@@ -112,6 +114,7 @@ set(VE_SHADER_SOURCES
   grass.frag
   grass_shadow.vert
   grass_shadow.frag
+  sky.frag
 )
 
 set(VE_SPV_FILES "")
@@ -131,7 +134,10 @@ endforeach()
 add_custom_target(ve_shaders ALL DEPENDS ${VE_SPV_FILES})
 add_dependencies(vulkan_engine ve_shaders)
 
-target_compile_definitions(vulkan_engine PRIVATE VE_SHADER_DIR="${VE_SHADER_OUTPUT_DIR}")
+target_compile_definitions(vulkan_engine PRIVATE
+  VE_SHADER_DIR="${VE_SHADER_OUTPUT_DIR}"
+  VE_ASSETS_DIR="${CMAKE_SOURCE_DIR}/assets"
+)
 
 if(CMAKE_EXPORT_COMPILE_COMMANDS AND EXISTS "${CMAKE_BINARY_DIR}/compile_commands.json")
   add_custom_command(TARGET vulkan_engine POST_BUILD
