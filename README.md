@@ -46,12 +46,25 @@ cmake --build build -j
 
 ImGui panel: grass density, wind, colors, enable/disable.
 
+## Demos (two executables, shared engine code)
+
+| Target | Entry | Description |
+|--------|-------|-------------|
+| `vulkan_engine` | `src/main.cpp` | Grass / PBR demo |
+| `vulkan_engine_voxel` | `src/main_voxel.cpp` | Voxel sandbox (cube-per-voxel placeholder) |
+
+Shared modules: `src/core`, `src/gfx`, ImGui backends.  
+Grass-only: `Scene`, `GrassSystem`, `Renderer`.  
+Voxel-only: `VoxelScene`, `VoxelRenderer`.
+
+Windows runners: `run_engine.bat`, `run_engine_voxel.bat`.
+
 ## Layout
 
 ```
 src/core/     Window, Camera
 src/gfx/      GfxDevice, VMA helpers, Mesh, Texture, PipelineBuilder
-src/scene/    Scene + materials + objects
-src/render/   Renderer (shadow → HDR PBR → tonemap → ImGui)
+src/scene/    Grass Scene + VoxelScene
+src/render/   Renderer (grass) + VoxelRenderer
 shaders/      GLSL → SPIR-V (built by CMake)
 ```

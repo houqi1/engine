@@ -87,9 +87,11 @@ private:
   VkSampler dummyCubeSampler_ = VK_NULL_HANDLE;
   VkSampler dummyLutSampler_ = VK_NULL_HANDLE;
 
-  AllocatedImage depthImage_{};
-  AllocatedImage hdrImage_{};
+  AllocatedImage depthImage_{};   // scene depth at msaaSamples_
+  AllocatedImage hdrMsaa_{};      // multisample HDR (empty when MSAA==1)
+  AllocatedImage hdrImage_{};     // 1x HDR (draw target or resolve target)
   AllocatedImage shadowImage_{};
+  VkSampleCountFlagBits msaaSamples_ = VK_SAMPLE_COUNT_1_BIT;
   VkSampler shadowSampler_ = VK_NULL_HANDLE;
   VkSampler hdrSampler_ = VK_NULL_HANDLE;
   VkDescriptorSet tonemapSet_ = VK_NULL_HANDLE;

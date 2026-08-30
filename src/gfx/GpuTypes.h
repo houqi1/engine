@@ -21,6 +21,7 @@ struct AllocatedImage {
   VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
   uint32_t mipLevels = 1;
   uint32_t layerCount = 1;
+  VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
 };
 
 struct Vertex {

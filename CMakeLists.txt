@@ -42,8 +42,8 @@ find_package(Vulkan REQUIRED)
 find_package(glfw3 3.3 REQUIRED)
 find_package(glm REQUIRED)
 
-set(VE_SOURCES
-  src/main.cpp
+# Shared engine modules linked into both demos.
+set(VE_COMMON_SOURCES
   src/core/Window.cpp
   src/core/Camera.cpp
   src/gfx/GfxDevice.cpp
@@ -52,9 +52,6 @@ set(VE_SOURCES
   src/gfx/Texture.cpp
   src/gfx/ShIrradiance.cpp
   src/gfx/IblBake.cpp
-  src/scene/Scene.cpp
-  src/scene/GrassSystem.cpp
-  src/render/Renderer.cpp
   ${imgui_SOURCE_DIR}/imgui.cpp
   ${imgui_SOURCE_DIR}/imgui_draw.cpp
   ${imgui_SOURCE_DIR}/imgui_tables.cpp
@@ -63,46 +60,68 @@ set(VE_SOURCES
   ${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp
 )
 
-add_executable(vulkan_engine ${VE_SOURCES})
-
-# Windows: use GUI subsystem so closing a console window does not kill the app.
-if(MSVC)
-  target_link_options(vulkan_engine PRIVATE "/SUBSYSTEM:WINDOWS" "/ENTRY:mainCRTStartup")
-endif()
-
-target_include_directories(vulkan_engine PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/src
-  ${CMAKE_CURRENT_SOURCE_DIR}/third_party
-  ${vma_SOURCE_DIR}/include
-  ${imgui_SOURCE_DIR}
-  ${imgui_SOURCE_DIR}/backends
+set(VE_GRASS_SOURCES
+  src/main.cpp
+  src/scene/Scene.cpp
+  src/scene/GrassSystem.cpp
+  src/render/Renderer.cpp
 )
 
-target_link_libraries(vulkan_engine PRIVATE
-  Vulkan::Vulkan
-  glfw
-  glm::glm
-  vk-bootstrap::vk-bootstrap
+set(VE_VOXEL_SOURCES
+  src/main_voxel.cpp
+  src/scene/VoxelScene.cpp
+  src/render/VoxelRenderer.cpp
 )
 
-target_compile_definitions(vulkan_engine PRIVATE
-  GLFW_INCLUDE_VULKAN
-  GLM_FORCE_RADIANS
-  GLM_FORCE_DEPTH_ZERO_TO_ONE
-  IMGUI_IMPL_VULKAN_HAS_DYNAMIC_RENDERING
-  $<$<AND:$<BOOL:${VE_ENABLE_VALIDATION}>,$<CONFIG:Debug>>:VE_ENABLE_VALIDATION=1>
-)
+function(ve_configure_target target_name)
+  target_include_directories(${target_name} PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party
+    ${vma_SOURCE_DIR}/include
+    ${imgui_SOURCE_DIR}
+    ${imgui_SOURCE_DIR}/backends
+  )
 
-if(APPLE)
-  target_compile_definitions(vulkan_engine PRIVATE VE_PLATFORM_MACOS=1)
-  target_compile_options(vulkan_engine PRIVATE -Wno-nullability-completeness)
-endif()
+  target_link_libraries(${target_name} PRIVATE
+    Vulkan::Vulkan
+    glfw
+    glm::glm
+    vk-bootstrap::vk-bootstrap
+  )
 
-# ---- Shader compilation ----
-find_program(GLSLC glslc HINTS /opt/homebrew/bin ENV VULKAN_SDK PATH_SUFFIXES bin REQUIRED)
+  target_compile_definitions(${target_name} PRIVATE
+    GLFW_INCLUDE_VULKAN
+    GLM_FORCE_RADIANS
+    GLM_FORCE_DEPTH_ZERO_TO_ONE
+    IMGUI_IMPL_VULKAN_HAS_DYNAMIC_RENDERING
+    VE_SHADER_DIR="${VE_SHADER_OUTPUT_DIR}"
+    VE_ASSETS_DIR="${CMAKE_SOURCE_DIR}/assets"
+    $<$<AND:$<BOOL:${VE_ENABLE_VALIDATION}>,$<CONFIG:Debug>>:VE_ENABLE_VALIDATION=1>
+  )
+
+  if(MSVC)
+    target_link_options(${target_name} PRIVATE "/SUBSYSTEM:WINDOWS" "/ENTRY:mainCRTStartup")
+  endif()
+
+  if(APPLE)
+    target_compile_definitions(${target_name} PRIVATE VE_PLATFORM_MACOS=1)
+    target_compile_options(${target_name} PRIVATE -Wno-nullability-completeness)
+  endif()
+endfunction()
+
+# Shader output dir must exist before target compile defs reference it.
 set(VE_SHADER_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/shaders)
 set(VE_SHADER_OUTPUT_DIR ${CMAKE_BINARY_DIR}/shaders)
 file(MAKE_DIRECTORY ${VE_SHADER_OUTPUT_DIR})
+
+add_executable(vulkan_engine ${VE_COMMON_SOURCES} ${VE_GRASS_SOURCES})
+ve_configure_target(vulkan_engine)
+
+add_executable(vulkan_engine_voxel ${VE_COMMON_SOURCES} ${VE_VOXEL_SOURCES})
+ve_configure_target(vulkan_engine_voxel)
+
+# ---- Shader compilation ----
+find_program(GLSLC glslc HINTS /opt/homebrew/bin ENV VULKAN_SDK PATH_SUFFIXES bin REQUIRED)
 
 set(VE_SHADER_SOURCES
   mesh.vert
@@ -119,6 +138,9 @@ set(VE_SHADER_SOURCES
   ibl_equirect_to_cube.frag
   ibl_prefilter.frag
   ibl_brdf.frag
+  ibl_cube.vert
+  voxel.vert
+  voxel.frag
 )
 
 set(VE_SPV_FILES "")
@@ -137,11 +159,7 @@ endforeach()
 
 add_custom_target(ve_shaders ALL DEPENDS ${VE_SPV_FILES})
 add_dependencies(vulkan_engine ve_shaders)
-
-target_compile_definitions(vulkan_engine PRIVATE
-  VE_SHADER_DIR="${VE_SHADER_OUTPUT_DIR}"
-  VE_ASSETS_DIR="${CMAKE_SOURCE_DIR}/assets"
-)
+add_dependencies(vulkan_engine_voxel ve_shaders)
 
 if(CMAKE_EXPORT_COMPILE_COMMANDS AND EXISTS "${CMAKE_BINARY_DIR}/compile_commands.json")
   add_custom_command(TARGET vulkan_engine POST_BUILD

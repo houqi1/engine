@@ -216,6 +216,19 @@ void GfxDevice::selectDevice() {
   deviceName_ = physicalDevice_.properties.deviceName ? physicalDevice_.properties.deviceName
                                                        : "Unknown GPU";
 
+  {
+    const VkSampleCountFlags supported =
+        physicalDevice_.properties.limits.framebufferColorSampleCounts &
+        physicalDevice_.properties.limits.framebufferDepthSampleCounts;
+    if (supported & VK_SAMPLE_COUNT_4_BIT) {
+      msaaSamples_ = VK_SAMPLE_COUNT_4_BIT;
+    } else if (supported & VK_SAMPLE_COUNT_2_BIT) {
+      msaaSamples_ = VK_SAMPLE_COUNT_2_BIT;
+    } else {
+      msaaSamples_ = VK_SAMPLE_COUNT_1_BIT;
+    }
+  }
+
   auto devRet = vkb::DeviceBuilder{physicalDevice_}.build();
   if (!devRet) {
     fail(std::string("Failed to create logical device: ") + devRet.error().message());
@@ -235,10 +248,12 @@ void GfxDevice::selectDevice() {
   graphicsQueueFamily_ = familyRet.value();
 
   std::cout << "Using GPU: " << deviceName_ << std::endl;
+  std::cout << "MSAA samples: " << static_cast<uint32_t>(msaaSamples_) << std::endl;
   {
     std::ofstream log("vulkan_engine.log", std::ios::app);
     if (log) {
       log << "Using GPU: " << deviceName_ << '\n';
+      log << "MSAA samples: " << static_cast<uint32_t>(msaaSamples_) << '\n';
     }
   }
 }
@@ -532,8 +547,15 @@ uint32_t GfxDevice::calcMipLevels(uint32_t width, uint32_t height) {
 
 AllocatedImage GfxDevice::createImage(VkExtent3D extent, VkFormat format, VkImageUsageFlags usage,
                                       VkImageAspectFlags aspect, bool dedicated,
-                                      uint32_t mipLevels) {
+                                      uint32_t mipLevels, VkSampleCountFlagBits samples) {
   mipLevels = std::max(1u, mipLevels);
+  if (samples == VK_SAMPLE_COUNT_FLAG_BITS_MAX_ENUM || samples == 0) {
+    samples = VK_SAMPLE_COUNT_1_BIT;
+  }
+  // Multisample images are single-mip only.
+  if (samples != VK_SAMPLE_COUNT_1_BIT) {
+    mipLevels = 1;
+  }
 
   VkImageCreateInfo imageInfo{};
   imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -542,7 +564,7 @@ AllocatedImage GfxDevice::createImage(VkExtent3D extent, VkFormat format, VkImag
   imageInfo.extent = extent;
   imageInfo.mipLevels = mipLevels;
   imageInfo.arrayLayers = 1;
-  imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+  imageInfo.samples = samples;
   imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
   imageInfo.usage = usage;
   imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -558,6 +580,7 @@ AllocatedImage GfxDevice::createImage(VkExtent3D extent, VkFormat format, VkImag
   out.format = format;
   out.mipLevels = mipLevels;
   out.layerCount = 1;
+  out.samples = samples;
   if (vmaCreateImage(allocator_, &imageInfo, &allocInfo, &out.image, &out.allocation, nullptr) !=
       VK_SUCCESS) {
     fail("Failed to create image");

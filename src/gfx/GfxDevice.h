@@ -45,7 +45,8 @@ public:
 
   AllocatedImage createImage(VkExtent3D extent, VkFormat format, VkImageUsageFlags usage,
                              VkImageAspectFlags aspect, bool dedicated = false,
-                             uint32_t mipLevels = 1);
+                             uint32_t mipLevels = 1,
+                             VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT);
   AllocatedImage createCubemap(uint32_t size, VkFormat format, VkImageUsageFlags usage,
                                uint32_t mipLevels = 1);
   void destroyImage(AllocatedImage& image);
@@ -90,6 +91,8 @@ public:
   bool swapchainWasRecreated() const { return swapchainRecreated_; }
   void clearSwapchainRecreatedFlag() { swapchainRecreated_ = false; }
   const std::string& deviceName() const { return deviceName_; }
+  // Preferred MSAA for scene color/depth (4x when supported, else 2x/1x).
+  VkSampleCountFlagBits msaaSamples() const { return msaaSamples_; }
 
 private:
   struct FrameData {
@@ -119,6 +122,7 @@ private:
   vkb::PhysicalDevice physicalDevice_{};
   vkb::Device device_{};
   std::string deviceName_;
+  VkSampleCountFlagBits msaaSamples_ = VK_SAMPLE_COUNT_1_BIT;
   VkQueue graphicsQueue_ = VK_NULL_HANDLE;
   uint32_t graphicsQueueFamily_ = 0;
   VmaAllocator allocator_ = VK_NULL_HANDLE;

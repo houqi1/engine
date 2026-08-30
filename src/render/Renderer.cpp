@@ -45,7 +45,7 @@ void writeVec3(float* dst, const glm::vec3& v) {
 
 }  // namespace
 
-Renderer::Renderer(GfxDevice& gfx) : gfx_(gfx) {}
+Renderer::Renderer(GfxDevice& gfx) : gfx_(gfx), msaaSamples_(gfx.msaaSamples()) {}
 
 Renderer::~Renderer() {
   gfx_.waitIdle();
@@ -474,12 +474,17 @@ void Renderer::createDescriptors() {
 
 void Renderer::createRenderTargets() {
   const VkExtent3D extent{gfx_.swapchainExtent().width, gfx_.swapchainExtent().height, 1};
-  depthImage_ = gfx_.createImage(extent, kDepthFormat,
-                                 VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_IMAGE_ASPECT_DEPTH_BIT,
-                                 true);
+  depthImage_ = gfx_.createImage(extent, kDepthFormat, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+                                 VK_IMAGE_ASPECT_DEPTH_BIT, true, 1, msaaSamples_);
+
+  // 1x HDR is always the tonemap source (direct target when MSAA==1, resolve target otherwise).
   hdrImage_ = gfx_.createImage(extent, kHdrFormat,
                                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                               VK_IMAGE_ASPECT_COLOR_BIT, true);
+                               VK_IMAGE_ASPECT_COLOR_BIT, true, 1, VK_SAMPLE_COUNT_1_BIT);
+  if (msaaSamples_ != VK_SAMPLE_COUNT_1_BIT) {
+    hdrMsaa_ = gfx_.createImage(extent, kHdrFormat, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+                                VK_IMAGE_ASPECT_COLOR_BIT, true, 1, msaaSamples_);
+  }
   if (!hdrSampler_) {
     hdrSampler_ = gfx_.createSampler(VK_FILTER_LINEAR, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, false);
   }
@@ -487,6 +492,7 @@ void Renderer::createRenderTargets() {
 
 void Renderer::destroyRenderTargets() {
   gfx_.destroyImage(depthImage_);
+  gfx_.destroyImage(hdrMsaa_);
   gfx_.destroyImage(hdrImage_);
 }
 
@@ -606,6 +612,7 @@ void Renderer::createPipelines() {
                       .setShaders(meshVert, meshFrag)
                       .setVertexInput(binding, attrs)
                       .setCullMode(VK_CULL_MODE_BACK_BIT, VK_FRONT_FACE_COUNTER_CLOCKWISE)
+                      .setMultisampling(msaaSamples_)
                       .setDepthTest(true, true, VK_COMPARE_OP_GREATER_OR_EQUAL)
                       .setColorFormat(kHdrFormat)
                       .setDepthFormat(kDepthFormat)
@@ -652,6 +659,7 @@ void Renderer::createPipelines() {
                        .setShaders(grassVert, grassFrag)
                        .setVertexInput(grassBindings, grassAttrs)
                        .setCullMode(VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE)
+                       .setMultisampling(msaaSamples_)
                        .setDepthTest(true, true, VK_COMPARE_OP_GREATER_OR_EQUAL)
                        .setColorFormat(kHdrFormat)
                        .setDepthFormat(kDepthFormat)
@@ -672,6 +680,7 @@ void Renderer::createPipelines() {
   skyPipeline_ = PipelineBuilder()
                      .setShaders(fsVert, skyFrag)
                      .setCullMode(VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE)
+                     .setMultisampling(msaaSamples_)
                      .setDepthTest(true, false, VK_COMPARE_OP_EQUAL)
                      .setColorFormat(kHdrFormat)
                      .setDepthFormat(kDepthFormat)
@@ -963,7 +972,15 @@ void Renderer::draw(Scene& scene, float /*dt*/, float displayFps) {
                          VK_IMAGE_ASPECT_DEPTH_BIT);
   }
 
-  // ---- Main HDR pass ----
+  // ---- Main HDR pass (MSAA scene → resolve to 1x hdrImage_ when enabled) ----
+  const bool useMsaa = msaaSamples_ != VK_SAMPLE_COUNT_1_BIT;
+  if (useMsaa) {
+    gfx_.transitionImage(frame.cmd, hdrMsaa_.image, VK_IMAGE_LAYOUT_UNDEFINED,
+                         VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                         VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                         VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+  }
   gfx_.transitionImage(frame.cmd, hdrImage_.image, VK_IMAGE_LAYOUT_UNDEFINED,
                        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
                        0, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
@@ -980,18 +997,26 @@ void Renderer::draw(Scene& scene, float /*dt*/, float displayFps) {
 
   VkRenderingAttachmentInfo colorAttach{};
   colorAttach.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-  colorAttach.imageView = hdrImage_.view;
   colorAttach.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
   colorAttach.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-  colorAttach.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
   colorAttach.clearValue = colorClear;
+  if (useMsaa) {
+    colorAttach.imageView = hdrMsaa_.view;
+    colorAttach.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    colorAttach.resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT;
+    colorAttach.resolveImageView = hdrImage_.view;
+    colorAttach.resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+  } else {
+    colorAttach.imageView = hdrImage_.view;
+    colorAttach.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  }
 
   VkRenderingAttachmentInfo depthAttach{};
   depthAttach.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
   depthAttach.imageView = depthImage_.view;
   depthAttach.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
   depthAttach.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-  depthAttach.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  depthAttach.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
   depthAttach.clearValue = depthClear;
 
   VkRenderingInfo mainInfo{};
@@ -1169,6 +1194,7 @@ void Renderer::recordImGui(VkCommandBuffer cmd, const FrameContext& /*frame*/, S
 
   ImGui::Begin("Vulkan Engine");
   ImGui::TextWrapped("GPU: %s", gfx_.deviceName().c_str());
+  ImGui::Text("MSAA: %ux", static_cast<uint32_t>(msaaSamples_));
   ImGui::Separator();
   ImGui::Text("Timing (VSync ON)");
   ImGui::Text("Display FPS: %.1f  (%.2f ms)", stats_.displayFps, stats_.displayFrameMs);
