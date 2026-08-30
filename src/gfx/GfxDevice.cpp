@@ -557,6 +557,7 @@ AllocatedImage GfxDevice::createImage(VkExtent3D extent, VkFormat format, VkImag
   out.extent = extent;
   out.format = format;
   out.mipLevels = mipLevels;
+  out.layerCount = 1;
   if (vmaCreateImage(allocator_, &imageInfo, &allocInfo, &out.image, &out.allocation, nullptr) !=
       VK_SUCCESS) {
     fail("Failed to create image");
@@ -572,6 +573,51 @@ AllocatedImage GfxDevice::createImage(VkExtent3D extent, VkFormat format, VkImag
   viewInfo.subresourceRange.layerCount = 1;
   if (vkCreateImageView(device_.device, &viewInfo, nullptr, &out.view) != VK_SUCCESS) {
     fail("Failed to create image view");
+  }
+  return out;
+}
+
+AllocatedImage GfxDevice::createCubemap(uint32_t size, VkFormat format, VkImageUsageFlags usage,
+                                        uint32_t mipLevels) {
+  mipLevels = std::max(1u, mipLevels);
+  size = std::max(1u, size);
+
+  VkImageCreateInfo imageInfo{};
+  imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+  imageInfo.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+  imageInfo.imageType = VK_IMAGE_TYPE_2D;
+  imageInfo.format = format;
+  imageInfo.extent = {size, size, 1};
+  imageInfo.mipLevels = mipLevels;
+  imageInfo.arrayLayers = 6;
+  imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+  imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+  imageInfo.usage = usage;
+  imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+  VmaAllocationCreateInfo allocInfo{};
+  allocInfo.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+
+  AllocatedImage out{};
+  out.extent = {size, size, 1};
+  out.format = format;
+  out.mipLevels = mipLevels;
+  out.layerCount = 6;
+  if (vmaCreateImage(allocator_, &imageInfo, &allocInfo, &out.image, &out.allocation, nullptr) !=
+      VK_SUCCESS) {
+    fail("Failed to create cubemap image");
+  }
+
+  VkImageViewCreateInfo viewInfo{};
+  viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+  viewInfo.image = out.image;
+  viewInfo.viewType = VK_IMAGE_VIEW_TYPE_CUBE;
+  viewInfo.format = format;
+  viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  viewInfo.subresourceRange.levelCount = mipLevels;
+  viewInfo.subresourceRange.layerCount = 6;
+  if (vkCreateImageView(device_.device, &viewInfo, nullptr, &out.view) != VK_SUCCESS) {
+    fail("Failed to create cubemap image view");
   }
   return out;
 }
@@ -719,7 +765,8 @@ void GfxDevice::transitionImage(VkCommandBuffer cmd, VkImage image, VkImageLayou
                                 VkImageLayout newLayout, VkPipelineStageFlags2 srcStage,
                                 VkAccessFlags2 srcAccess, VkPipelineStageFlags2 dstStage,
                                 VkAccessFlags2 dstAccess, VkImageAspectFlags aspect,
-                                uint32_t baseMipLevel, uint32_t levelCount) const {
+                                uint32_t baseMipLevel, uint32_t levelCount, uint32_t baseArrayLayer,
+                                uint32_t layerCount) const {
   VkImageMemoryBarrier2 barrier{};
   barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
   barrier.srcStageMask = srcStage;
@@ -734,11 +781,239 @@ void GfxDevice::transitionImage(VkCommandBuffer cmd, VkImage image, VkImageLayou
   barrier.subresourceRange.aspectMask = aspect;
   barrier.subresourceRange.baseMipLevel = baseMipLevel;
   barrier.subresourceRange.levelCount = levelCount;
-  barrier.subresourceRange.layerCount = 1;
+  barrier.subresourceRange.baseArrayLayer = baseArrayLayer;
+  barrier.subresourceRange.layerCount = layerCount;
 
   VkDependencyInfo dependency{};
   dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
   dependency.imageMemoryBarrierCount = 1;
   dependency.pImageMemoryBarriers = &barrier;
   vkCmdPipelineBarrier2(cmd, &dependency);
+}
+
+void GfxDevice::uploadCubemapRGBA32F(AllocatedImage& image, const float* data) {
+  if (!data || image.layerCount != 6 || image.format != VK_FORMAT_R32G32B32A32_SFLOAT) {
+    fail("uploadCubemapRGBA32F: invalid cubemap or data");
+  }
+
+  const uint32_t mipLevels = std::max(1u, image.mipLevels);
+  uint32_t size = image.extent.width;
+  VkDeviceSize totalFloats = 0;
+  for (uint32_t mip = 0; mip < mipLevels; ++mip) {
+    const uint32_t s = std::max(1u, size >> mip);
+    totalFloats += static_cast<VkDeviceSize>(s) * s * 6u * 4u;
+  }
+
+  AllocatedBuffer staging = createBuffer(totalFloats * sizeof(float), VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                         VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
+  std::memcpy(staging.info.pMappedData, data, static_cast<size_t>(totalFloats * sizeof(float)));
+
+  std::vector<VkBufferImageCopy> regions;
+  regions.reserve(mipLevels * 6u);
+  VkDeviceSize offsetBytes = 0;
+  for (uint32_t mip = 0; mip < mipLevels; ++mip) {
+    const uint32_t s = std::max(1u, size >> mip);
+    const VkDeviceSize faceBytes = static_cast<VkDeviceSize>(s) * s * 4u * sizeof(float);
+    for (uint32_t face = 0; face < 6; ++face) {
+      VkBufferImageCopy region{};
+      region.bufferOffset = offsetBytes;
+      region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+      region.imageSubresource.mipLevel = mip;
+      region.imageSubresource.baseArrayLayer = face;
+      region.imageSubresource.layerCount = 1;
+      region.imageExtent = {s, s, 1};
+      regions.push_back(region);
+      offsetBytes += faceBytes;
+    }
+  }
+
+  immediateSubmit([&](VkCommandBuffer cmd) {
+    transitionImage(cmd, image.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                    VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_IMAGE_ASPECT_COLOR_BIT, 0, mipLevels, 0, 6);
+    vkCmdCopyBufferToImage(cmd, staging.buffer, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                           static_cast<uint32_t>(regions.size()), regions.data());
+    transitionImage(cmd, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                    VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                    VK_ACCESS_2_SHADER_READ_BIT, VK_IMAGE_ASPECT_COLOR_BIT, 0, mipLevels, 0, 6);
+  });
+
+  image.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  destroyBuffer(staging);
+}
+
+VkImageView GfxDevice::createImageView(AllocatedImage& image, VkImageViewType type, uint32_t baseMip,
+                                       uint32_t mipCount, uint32_t baseLayer,
+                                       uint32_t layerCount) const {
+  VkImageViewCreateInfo info{};
+  info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+  info.image = image.image;
+  info.viewType = type;
+  info.format = image.format;
+  info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  info.subresourceRange.baseMipLevel = baseMip;
+  info.subresourceRange.levelCount = mipCount;
+  info.subresourceRange.baseArrayLayer = baseLayer;
+  info.subresourceRange.layerCount = layerCount;
+  VkImageView view = VK_NULL_HANDLE;
+  if (vkCreateImageView(device_.device, &info, nullptr, &view) != VK_SUCCESS) {
+    fail("Failed to create image view");
+  }
+  return view;
+}
+
+void GfxDevice::destroyImageView(VkImageView view) const {
+  if (view) {
+    vkDestroyImageView(device_.device, view, nullptr);
+  }
+}
+
+void GfxDevice::generateCubemapMips(AllocatedImage& image) {
+  if (image.layerCount != 6 || image.mipLevels <= 1) {
+    return;
+  }
+  const uint32_t mipLevels = image.mipLevels;
+  immediateSubmit([&](VkCommandBuffer cmd) {
+    // mip0 is valid; higher mips are still UNDEFINED.
+    transitionImage(cmd, image.image, image.layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_SHADER_READ_BIT,
+                    VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+                    VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 6);
+    if (mipLevels > 1) {
+      transitionImage(cmd, image.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                      VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                      VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_IMAGE_ASPECT_COLOR_BIT, 1, mipLevels - 1, 0,
+                      6);
+    }
+
+    int32_t mipWidth = static_cast<int32_t>(image.extent.width);
+    int32_t mipHeight = static_cast<int32_t>(image.extent.height);
+    for (uint32_t i = 1; i < mipLevels; ++i) {
+      VkImageBlit blit{};
+      blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+      blit.srcSubresource.mipLevel = i - 1;
+      blit.srcSubresource.baseArrayLayer = 0;
+      blit.srcSubresource.layerCount = 6;
+      blit.srcOffsets[1] = {mipWidth, mipHeight, 1};
+      blit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+      blit.dstSubresource.mipLevel = i;
+      blit.dstSubresource.baseArrayLayer = 0;
+      blit.dstSubresource.layerCount = 6;
+      blit.dstOffsets[1] = {mipWidth > 1 ? mipWidth / 2 : 1, mipHeight > 1 ? mipHeight / 2 : 1, 1};
+
+      vkCmdBlitImage(cmd, image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image.image,
+                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+
+      transitionImage(cmd, image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                      VK_ACCESS_2_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                      VK_ACCESS_2_SHADER_READ_BIT, VK_IMAGE_ASPECT_COLOR_BIT, i - 1, 1, 0, 6);
+
+      if (i + 1 < mipLevels) {
+        transitionImage(cmd, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                        VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                        VK_ACCESS_2_TRANSFER_READ_BIT, VK_IMAGE_ASPECT_COLOR_BIT, i, 1, 0, 6);
+      }
+
+      if (mipWidth > 1) {
+        mipWidth /= 2;
+      }
+      if (mipHeight > 1) {
+        mipHeight /= 2;
+      }
+    }
+
+    transitionImage(cmd, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                    VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                    VK_ACCESS_2_SHADER_READ_BIT, VK_IMAGE_ASPECT_COLOR_BIT, mipLevels - 1, 1, 0, 6);
+  });
+  image.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+}
+
+void GfxDevice::downloadCubemapRGBA32F(AllocatedImage& image, std::vector<float>& out) {
+  if (image.layerCount != 6 || image.format != VK_FORMAT_R32G32B32A32_SFLOAT) {
+    fail("downloadCubemapRGBA32F: invalid cubemap");
+  }
+  const uint32_t mipLevels = std::max(1u, image.mipLevels);
+  const uint32_t size = image.extent.width;
+  VkDeviceSize totalFloats = 0;
+  for (uint32_t mip = 0; mip < mipLevels; ++mip) {
+    const uint32_t s = std::max(1u, size >> mip);
+    totalFloats += static_cast<VkDeviceSize>(s) * s * 6u * 4u;
+  }
+  out.resize(static_cast<size_t>(totalFloats));
+
+  AllocatedBuffer staging =
+      createBuffer(totalFloats * sizeof(float), VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                   VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
+
+  std::vector<VkBufferImageCopy> regions;
+  regions.reserve(mipLevels * 6u);
+  VkDeviceSize offsetBytes = 0;
+  for (uint32_t mip = 0; mip < mipLevels; ++mip) {
+    const uint32_t s = std::max(1u, size >> mip);
+    const VkDeviceSize faceBytes = static_cast<VkDeviceSize>(s) * s * 4u * sizeof(float);
+    for (uint32_t face = 0; face < 6; ++face) {
+      VkBufferImageCopy region{};
+      region.bufferOffset = offsetBytes;
+      region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+      region.imageSubresource.mipLevel = mip;
+      region.imageSubresource.baseArrayLayer = face;
+      region.imageSubresource.layerCount = 1;
+      region.imageExtent = {s, s, 1};
+      regions.push_back(region);
+      offsetBytes += faceBytes;
+    }
+  }
+
+  immediateSubmit([&](VkCommandBuffer cmd) {
+    transitionImage(cmd, image.image, image.layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_SHADER_READ_BIT,
+                    VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+                    VK_IMAGE_ASPECT_COLOR_BIT, 0, mipLevels, 0, 6);
+    vkCmdCopyImageToBuffer(cmd, image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, staging.buffer,
+                           static_cast<uint32_t>(regions.size()), regions.data());
+    transitionImage(cmd, image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                    VK_ACCESS_2_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                    VK_ACCESS_2_SHADER_READ_BIT, VK_IMAGE_ASPECT_COLOR_BIT, 0, mipLevels, 0, 6);
+  });
+  image.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  std::memcpy(out.data(), staging.info.pMappedData, static_cast<size_t>(totalFloats * sizeof(float)));
+  destroyBuffer(staging);
+}
+
+void GfxDevice::downloadImageRGBA32F(AllocatedImage& image, std::vector<float>& out) {
+  if (image.format != VK_FORMAT_R32G32B32A32_SFLOAT) {
+    fail("downloadImageRGBA32F: expected RGBA32F");
+  }
+  const uint32_t w = image.extent.width;
+  const uint32_t h = image.extent.height;
+  const VkDeviceSize floats = static_cast<VkDeviceSize>(w) * h * 4u;
+  out.resize(static_cast<size_t>(floats));
+  AllocatedBuffer staging = createBuffer(floats * sizeof(float), VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                         VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
+
+  VkBufferImageCopy region{};
+  region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  region.imageSubresource.layerCount = 1;
+  region.imageExtent = {w, h, 1};
+
+  immediateSubmit([&](VkCommandBuffer cmd) {
+    transitionImage(cmd, image.image, image.layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_SHADER_READ_BIT,
+                    VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+    vkCmdCopyImageToBuffer(cmd, image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, staging.buffer, 1,
+                           &region);
+    transitionImage(cmd, image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                    VK_ACCESS_2_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                    VK_ACCESS_2_SHADER_READ_BIT);
+  });
+  image.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  std::memcpy(out.data(), staging.info.pMappedData, static_cast<size_t>(floats * sizeof(float)));
+  destroyBuffer(staging);
 }

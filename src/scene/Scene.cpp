@@ -20,23 +20,25 @@ void Scene::init(GfxDevice& gfx) {
   gold_ = TextureFactory::createSolid(gfx, 1.0f, 0.76f, 0.33f);
 
   const std::string skyPath = std::string(VE_ASSETS_DIR) + "/sky/autumn_field_puresky_2k.hdr";
+  const std::string iblCacheDir = std::string(VE_ASSETS_DIR) + "/sky/cache";
   try {
     EquirectHdrData skyHdr = TextureFactory::loadHdrEquirectData(skyPath);
     sky_ = TextureFactory::createEquirectTexture(gfx, skyHdr);
-    skyIrradianceSH_ = ShIrradiance::projectEquirect(skyHdr.rgba.data(), skyHdr.width, skyHdr.height);
-    std::cout << "Loaded skybox: " << skyPath << " (" << skyHdr.width << "x" << skyHdr.height
-              << "), SH irradiance=" << (skyIrradianceSH_.valid ? "ok" : "fail") << std::endl;
+    std::cout << "Loaded skybox: " << skyPath << " (" << skyHdr.width << "x" << skyHdr.height << ")"
+              << std::endl;
+    ibl_ = IblBake::buildOrLoad(gfx, skyHdr, skyPath, iblCacheDir, &skyIrradianceSH_);
   } catch (const std::exception& e) {
-    std::cerr << "Skybox load failed: " << e.what() << std::endl;
+    std::cerr << "Skybox/IBL load failed: " << e.what() << std::endl;
     skyIrradianceSH_ = {};
+    IblBake::destroy(gfx, ibl_);
   }
 
   matFloor_ = Material{&checker_, glm::vec4(1.0f), 0.0f, 0.85f};
   matCube_ = Material{&rust_, glm::vec4(1.0f), 0.1f, 0.45f};
   matSphere_ = Material{&white_, glm::vec4(0.2f, 0.45f, 0.95f, 1.0f), 0.05f, 0.25f};
   matGold_ = Material{&gold_, glm::vec4(1.0f), 1.0f, 0.2f};
-  // SH debug probe: raw irradiance only (see mesh.frag shOnly).
-  matProbe_ = Material{&white_, glm::vec4(1.0f), 0.0f, 1.0f, true};
+  // SH + specular IBL debug probe (no direct light). Mid roughness so reflections read clearly.
+  matProbe_ = Material{&white_, glm::vec4(1.0f), 0.0f, 0.25f, true};
 
   objects_.clear();
   objects_.push_back(RenderObject{&plane_, &matFloor_, glm::mat4(1.0f), true});
@@ -71,6 +73,7 @@ void Scene::init(GfxDevice& gfx) {
 void Scene::cleanup(GfxDevice& gfx) {
   objects_.clear();
   grass_.cleanup(gfx);
+  IblBake::destroy(gfx, ibl_);
   TextureFactory::destroy(gfx, sky_);
   TextureFactory::destroy(gfx, checker_);
   TextureFactory::destroy(gfx, white_);

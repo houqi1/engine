@@ -25,6 +25,10 @@ layout(set = 0, binding = 0, std140) uniform FrameUBO {
     float skyYaw;
     float skyIntensity;
     float ambientScale;
+    float iblMaxLod;
+    float specularIblScale;
+    float enablePrefiltered;
+    float enableBrdfLut;
     vec4 ambientSH[9];
 } frame;
 
@@ -98,7 +102,7 @@ vec3 grassAmbient(vec3 worldN) {
 }
 
 void main() {
-    // Blade silhouette comes from tapered geometry â€” no discard (keeps Early-Z).
+    // Blade silhouette comes from tapered geometry â€?no discard (keeps Early-Z).
     vec3 N = normalize(vWorldNormal);
     vec3 L = normalize(-frame.lightDir);
     // Two-sided lighting for thin blades.

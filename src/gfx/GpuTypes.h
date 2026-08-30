@@ -20,6 +20,7 @@ struct AllocatedImage {
   VkFormat format = VK_FORMAT_UNDEFINED;
   VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
   uint32_t mipLevels = 1;
+  uint32_t layerCount = 1;
 };
 
 struct Vertex {
@@ -43,8 +44,12 @@ struct FrameUBO {
   float mipLodBias;
   float skyYaw;
   float skyIntensity;
-  float ambientScale;     // scales SH irradiance for grass
-  float ambientSH[9][4];  // L2 irradiance coeffs (std140 vec4 each)
+  float ambientScale;      // scales SH irradiance (diffuse IBL)
+  float iblMaxLod;          // prefiltered cubemap max mip
+  float specularIblScale;   // specular IBL intensity
+  float enablePrefiltered;  // 1 = include/show prefiltered cubemap
+  float enableBrdfLut;      // 1 = include/show BRDF LUT term
+  float ambientSH[9][4];    // L2 irradiance coeffs (std140 vec4 each)
 };
 
 struct MaterialUBO {

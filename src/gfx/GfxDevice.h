@@ -46,9 +46,20 @@ public:
   AllocatedImage createImage(VkExtent3D extent, VkFormat format, VkImageUsageFlags usage,
                              VkImageAspectFlags aspect, bool dedicated = false,
                              uint32_t mipLevels = 1);
+  AllocatedImage createCubemap(uint32_t size, VkFormat format, VkImageUsageFlags usage,
+                               uint32_t mipLevels = 1);
   void destroyImage(AllocatedImage& image);
   void uploadToImage(AllocatedImage& image, const void* data, VkDeviceSize size, VkExtent3D extent,
                      bool generateMips = false);
+  // RGBA32F tightly packed: for each mip, 6 faces in +X,-X,+Y,-Y,+Z,-Z order.
+  void uploadCubemapRGBA32F(AllocatedImage& image, const float* data);
+  void downloadCubemapRGBA32F(AllocatedImage& image, std::vector<float>& out);
+  void downloadImageRGBA32F(AllocatedImage& image, std::vector<float>& out);
+  void generateCubemapMips(AllocatedImage& image);
+
+  VkImageView createImageView(AllocatedImage& image, VkImageViewType type, uint32_t baseMip,
+                              uint32_t mipCount, uint32_t baseLayer, uint32_t layerCount) const;
+  void destroyImageView(VkImageView view) const;
 
   VkSampler createSampler(VkFilter filter, VkSamplerAddressMode addressMode, bool anisotropy,
                           uint32_t mipLevels = 1, float mipLodBias = 0.0f);
@@ -61,7 +72,8 @@ public:
                        VkAccessFlags2 srcAccess, VkPipelineStageFlags2 dstStage,
                        VkAccessFlags2 dstAccess,
                        VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT,
-                       uint32_t baseMipLevel = 0, uint32_t levelCount = 1) const;
+                       uint32_t baseMipLevel = 0, uint32_t levelCount = 1,
+                       uint32_t baseArrayLayer = 0, uint32_t layerCount = 1) const;
 
   static uint32_t calcMipLevels(uint32_t width, uint32_t height);
 

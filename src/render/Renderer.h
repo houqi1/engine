@@ -43,6 +43,7 @@ private:
   void initImGui();
   void shutdownImGui();
   void ensureMaterialSet(Material* material);
+  void syncMaterialUbo(Material* material);
   void updateFrameUBO(Scene& scene, uint32_t frameIndex);
   void recordGrass(VkCommandBuffer cmd, VkPipeline pipeline, VkPipelineLayout layout,
                    VkDescriptorSet frameSet, Scene& scene, bool shadowPass);
@@ -61,6 +62,7 @@ private:
   VkDescriptorSetLayout frameLayout_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout materialLayout_ = VK_NULL_HANDLE;
   VkDescriptorSetLayout skyLayout_ = VK_NULL_HANDLE;
+  VkDescriptorSetLayout iblLayout_ = VK_NULL_HANDLE;
   VkDescriptorPool descriptorPool_ = VK_NULL_HANDLE;
   VkDescriptorPool imguiPool_ = VK_NULL_HANDLE;
 
@@ -77,6 +79,13 @@ private:
   VkPipeline grassShadowPipeline_ = VK_NULL_HANDLE;
   VkPipeline skyPipeline_ = VK_NULL_HANDLE;
   VkDescriptorSet skySet_ = VK_NULL_HANDLE;
+  VkDescriptorSet iblSet_ = VK_NULL_HANDLE;
+
+  // Fallback 1x1 resources so mesh set=2 is always valid.
+  AllocatedImage dummyCube_{};
+  AllocatedImage dummyLut_{};
+  VkSampler dummyCubeSampler_ = VK_NULL_HANDLE;
+  VkSampler dummyLutSampler_ = VK_NULL_HANDLE;
 
   AllocatedImage depthImage_{};
   AllocatedImage hdrImage_{};
@@ -99,8 +108,11 @@ private:
   bool showSky_ = true;
   float skyIntensity_ = 1.0f;
   float skyYaw_ = 0.0f;
-  float ambientScale_ = 0.35f;  // SH irradiance scale for grass
+  float ambientScale_ = 0.35f;  // SH irradiance scale (diffuse IBL)
   bool useSkyAmbient_ = true;
+  bool enablePrefilteredIbl_ = true;
+  bool enableBrdfLutIbl_ = true;
+  float specularIblScale_ = 1.0f;
   // Positive bias samples lower-res mips sooner (shader bias; MoltenVK lacks samplerMipLodBias).
   float mipLodBias_ = 0.5f;
 

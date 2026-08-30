@@ -23,6 +23,10 @@ layout(set = 0, binding = 0, std140) uniform FrameUBO {
     float skyYaw;
     float skyIntensity;
     float ambientScale;
+    float iblMaxLod;
+    float specularIblScale;
+    float enablePrefiltered;
+    float enableBrdfLut;
     vec4 ambientSH[9];
 } frame;
 
@@ -37,6 +41,9 @@ layout(set = 1, binding = 1, std140) uniform MaterialUBO {
     float shOnly;
     float _pad1;
 } material;
+
+layout(set = 2, binding = 0) uniform samplerCube prefilteredMap;
+layout(set = 2, binding = 1) uniform sampler2D brdfLUT;
 
 const float PI = 3.14159265359;
 
@@ -65,9 +72,12 @@ vec3 FresnelSchlick(float cosTheta, vec3 F0) {
     return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
 }
 
+vec3 FresnelSchlickRoughness(float cosTheta, vec3 F0, float roughness) {
+    return F0 + (max(vec3(1.0 - roughness), F0) - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+}
+
 float ShadowPCF(vec4 lightSpacePos) {
     vec3 projCoords = lightSpacePos.xyz / lightSpacePos.w;
-    // Vulkan NDC: xy in [-1,1] -> [0,1], depth already [0,1]
     projCoords.xy = projCoords.xy * 0.5 + 0.5;
 
     if (projCoords.z > 1.0 || projCoords.x < 0.0 || projCoords.x > 1.0 ||
@@ -131,22 +141,53 @@ vec3 skyAmbient(vec3 worldN) {
     return evalSHIrradiance(nEnv) * frame.skyIntensity * frame.ambientScale;
 }
 
+// Independent toggles: prefiltered cubemap and/or BRDF LUT.
+vec3 evalSpecularIbl(vec3 N, vec3 V, float NdotV, vec3 F0, float roughness) {
+    bool usePref = frame.enablePrefiltered > 0.5;
+    bool useBrdf = frame.enableBrdfLut > 0.5;
+    if (!usePref && !useBrdf) {
+        return vec3(0.0);
+    }
+
+    vec3 Frough = FresnelSchlickRoughness(NdotV, F0, roughness);
+    vec3 R = rotateYaw(reflect(-V, N), frame.skyYaw);
+    float lod = roughness * max(frame.iblMaxLod, 0.0);
+    vec3 prefiltered = textureLod(prefilteredMap, R, lod).rgb * frame.skyIntensity;
+    vec2 brdf = texture(brdfLUT, vec2(NdotV, roughness)).rg;
+    vec3 brdfTerm = Frough * brdf.x + brdf.y;
+
+    if (usePref && useBrdf) {
+        return prefiltered * brdfTerm * frame.specularIblScale;
+    }
+    if (usePref) {
+        // Raw prefiltered environment at this roughness lod.
+        return prefiltered * frame.specularIblScale;
+    }
+    // BRDF LUT only: R=scale, G=bias (visualize channels).
+    return vec3(brdf.x, brdf.y, 0.0) * frame.specularIblScale;
+}
+
 void main() {
     vec3 N = normalize(vWorldNormal);
 
-    // Debug probe: raw sky SH irradiance only (no albedo, direct, shadow, or BRDF).
+    // Debug probe: sky SH diffuse + specular IBL only (no direct light / shadows).
     if (material.shOnly > 0.5) {
-        vec3 sh = vec3(0.0);
-        if (frame.ambientScale > 0.0) {
-            vec3 nEnv = rotateYaw(N, frame.skyYaw);
-            sh = evalSHIrradiance(nEnv) * frame.skyIntensity * frame.ambientScale;
-        }
-        outColor = vec4(sh, 1.0);
+        vec3 albedo = material.baseColorFactor.rgb;
+        float metallic = material.metallic;
+        float roughness = max(material.roughness, 0.04);
+        vec3 V = normalize(frame.cameraPos - vWorldPos);
+        float NdotV = max(dot(N, V), 0.0);
+        vec3 F0 = mix(vec3(0.04), albedo, metallic);
+
+        vec3 Frough = FresnelSchlickRoughness(NdotV, F0, roughness);
+        vec3 kDibl = (vec3(1.0) - Frough) * (1.0 - metallic);
+        vec3 diffuseIBL = kDibl * albedo * skyAmbient(N);
+        vec3 specularIBL = evalSpecularIbl(N, V, NdotV, F0, roughness);
+
+        outColor = vec4(diffuseIBL + specularIBL, 1.0);
         return;
     }
 
-    // Positive bias picks lower mips sooner — reduces ground moiré on grazing angles.
-    // (Sampler mipLodBias is unavailable under MoltenVK portability; bias comes from FrameUBO.)
     vec4 albedoSample = texture(albedoMap, vUV, frame.mipLodBias) * material.baseColorFactor;
     vec3 albedo = albedoSample.rgb;
     float metallic = material.metallic;
@@ -155,9 +196,11 @@ void main() {
     vec3 V = normalize(frame.cameraPos - vWorldPos);
     vec3 L = normalize(-frame.lightDir);
     vec3 H = normalize(V + L);
+    float NdotV = max(dot(N, V), 0.0);
 
     vec3 F0 = mix(vec3(0.04), albedo, metallic);
 
+    // Direct lighting
     float NDF = DistributionGGX(N, H, roughness);
     float G = GeometrySmith(N, V, L, roughness);
     vec3 F = FresnelSchlick(max(dot(H, V), 0.0), F0);
@@ -174,8 +217,18 @@ void main() {
     float shadow = ShadowPCF(vLightSpacePos);
 
     vec3 Lo = (kD * albedo / PI + specular) * radiance * NdotL * shadow;
-    vec3 ambient = frame.ambientColor * albedo;
-    vec3 color = ambient + Lo;
 
+    // Diffuse IBL from SH
+    vec3 diffuseIBL = kD * albedo * skyAmbient(N);
+
+    // Specular IBL (split-sum); each half can be toggled independently.
+    vec3 specularIBL = evalSpecularIbl(N, V, NdotV, F0, roughness);
+    if (frame.enablePrefiltered > 0.5 || frame.enableBrdfLut > 0.5) {
+        vec3 Frough = FresnelSchlickRoughness(NdotV, F0, roughness);
+        vec3 kDibl = (vec3(1.0) - Frough) * (1.0 - metallic);
+        diffuseIBL = kDibl * albedo * skyAmbient(N);
+    }
+
+    vec3 color = Lo + diffuseIBL + specularIBL;
     outColor = vec4(color, albedoSample.a);
 }

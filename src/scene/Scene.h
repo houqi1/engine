@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/Camera.h"
+#include "gfx/IblBake.h"
 #include "gfx/Mesh.h"
 #include "gfx/ShIrradiance.h"
 #include "gfx/Texture.h"
@@ -15,7 +16,7 @@ struct Material {
   glm::vec4 baseColor{1.0f};
   float metallic = 0.0f;
   float roughness = 0.5f;
-  bool shOnly = false;  // debug: output raw sky SH, no direct/specular/diffuse BRDF
+  bool shOnly = false;  // debug probe: sky SH + specular IBL only (no direct light)
 };
 
 struct RenderObject {
@@ -51,6 +52,10 @@ public:
   bool hasSky() const { return sky_.image.image != VK_NULL_HANDLE; }
   const Sh9& skyIrradianceSH() const { return skyIrradianceSH_; }
   bool hasSkyIrradianceSH() const { return skyIrradianceSH_.valid; }
+  const IblMaps& ibl() const { return ibl_; }
+  bool hasIbl() const { return ibl_.ready; }
+  Material& probeMaterial() { return matProbe_; }
+  const Material& probeMaterial() const { return matProbe_; }
   float time() const { return time_; }
 
 private:
@@ -68,6 +73,7 @@ private:
   Texture gold_{};
   Texture sky_{};
   Sh9 skyIrradianceSH_{};
+  IblMaps ibl_{};
 
   Material matFloor_{};
   Material matCube_{};

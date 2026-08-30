@@ -19,6 +19,10 @@ layout(set = 0, binding = 0, std140) uniform FrameUBO {
     float skyYaw;
     float skyIntensity;
     float ambientScale;
+    float iblMaxLod;
+    float specularIblScale;
+    float enablePrefiltered;
+    float enableBrdfLut;
     vec4 ambientSH[9];
 } frame;
 

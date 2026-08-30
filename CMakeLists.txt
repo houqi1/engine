@@ -51,6 +51,7 @@ set(VE_SOURCES
   src/gfx/Mesh.cpp
   src/gfx/Texture.cpp
   src/gfx/ShIrradiance.cpp
+  src/gfx/IblBake.cpp
   src/scene/Scene.cpp
   src/scene/GrassSystem.cpp
   src/render/Renderer.cpp
@@ -115,6 +116,9 @@ set(VE_SHADER_SOURCES
   grass_shadow.vert
   grass_shadow.frag
   sky.frag
+  ibl_equirect_to_cube.frag
+  ibl_prefilter.frag
+  ibl_brdf.frag
 )
 
 set(VE_SPV_FILES "")

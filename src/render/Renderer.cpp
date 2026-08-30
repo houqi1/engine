@@ -9,9 +9,11 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <stdexcept>
+#include <vector>
 
 namespace {
 
@@ -107,6 +109,9 @@ Renderer::~Renderer() {
   if (skyLayout_) {
     vkDestroyDescriptorSetLayout(gfx_.device(), skyLayout_, nullptr);
   }
+  if (iblLayout_) {
+    vkDestroyDescriptorSetLayout(gfx_.device(), iblLayout_, nullptr);
+  }
   if (descriptorPool_) {
     vkDestroyDescriptorPool(gfx_.device(), descriptorPool_, nullptr);
   }
@@ -117,6 +122,16 @@ Renderer::~Renderer() {
     gfx_.destroySampler(hdrSampler_);
     hdrSampler_ = VK_NULL_HANDLE;
   }
+  if (dummyCubeSampler_) {
+    gfx_.destroySampler(dummyCubeSampler_);
+    dummyCubeSampler_ = VK_NULL_HANDLE;
+  }
+  if (dummyLutSampler_) {
+    gfx_.destroySampler(dummyLutSampler_);
+    dummyLutSampler_ = VK_NULL_HANDLE;
+  }
+  gfx_.destroyImage(dummyCube_);
+  gfx_.destroyImage(dummyLut_);
 }
 
 void Renderer::createTimestampPool() {
@@ -272,6 +287,67 @@ void Renderer::init(Scene& scene) {
     vkUpdateDescriptorSets(gfx_.device(), 1, &write, 0, nullptr);
   }
 
+  // Dummy IBL so set=2 is always bindable.
+  {
+    const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    std::vector<float> cube(6u * 4u);
+    for (int i = 0; i < 6; ++i) {
+      cube[static_cast<size_t>(i) * 4 + 0] = black[0];
+      cube[static_cast<size_t>(i) * 4 + 1] = black[1];
+      cube[static_cast<size_t>(i) * 4 + 2] = black[2];
+      cube[static_cast<size_t>(i) * 4 + 3] = black[3];
+    }
+    dummyCube_ = gfx_.createCubemap(1, VK_FORMAT_R32G32B32A32_SFLOAT,
+                                    VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, 1);
+    gfx_.uploadCubemapRGBA32F(dummyCube_, cube.data());
+    dummyLut_ = gfx_.createImage({1, 1, 1}, VK_FORMAT_R32G32B32A32_SFLOAT,
+                                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                 VK_IMAGE_ASPECT_COLOR_BIT);
+    gfx_.uploadToImage(dummyLut_, black, sizeof(black), {1, 1, 1});
+    dummyCubeSampler_ =
+        gfx_.createSampler(VK_FILTER_LINEAR, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, false, 1);
+    dummyLutSampler_ =
+        gfx_.createSampler(VK_FILTER_LINEAR, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, false, 1);
+  }
+
+  {
+    VkDescriptorSetAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    allocInfo.descriptorPool = descriptorPool_;
+    allocInfo.descriptorSetCount = 1;
+    allocInfo.pSetLayouts = &iblLayout_;
+    if (vkAllocateDescriptorSets(gfx_.device(), &allocInfo, &iblSet_) != VK_SUCCESS) {
+      throw std::runtime_error("Failed to allocate IBL descriptor set");
+    }
+
+    const bool useReal = scene.hasIbl();
+    VkDescriptorImageInfo cubeInfo{};
+    cubeInfo.sampler = useReal ? scene.ibl().cubeSampler : dummyCubeSampler_;
+    cubeInfo.imageView = useReal ? scene.ibl().prefiltered.view : dummyCube_.view;
+    cubeInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+    VkDescriptorImageInfo lutInfo{};
+    lutInfo.sampler = useReal ? scene.ibl().lutSampler : dummyLutSampler_;
+    lutInfo.imageView = useReal ? scene.ibl().brdfLut.view : dummyLut_.view;
+    lutInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+    VkWriteDescriptorSet writes[2]{};
+    writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[0].dstSet = iblSet_;
+    writes[0].dstBinding = 0;
+    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[0].descriptorCount = 1;
+    writes[0].pImageInfo = &cubeInfo;
+
+    writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[1].dstSet = iblSet_;
+    writes[1].dstBinding = 1;
+    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[1].descriptorCount = 1;
+    writes[1].pImageInfo = &lutInfo;
+    vkUpdateDescriptorSets(gfx_.device(), 2, writes, 0, nullptr);
+  }
+
   initImGui();
 }
 
@@ -350,7 +426,7 @@ void Renderer::createDescriptors() {
     vkCreateDescriptorSetLayout(gfx_.device(), &info, nullptr, &tonemapLayout_);
   }
 
-  // Sky equirect layout (set 1)
+  // Sky equirect layout (set 1 for sky pass)
   {
     VkDescriptorSetLayoutBinding binding{};
     binding.binding = 0;
@@ -365,13 +441,32 @@ void Renderer::createDescriptors() {
     vkCreateDescriptorSetLayout(gfx_.device(), &info, nullptr, &skyLayout_);
   }
 
+  // IBL layout (mesh set 2): prefiltered cube + BRDF LUT
+  {
+    VkDescriptorSetLayoutBinding bindings[2]{};
+    bindings[0].binding = 0;
+    bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[0].descriptorCount = 1;
+    bindings[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    bindings[1].binding = 1;
+    bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[1].descriptorCount = 1;
+    bindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+    VkDescriptorSetLayoutCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    info.bindingCount = 2;
+    info.pBindings = bindings;
+    vkCreateDescriptorSetLayout(gfx_.device(), &info, nullptr, &iblLayout_);
+  }
+
   VkDescriptorPoolSize sizes[] = {
       {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 64},
-      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 64},
+      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 96},
   };
   VkDescriptorPoolCreateInfo poolInfo{};
   poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-  poolInfo.maxSets = 128;
+  poolInfo.maxSets = 160;
   poolInfo.poolSizeCount = 2;
   poolInfo.pPoolSizes = sizes;
   vkCreateDescriptorPool(gfx_.device(), &poolInfo, nullptr, &descriptorPool_);
@@ -456,10 +551,10 @@ void Renderer::createPipelines() {
   skyPush.size = sizeof(SkyPushConstants);
 
   {
-    VkDescriptorSetLayout layouts[] = {frameLayout_, materialLayout_};
+    VkDescriptorSetLayout layouts[] = {frameLayout_, materialLayout_, iblLayout_};
     VkPipelineLayoutCreateInfo info{};
     info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    info.setLayoutCount = 2;
+    info.setLayoutCount = 3;
     info.pSetLayouts = layouts;
     info.pushConstantRangeCount = 1;
     info.pPushConstantRanges = &pushRange;
@@ -596,6 +691,26 @@ void Renderer::createPipelines() {
   vkDestroyShaderModule(gfx_.device(), skyFrag, nullptr);
 }
 
+void Renderer::syncMaterialUbo(Material* material) {
+  if (!material) {
+    return;
+  }
+  auto it = materialSets_.find(material);
+  if (it == materialSets_.end() || !it->second.materialUBO.info.pMappedData) {
+    return;
+  }
+
+  MaterialUBO ubo{};
+  ubo.baseColorFactor[0] = material->baseColor.r;
+  ubo.baseColorFactor[1] = material->baseColor.g;
+  ubo.baseColorFactor[2] = material->baseColor.b;
+  ubo.baseColorFactor[3] = material->baseColor.a;
+  ubo.metallic = material->metallic;
+  ubo.roughness = material->roughness;
+  ubo.shOnly = material->shOnly ? 1.0f : 0.0f;
+  std::memcpy(it->second.materialUBO.info.pMappedData, &ubo, sizeof(ubo));
+}
+
 void Renderer::ensureMaterialSet(Material* material) {
   if (!material || materialSets_.count(material)) {
     return;
@@ -688,6 +803,13 @@ void Renderer::updateFrameUBO(Scene& scene, uint32_t frameIndex) {
       ubo.ambientSH[i][3] = 0.0f;
     }
   }
+
+  const bool hasIblMaps = scene.hasIbl();
+  ubo.enablePrefiltered = (enablePrefilteredIbl_ && hasIblMaps) ? 1.0f : 0.0f;
+  ubo.enableBrdfLut = (enableBrdfLutIbl_ && hasIblMaps) ? 1.0f : 0.0f;
+  ubo.specularIblScale = specularIblScale_;
+  ubo.iblMaxLod =
+      hasIblMaps ? static_cast<float>(std::max(1u, scene.ibl().mipCount) - 1u) : 0.0f;
 
   std::memcpy(frames_[frameIndex].frameUBO.info.pMappedData, &ubo, sizeof(ubo));
 }
@@ -888,6 +1010,8 @@ void Renderer::draw(Scene& scene, float /*dt*/, float displayFps) {
   vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, meshPipeline_);
   vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, meshPipelineLayout_, 0, 1,
                           &frameSet, 0, nullptr);
+  vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, meshPipelineLayout_, 2, 1,
+                          &iblSet_, 0, nullptr);
 
   for (const RenderObject& obj : scene.objects()) {
     ensureMaterialSet(obj.material);
@@ -1061,9 +1185,23 @@ void Renderer::recordImGui(VkCommandBuffer cmd, const FrameContext& /*frame*/, S
   ImGui::Checkbox("Skybox", &showSky_);
   ImGui::DragFloat("Sky Intensity", &skyIntensity_, 0.01f, 0.0f, 8.0f);
   ImGui::DragFloat("Sky Yaw", &skyYaw_, 0.01f, -3.14159f, 3.14159f);
-  ImGui::Checkbox("Grass Sky Ambient (SH)", &useSkyAmbient_);
-  ImGui::DragFloat("Grass Ambient Scale", &ambientScale_, 0.01f, 0.0f, 4.0f);
-  ImGui::TextDisabled("SH from sky HDR; yaw/intensity match skybox.");
+  ImGui::Checkbox("Diffuse SH Ambient", &useSkyAmbient_);
+  ImGui::DragFloat("Diffuse Ambient Scale", &ambientScale_, 0.01f, 0.0f, 4.0f);
+  ImGui::Checkbox("Specular Prefiltered Map", &enablePrefilteredIbl_);
+  ImGui::Checkbox("Specular BRDF LUT", &enableBrdfLutIbl_);
+  ImGui::DragFloat("Specular IBL Scale", &specularIblScale_, 0.01f, 0.0f, 4.0f);
+  ImGui::TextDisabled("Both on = full split-sum; one on = isolate that term.");
+  Material& probeMat = scene.probeMaterial();
+  if (ImGui::DragFloat("Probe Roughness", &probeMat.roughness, 0.005f, 0.04f, 1.0f)) {
+    ensureMaterialSet(&probeMat);
+    syncMaterialUbo(&probeMat);
+  }
+  if (ImGui::DragFloat("Probe Metallic", &probeMat.metallic, 0.01f, 0.0f, 1.0f)) {
+    ensureMaterialSet(&probeMat);
+    syncMaterialUbo(&probeMat);
+  }
+  ImGui::TextDisabled(scene.hasIbl() ? "IBL maps ready (prefiltered + BRDF LUT)."
+                                     : "IBL maps missing; specular disabled.");
   ImGui::DragFloat("Mip LOD Bias", &mipLodBias_, 0.01f, -2.0f, 4.0f);
   ImGui::Separator();
   ImGui::Text("Light");
