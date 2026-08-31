@@ -2,6 +2,7 @@
 
 #include "core/Camera.h"
 #include "gfx/GpuTypes.h"
+#include "gfx/Texture.h"
 
 #include <glm/glm.hpp>
 
@@ -50,7 +51,14 @@ public:
   }
 
   float& ambient() { return ambient_; }
+  float& aoStrength() { return aoStrength_; }
+  float& aoPower() { return aoPower_; }
   glm::vec3& skyColor() { return skyColor_; }
+  bool& showSky() { return showSky_; }
+  float& skyIntensity() { return skyIntensity_; }
+  float& skyYaw() { return skyYaw_; }
+  const Texture& sky() const { return sky_; }
+  bool hasSky() const { return sky_.image.image != VK_NULL_HANDLE; }
   uint32_t& maxSteps() { return maxSteps_; }
   int& renderMode() { return renderMode_; }
   int& brushMaterial() { return brushMaterial_; }
@@ -70,9 +78,21 @@ private:
   bool getMicro(const glm::ivec3& coarse, const glm::ivec3& micro) const;
   bool setMicroCpu(const glm::ivec3& coarse, const glm::ivec3& micro, bool solid);
   void fillMicroBrickTemplate(uint32_t coarseIndex);
+  void fillMicroBrickSolid(uint32_t coarseIndex);
   void clearMicroBrick(uint32_t coarseIndex);
   bool microBrickEmpty(uint32_t coarseIndex) const;
+  void syncHasMicroFlag(uint32_t coarseIndex);
   void ensureCoarseBrick(const glm::ivec3& coarse, uint32_t material);
+
+  // Packed in voxelsCpu_/GPU SSBO: low bits = material, bit31 = brick has any micro solid.
+  static constexpr uint32_t kVoxelMatMask = 0x7FFFFFFFu;
+  static constexpr uint32_t kVoxelHasMicroBit = 0x80000000u;
+  static uint32_t materialOf(uint32_t packed) { return packed & kVoxelMatMask; }
+  static bool hasMicroOf(uint32_t packed) { return (packed & kVoxelHasMicroBit) != 0u; }
+  static uint32_t packVoxel(uint32_t material, bool hasMicro) {
+    const uint32_t mat = material & kVoxelMatMask;
+    return (mat == 0u) ? 0u : (mat | (hasMicro ? kVoxelHasMicroBit : 0u));
+  }
 
   void flushAll(GfxDevice& gfx);
   int applyCoarseSphereBrush(const glm::ivec3& center, float radius, uint32_t material,
@@ -94,7 +114,13 @@ private:
   glm::vec3 gridOrigin_{0.0f};
   glm::vec3 lightDir_{0.35f, -1.0f, 0.25f};
   float ambient_ = 0.18f;
+  float aoStrength_ = 1.0f;
+  float aoPower_ = 1.0f / 3.0f;
   glm::vec3 skyColor_{0.15f, 0.25f, 0.45f};
+  Texture sky_{};
+  bool showSky_ = true;
+  float skyIntensity_ = 1.0f;
+  float skyYaw_ = 0.0f;
   uint32_t maxSteps_ = 192;
   uint32_t occupiedCount_ = 0;
   uint32_t occupiedMicroCount_ = 0;

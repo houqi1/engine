@@ -1,13 +1,17 @@
 #include "scene/VoxelScene.h"
 
 #include "gfx/GfxDevice.h"
+#include "gfx/Texture.h"
 
 #include <GLFW/glfw3.h>
 #include <imgui.h>
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
+#include <iostream>
 #include <limits>
+#include <string>
 
 namespace {
 
@@ -36,15 +40,26 @@ constexpr uint32_t kMicroTemplateWords[16] = {
 }  // namespace
 
 void VoxelScene::init(GfxDevice& gfx) {
-  camera_.setOrbitTarget(glm::vec3(0.0f, 2.0f, 0.0f));
-  camera_.setOrbitDistance(18.0f);
-  camera_.setYawPitch(0.85f, 0.45f);
+  camera_.setOrbitTarget(glm::vec3(0.0f, 0.4f, 0.0f));
+  camera_.setOrbitDistance(22.0f);
+  camera_.setYawPitch(0.75f, 0.55f);
+
+  const std::string skyPath = std::string(VE_ASSETS_DIR) + "/sky/autumn_field_puresky_2k.hdr";
+  try {
+    sky_ = TextureFactory::loadHdrEquirect(gfx, skyPath);
+    std::cout << "Loaded voxel skybox: " << skyPath << std::endl;
+  } catch (const std::exception& e) {
+    std::cerr << "Voxel skybox load failed: " << e.what() << std::endl;
+    sky_ = TextureFactory::createSolid(gfx, skyColor_.r, skyColor_.g, skyColor_.b);
+  }
+
   rebuildVoxels(gfx);
 }
 
 void VoxelScene::cleanup(GfxDevice& gfx) {
   gfx.destroyBuffer(voxelBuffer_);
   gfx.destroyBuffer(microBuffer_);
+  TextureFactory::destroy(gfx, sky_);
   voxelsCpu_.clear();
   microCpu_.clear();
   occupiedCount_ = 0;
@@ -81,7 +96,7 @@ uint32_t VoxelScene::getVoxel(const glm::ivec3& p) const {
   if (!inBounds(p) || voxelsCpu_.empty()) {
     return 0;
   }
-  return voxelsCpu_[indexOf(p)];
+  return materialOf(voxelsCpu_[indexOf(p)]);
 }
 
 bool VoxelScene::getMicro(const glm::ivec3& coarse, const glm::ivec3& micro) const {
@@ -110,20 +125,45 @@ void VoxelScene::clearMicroBrick(uint32_t coarseIndex) {
   for (int i = 0; i < kMicroWords; ++i) {
     const uint32_t w = microCpu_[base + static_cast<uint32_t>(i)];
     if (w != 0u) {
-      occupiedMicroCount_ -= static_cast<uint32_t>(__builtin_popcount(w));
+      occupiedMicroCount_ -= static_cast<uint32_t>(std::popcount(w));
       microCpu_[base + static_cast<uint32_t>(i)] = 0u;
     }
   }
+  syncHasMicroFlag(coarseIndex);
 }
 
 void VoxelScene::fillMicroBrickTemplate(uint32_t coarseIndex) {
+  // clearMicroBrick syncs hasMicro=false; restore after filling bits.
   clearMicroBrick(coarseIndex);
   const uint32_t base = coarseIndex * static_cast<uint32_t>(kMicroWords);
   for (int i = 0; i < kMicroWords; ++i) {
     const uint32_t w = kMicroTemplateWords[i];
     microCpu_[base + static_cast<uint32_t>(i)] = w;
-    occupiedMicroCount_ += static_cast<uint32_t>(__builtin_popcount(w));
+    occupiedMicroCount_ += static_cast<uint32_t>(std::popcount(w));
   }
+  syncHasMicroFlag(coarseIndex);
+}
+
+void VoxelScene::fillMicroBrickSolid(uint32_t coarseIndex) {
+  clearMicroBrick(coarseIndex);
+  const uint32_t base = coarseIndex * static_cast<uint32_t>(kMicroWords);
+  for (int i = 0; i < kMicroWords; ++i) {
+    microCpu_[base + static_cast<uint32_t>(i)] = 0xFFFFFFFFu;
+    occupiedMicroCount_ += 32u;
+  }
+  syncHasMicroFlag(coarseIndex);
+}
+
+void VoxelScene::syncHasMicroFlag(uint32_t coarseIndex) {
+  if (coarseIndex >= voxelsCpu_.size()) {
+    return;
+  }
+  const uint32_t mat = materialOf(voxelsCpu_[coarseIndex]);
+  if (mat == 0u) {
+    voxelsCpu_[coarseIndex] = 0u;
+    return;
+  }
+  voxelsCpu_[coarseIndex] = packVoxel(mat, !microBrickEmpty(coarseIndex));
 }
 
 bool VoxelScene::setVoxelCpu(const glm::ivec3& p, uint32_t material) {
@@ -131,18 +171,22 @@ bool VoxelScene::setVoxelCpu(const glm::ivec3& p, uint32_t material) {
     return false;
   }
   const uint32_t idx = indexOf(p);
-  const uint32_t old = voxelsCpu_[idx];
-  if (old == material) {
+  const uint32_t oldMat = materialOf(voxelsCpu_[idx]);
+  const uint32_t newMat = material & kVoxelMatMask;
+  if (oldMat == newMat) {
     return false;
   }
-  if (old == 0 && material != 0) {
+  if (oldMat == 0 && newMat != 0) {
     ++occupiedCount_;
-    fillMicroBrickTemplate(idx);
-  } else if (old != 0 && material == 0) {
+    voxelsCpu_[idx] = packVoxel(newMat, false);
+    fillMicroBrickSolid(idx);
+  } else if (oldMat != 0 && newMat == 0) {
     occupiedCount_ = occupiedCount_ > 0 ? occupiedCount_ - 1 : 0;
     clearMicroBrick(idx);
+    voxelsCpu_[idx] = 0u;
+  } else {
+    voxelsCpu_[idx] = packVoxel(newMat, hasMicroOf(voxelsCpu_[idx]));
   }
-  voxelsCpu_[idx] = material;
   return true;
 }
 
@@ -166,6 +210,7 @@ bool VoxelScene::setMicroCpu(const glm::ivec3& coarse, const glm::ivec3& micro, 
     dst &= ~mask;
     occupiedMicroCount_ = occupiedMicroCount_ > 0 ? occupiedMicroCount_ - 1 : 0;
   }
+  syncHasMicroFlag(idx);
   return true;
 }
 
@@ -174,11 +219,11 @@ void VoxelScene::ensureCoarseBrick(const glm::ivec3& coarse, uint32_t material) 
     return;
   }
   const uint32_t idx = indexOf(coarse);
-  if (voxelsCpu_[idx] == 0u) {
-    voxelsCpu_[idx] = material;
+  if (materialOf(voxelsCpu_[idx]) == 0u) {
     ++occupiedCount_;
     // Start empty so placement creates the first micros explicitly.
     clearMicroBrick(idx);
+    voxelsCpu_[idx] = packVoxel(material, false);
   }
 }
 
@@ -406,52 +451,54 @@ std::optional<VoxelHit> VoxelScene::pickCenterRayNested() const {
       break;
     }
 
-    const uint32_t mat = getVoxel(mapPos);
+    const uint32_t packed = voxelsCpu_[indexOf(mapPos)];
+    const uint32_t mat = materialOf(packed);
     if (mat != 0) {
-      glm::vec3 local01;
-      if (mapPos == startPos) {
-        local01 = glm::clamp(pos - glm::vec3(mapPos), glm::vec3(0.0f), glm::vec3(0.9999f));
-      } else {
-        const glm::vec3 mini = ((glm::vec3(mapPos) - ro) + 0.5f - 0.5f * sgn) * invDir;
-        const float d = std::max(mini.x, std::max(mini.y, mini.z));
-        const glm::vec3 intersect = ro + rd * d;
-        local01 = glm::clamp(intersect - glm::vec3(mapPos), glm::vec3(0.0f), glm::vec3(0.9999f));
-      }
-
-      glm::vec3 localPos = glm::clamp(local01 * 8.0f, glm::vec3(0.0001f), glm::vec3(7.9999f));
-      glm::ivec3 microPos = glm::ivec3(glm::floor(localPos));
-      glm::vec3 microSide =
-          (sgn * (glm::vec3(microPos) - localPos) + (sgn * 0.5f + 0.5f)) * deltaDist;
-      glm::bvec3 microMask = mask;
-
-      auto finishHit = [&](const glm::ivec3& m, const glm::bvec3& msk) -> VoxelHit {
-        VoxelHit hit{};
-        hit.cell = mapPos;
-        hit.micro = m;
-        hit.material = mat;
-        hit.normal = glm::ivec3(-glm::vec3(msk) * sgn);
-        hit.hasMicro = true;
-        return hit;
-      };
-
-      if (getMicro(mapPos, microPos)) {
-        return finishHit(microPos, microMask);
-      }
-
-      bool microHit = false;
-      for (int s = 0; s < 32; ++s) {
-        microMask = stepMaskCpu(microSide);
-        microSide += glm::vec3(microMask) * deltaDist;
-        microPos += glm::ivec3(glm::vec3(microMask)) * rayStep;
-        if (!microInBounds(microPos)) {
-          break;
+      // Empty micro brick: skip nested DDA (matches GPU HAS_MICRO bit).
+      if (hasMicroOf(packed)) {
+        glm::vec3 local01;
+        if (mapPos == startPos) {
+          local01 = glm::clamp(pos - glm::vec3(mapPos), glm::vec3(0.0f), glm::vec3(0.9999f));
+        } else {
+          const glm::vec3 mini = ((glm::vec3(mapPos) - ro) + 0.5f - 0.5f * sgn) * invDir;
+          const float d = std::max(mini.x, std::max(mini.y, mini.z));
+          const glm::vec3 intersect = ro + rd * d;
+          local01 = glm::clamp(intersect - glm::vec3(mapPos), glm::vec3(0.0f), glm::vec3(0.9999f));
         }
+
+        glm::vec3 localPos = glm::clamp(local01 * 8.0f, glm::vec3(0.0001f), glm::vec3(7.9999f));
+        glm::ivec3 microPos = glm::ivec3(glm::floor(localPos));
+        glm::vec3 microSide =
+            (sgn * (glm::vec3(microPos) - localPos) + (sgn * 0.5f + 0.5f)) * deltaDist;
+        glm::bvec3 microMask = mask;
+
+        auto finishHit = [&](const glm::ivec3& m, const glm::bvec3& msk) -> VoxelHit {
+          VoxelHit hit{};
+          hit.cell = mapPos;
+          hit.micro = m;
+          hit.material = mat;
+          hit.normal = glm::ivec3(-glm::vec3(msk) * sgn);
+          hit.hasMicro = true;
+          return hit;
+        };
+
         if (getMicro(mapPos, microPos)) {
           return finishHit(microPos, microMask);
         }
+
+        for (int s = 0; s < 32; ++s) {
+          microMask = stepMaskCpu(microSide);
+          microSide += glm::vec3(microMask) * deltaDist;
+          microPos += glm::ivec3(glm::vec3(microMask)) * rayStep;
+          if (!microInBounds(microPos)) {
+            break;
+          }
+          if (getMicro(mapPos, microPos)) {
+            return finishHit(microPos, microMask);
+          }
+        }
+        // Hollow template miss: continue coarse traversal.
       }
-      (void)microHit;
-      // Hollow: continue coarse traversal.
     }
 
     mask = stepMaskCpu(sideDist);
@@ -531,7 +578,8 @@ void VoxelScene::rebuildVoxels(GfxDevice& gfx) {
   maxSteps_ = static_cast<uint32_t>(std::max(16, n * 3));
 
   const float half = 0.5f * static_cast<float>(n);
-  gridOrigin_ = glm::vec3(-half, -half * 0.35f, -half) * voxelSize_;
+  // Flat ground near y=0; keep XZ centered on origin.
+  gridOrigin_ = glm::vec3(-half, 0.0f, -half) * voxelSize_;
 
   const size_t count = static_cast<size_t>(n) * static_cast<size_t>(n) * static_cast<size_t>(n);
   voxelsCpu_.assign(count, 0u);
@@ -540,29 +588,17 @@ void VoxelScene::rebuildVoxels(GfxDevice& gfx) {
   occupiedMicroCount_ = 0;
   lastHit_.reset();
 
-  const float radius = 0.38f * static_cast<float>(n);
-  const float center = half - 0.5f;
-  const int cubeMin = n / 2 - std::max(2, n / 10);
-  const int cubeMax = n / 2 + std::max(2, n / 10);
-
+  // Single-material flat ground slab (2 coarse cells thick).
+  constexpr uint32_t kGroundMat = 1u;
+  const int groundThickness = 2;
   for (int z = 0; z < n; ++z) {
-    for (int y = 0; y < n; ++y) {
-      for (int x = 0; x < n; ++x) {
-        const float fx = static_cast<float>(x) + 0.5f - center;
-        const float fy = static_cast<float>(y) + 0.5f - center;
-        const float fz = static_cast<float>(z) + 0.5f - center;
-        const float dist = std::sqrt(fx * fx + fy * fy + fz * fz);
-        const bool inShell = (dist <= radius && dist >= radius - 1.6f);
-        const bool inCube =
-            x >= cubeMin && x < cubeMax && y >= cubeMin && y < cubeMax && z >= cubeMin && z < cubeMax;
-        if (!inShell && !inCube) {
-          continue;
-        }
+    for (int x = 0; x < n; ++x) {
+      for (int y = 0; y < groundThickness; ++y) {
         const glm::ivec3 p(x, y, z);
         const uint32_t idx = indexOf(p);
-        voxelsCpu_[idx] = inCube ? 2u : 1u;
+        voxelsCpu_[idx] = packVoxel(kGroundMat, false);
         ++occupiedCount_;
-        fillMicroBrickTemplate(idx);
+        fillMicroBrickSolid(idx);
       }
     }
   }

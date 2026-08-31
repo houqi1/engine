@@ -18,7 +18,14 @@ layout(set = 0, binding = 0, std140) uniform VoxelDdaUBO {
     float projY;
     uint nestedMicro;
     uint skipTrace;  // 1 = skip DDA and write sky (dispatch/bandwidth baseline)
-    float _pad3;
+    float aoStrength;
+    float aoPower;
+    float skyYaw;
+    float skyIntensity;
+    uint useSky;
+    float _padSky0;
+    float _padSky1;
+    float _padSky2;
 } ubo;
 
 layout(set = 0, binding = 1, std430) readonly buffer VoxelGrid {
@@ -32,13 +39,45 @@ layout(set = 0, binding = 3, std430) readonly buffer MicroGrid {
     uint micro[];
 };
 
+layout(set = 0, binding = 4) uniform sampler2D skyMap;
+
 const uint MODE_SHADED = 0u;
 const uint MODE_ALBEDO = 1u;
 const uint MODE_NORMAL = 2u;
 const uint MODE_STEPS = 3u;
 const uint MODE_COORD = 4u;
+const uint MODE_AO = 5u;
 const uint MICRO_WORDS = 16u;
 const float FLT_MAX = 3.4028235e+38;
+const float kPi = 3.14159265359;
+
+vec2 directionToEquirectUv(vec3 dir) {
+    // Same mapping as shaders/sky.frag (Poly Haven / Blender-style).
+    float phi = atan(dir.z, dir.x);
+    float theta = asin(clamp(dir.y, -1.0, 1.0));
+    return vec2(fract(phi / (2.0 * kPi) + 0.5), 0.5 - theta / kPi);
+}
+
+vec3 ACESFilm(vec3 x) {
+    const float a = 2.51;
+    const float b = 0.03;
+    const float c = 2.43;
+    const float d = 0.59;
+    const float e = 0.14;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+}
+
+vec3 sampleSky(vec3 dir) {
+    if (ubo.useSky == 0u) {
+        return ubo.skyColor;
+    }
+    float cy = cos(ubo.skyYaw);
+    float sy = sin(ubo.skyYaw);
+    vec3 rotated = vec3(cy * dir.x + sy * dir.z, dir.y, -sy * dir.x + cy * dir.z);
+    vec3 hdr = textureLod(skyMap, directionToEquirectUv(normalize(rotated)), 0.0).rgb;
+    vec3 ldr = ACESFilm(max(hdr, vec3(0.0)) * ubo.skyIntensity);
+    return pow(ldr, vec3(1.0 / 2.2));
+}
 
 uint voxelIndex(ivec3 p) {
     return uint(p.x) + uint(p.y) * ubo.gridSize.x + uint(p.z) * ubo.gridSize.x * ubo.gridSize.y;
@@ -62,15 +101,44 @@ bool getMicroVoxel(ivec3 coarse, ivec3 c) {
     return ((word >> (bit & 31u)) & 1u) != 0u;
 }
 
-vec3 albedoForVoxel(ivec3 p, uint matId) {
-    float t = float(p.y) / max(float(ubo.gridSize.y - 1u), 1.0);
-    vec3 cool = vec3(0.20, 0.55, 0.95);
-    vec3 warm = vec3(0.95, 0.55, 0.20);
-    vec3 base = mix(cool, warm, t);
-    if (matId == 2u) {
-        base = mix(base, vec3(0.35, 0.85, 0.45), 0.35);
+// Low 31 bits = material; bit 31 = HAS_MICRO (brick has any solid micro voxel).
+const uint VOXEL_MAT_MASK = 0x7FFFFFFFu;
+const uint VOXEL_HAS_MICRO_BIT = 0x80000000u;
+
+uint voxelMaterial(uint raw) {
+    return raw & VOXEL_MAT_MASK;
+}
+
+bool voxelHasMicro(uint raw) {
+    return (raw & VOXEL_HAS_MICRO_BIT) != 0u;
+}
+
+bool solidCoarse(ivec3 p) {
+    return insideGrid(p) && voxelMaterial(readVoxel(p)) != 0u;
+}
+
+// Global micro coordinates: coarse * 8 + local micro.
+bool solidMicroGlobal(ivec3 g) {
+    ivec3 coarse = g >> 3;
+    ivec3 local = g & ivec3(7);
+    if (!insideGrid(coarse)) {
+        return false;
     }
-    return base;
+    uint raw = readVoxel(coarse);
+    if (voxelMaterial(raw) == 0u) {
+        return false;
+    }
+    return getMicroVoxel(coarse, local);
+}
+
+bool neighborSolid(ivec3 solidPos, ivec3 offset, bool microSpace) {
+    ivec3 p = solidPos + offset;
+    return microSpace ? solidMicroGlobal(p) : solidCoarse(p);
+}
+
+vec3 albedoForVoxel(ivec3 p, uint matId) {
+    // Unified ground albedo (ignore height / material tint).
+    return vec3(0.62, 0.64, 0.68);
 }
 
 vec3 stepsToColor(uint steps) {
@@ -82,14 +150,56 @@ bvec3 stepMask(vec3 sideDist) {
     return lessThanEqual(sideDist.xyz, min(sideDist.yzx, sideDist.zxy));
 }
 
+float vertexAo(vec2 side, float corner) {
+    return (side.x + side.y + max(corner, side.x * side.y)) / 3.0;
+}
+
+// Sample 4 edge + 4 corner neighbors around aoPos (air cell outside hit face).
+// Returns lit factors (1 = open, 0 = fully occluded) at the 4 face corners.
+vec4 voxelAo(ivec3 aoPos, ivec3 d1, ivec3 d2, bool microSpace) {
+    vec4 side = vec4(
+        float(neighborSolid(aoPos, d1, microSpace)),
+        float(neighborSolid(aoPos, d2, microSpace)),
+        float(neighborSolid(aoPos, -d1, microSpace)),
+        float(neighborSolid(aoPos, -d2, microSpace)));
+    vec4 corner = vec4(
+        float(neighborSolid(aoPos, d1 + d2, microSpace)),
+        float(neighborSolid(aoPos, -d1 + d2, microSpace)),
+        float(neighborSolid(aoPos, -d1 - d2, microSpace)),
+        float(neighborSolid(aoPos, d1 - d2, microSpace)));
+    vec4 ao;
+    ao.x = vertexAo(side.xy, corner.x);
+    ao.y = vertexAo(side.yz, corner.y);
+    ao.z = vertexAo(side.zw, corner.z);
+    ao.w = vertexAo(side.wx, corner.w);
+    return 1.0 - ao;
+}
+
+vec2 faceUv(bvec3 mask, vec3 uvw) {
+    return vec2(dot(vec3(mask) * uvw.yzx, vec3(1.0)),
+                dot(vec3(mask) * uvw.zxy, vec3(1.0)));
+}
+
+float evalVoxelAo(ivec3 solidPos, bvec3 mask, vec3 sgn, vec3 uvw, bool microSpace) {
+    ivec3 aoPos = solidPos + ivec3(-vec3(mask) * sgn);
+    ivec3 d1 = ivec3(vec3(mask).zxy);
+    ivec3 d2 = ivec3(vec3(mask).yzx);
+    vec4 corners = voxelAo(aoPos, d1, d2, microSpace);
+    vec2 uv = clamp(faceUv(mask, uvw), vec2(0.0), vec2(1.0));
+    float ao = mix(mix(corners.z, corners.w, uv.x), mix(corners.y, corners.x, uv.x), uv.y);
+    ao = pow(clamp(ao, 0.0, 1.0), max(ubo.aoPower, 1e-3));
+    return mix(1.0, ao, clamp(ubo.aoStrength, 0.0, 1.0));
+}
+
 bool traceMicro(ivec3 coarse, vec3 localPos, vec3 rd, vec3 sgn, bvec3 enterMask,
-                out ivec3 outMicro, out bvec3 outMask, inout uint outSteps) {
+                out ivec3 outMicro, out bvec3 outMask, out vec3 outUvw, inout uint outSteps) {
     localPos = clamp(localPos, vec3(0.0001), vec3(7.9999));
     ivec3 mapPos = ivec3(floor(localPos));
     vec3 deltaDist = abs(1.0 / rd);
     vec3 sideDist = (sgn * (vec3(mapPos) - localPos) + (sgn * 0.5 + 0.5)) * deltaDist;
     bvec3 mask = enterMask;
     ivec3 rayStep = ivec3(sgn);
+    outUvw = clamp(localPos - vec3(mapPos), vec3(0.0), vec3(1.0));
 
     if (getMicroVoxel(coarse, mapPos)) {
         outMicro = mapPos;
@@ -106,6 +216,9 @@ bool traceMicro(ivec3 coarse, vec3 localPos, vec3 rd, vec3 sgn, bvec3 enterMask,
             return false;
         }
         if (getMicroVoxel(coarse, mapPos)) {
+            float tHit = dot(sideDist - deltaDist, vec3(mask));
+            vec3 hitPos = localPos + rd * tHit;
+            outUvw = clamp(hitPos - vec3(mapPos), vec3(0.0), vec3(1.0));
             outMicro = mapPos;
             outMask = mask;
             return true;
@@ -116,7 +229,7 @@ bool traceMicro(ivec3 coarse, vec3 localPos, vec3 rd, vec3 sgn, bvec3 enterMask,
 
 bool traverse(vec3 originWorld, vec3 dirWorld, out vec3 outColor, out uint outSteps) {
     outSteps = 0u;
-    outColor = ubo.skyColor;
+    outColor = sampleSky(normalize(dirWorld));
 
     vec3 ro = (originWorld - ubo.gridOrigin) / ubo.voxelSize;
     vec3 rd = normalize(dirWorld);
@@ -162,6 +275,7 @@ bool traverse(vec3 originWorld, vec3 dirWorld, out vec3 outColor, out uint outSt
     uint matId = 0u;
     ivec3 microPos = ivec3(0);
     bool usedMicro = false;
+    vec3 hitUvw = vec3(0.5);
 
     for (uint i = 0u; i < ubo.maxSteps; ++i) {
         outSteps = i + 1u;
@@ -169,31 +283,45 @@ bool traverse(vec3 originWorld, vec3 dirWorld, out vec3 outColor, out uint outSt
             break;
         }
 
-        matId = readVoxel(mapPos);
+        uint rawVoxel = readVoxel(mapPos);
+        matId = voxelMaterial(rawVoxel);
         if (matId != 0u) {
             if (ubo.nestedMicro == 0u) {
+                if (mapPos == startPos) {
+                    hitUvw = clamp(pos - vec3(mapPos), vec3(0.0), vec3(1.0));
+                } else {
+                    float tHit = dot(sideDist - deltaDist, vec3(mask));
+                    vec3 hitCell = ro + rd * tHit;
+                    hitUvw = clamp(hitCell - vec3(mapPos), vec3(0.0), vec3(1.0));
+                }
                 hit = true;
                 break;
             }
 
-            vec3 local01;
-            if (mapPos == startPos) {
-                local01 = clamp(pos - vec3(mapPos), vec3(0.0), vec3(0.9999));
-            } else {
-                vec3 mini = ((vec3(mapPos) - ro) + 0.5 - 0.5 * sgn) * invDir;
-                float d = max(mini.x, max(mini.y, mini.z));
-                vec3 intersect = ro + rd * d;
-                local01 = clamp(intersect - vec3(mapPos), vec3(0.0), vec3(0.9999));
-            }
+            // Empty micro brick: do not enter traceMicro (CPU packs HAS_MICRO).
+            if (voxelHasMicro(rawVoxel)) {
+                vec3 local01;
+                if (mapPos == startPos) {
+                    local01 = clamp(pos - vec3(mapPos), vec3(0.0), vec3(0.9999));
+                } else {
+                    vec3 mini = ((vec3(mapPos) - ro) + 0.5 - 0.5 * sgn) * invDir;
+                    float d = max(mini.x, max(mini.y, mini.z));
+                    vec3 intersect = ro + rd * d;
+                    local01 = clamp(intersect - vec3(mapPos), vec3(0.0), vec3(0.9999));
+                }
 
-            ivec3 hitMicro;
-            bvec3 microMask;
-            if (traceMicro(mapPos, local01 * 8.0, rd, sgn, mask, hitMicro, microMask, outSteps)) {
-                hit = true;
-                usedMicro = true;
-                microPos = hitMicro;
-                mask = microMask;
-                break;
+                ivec3 hitMicro;
+                bvec3 microMask;
+                vec3 microUvw;
+                if (traceMicro(mapPos, local01 * 8.0, rd, sgn, mask, hitMicro, microMask, microUvw,
+                               outSteps)) {
+                    hit = true;
+                    usedMicro = true;
+                    microPos = hitMicro;
+                    mask = microMask;
+                    hitUvw = microUvw;
+                    break;
+                }
             }
         }
 
@@ -207,27 +335,29 @@ bool traverse(vec3 originWorld, vec3 dirWorld, out vec3 outColor, out uint outSt
         return hit;
     }
     if (!hit) {
-        outColor = ubo.skyColor;
+        outColor = sampleSky(rd);
         return false;
     }
 
     vec3 normal = -vec3(mask) * sgn;
     vec3 albedo = albedoForVoxel(mapPos, matId);
-    if (usedMicro) {
-        albedo = mix(albedo, vec3(microPos) / 7.0, 0.35);
-    }
+
+    ivec3 solidPos = usedMicro ? (mapPos * 8 + microPos) : mapPos;
+    float ao = evalVoxelAo(solidPos, mask, sgn, hitUvw, usedMicro);
 
     if (ubo.renderMode == MODE_ALBEDO) {
-        outColor = usedMicro ? (vec3(microPos) / 7.0) : albedo;
+        outColor = albedo;
     } else if (ubo.renderMode == MODE_NORMAL) {
         outColor = normal * 0.5 + 0.5;
     } else if (ubo.renderMode == MODE_COORD) {
         outColor = usedMicro ? (vec3(microPos) / 7.0)
                              : (vec3(mapPos) / max(vec3(ubo.gridSize - uvec3(1u)), vec3(1.0)));
+    } else if (ubo.renderMode == MODE_AO) {
+        outColor = vec3(ao);
     } else {
         vec3 L = normalize(-ubo.lightDir);
         float ndotl = max(dot(normal, L), 0.0);
-        outColor = albedo * (ubo.ambient + (1.0 - ubo.ambient) * ndotl);
+        outColor = albedo * (ubo.ambient + (1.0 - ubo.ambient) * ndotl) * ao;
     }
     return true;
 }
@@ -239,22 +369,22 @@ void main() {
         return;
     }
 
-    if (ubo.skipTrace != 0u) {
-        // Baseline: same dispatch + storage write, no traversal.
-        imageStore(outImage, pixel, vec4(ubo.skyColor, 1.0));
-        return;
-    }
-
     vec2 uv = (vec2(pixel) + vec2(0.5)) / vec2(size);
     vec2 ndc = uv * 2.0 - 1.0;
     vec3 dirView = normalize(vec3(ndc.x / ubo.projX, ndc.y / ubo.projY, -1.0));
     vec3 dir = normalize((ubo.invView * vec4(dirView, 0.0)).xyz);
 
+    if (ubo.skipTrace != 0u) {
+        // Baseline: same dispatch + storage write, no traversal.
+        imageStore(outImage, pixel, vec4(sampleSky(dir), 1.0));
+        return;
+    }
+
     vec3 color;
     uint steps = 0u;
     bool hit = traverse(ubo.cameraPos, dir, color, steps);
     if (!hit && ubo.renderMode != MODE_STEPS) {
-        color = ubo.skyColor;
+        color = sampleSky(dir);
     }
     imageStore(outImage, pixel, vec4(color, 1.0));
 }

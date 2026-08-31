@@ -144,10 +144,11 @@ void VoxelRenderer::resize() {
   // Force descriptor refresh so storage-image views stay valid.
   boundVoxelBuffer_ = VK_NULL_HANDLE;
   boundMicroBuffer_ = VK_NULL_HANDLE;
+  boundSkyView_ = VK_NULL_HANDLE;
 }
 
 void VoxelRenderer::createDescriptors() {
-  VkDescriptorSetLayoutBinding bindings[4]{};
+  VkDescriptorSetLayoutBinding bindings[5]{};
   bindings[0].binding = 0;
   bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
   bindings[0].descriptorCount = 1;
@@ -168,9 +169,14 @@ void VoxelRenderer::createDescriptors() {
   bindings[3].descriptorCount = 1;
   bindings[3].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
+  bindings[4].binding = 4;
+  bindings[4].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+  bindings[4].descriptorCount = 1;
+  bindings[4].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
   VkDescriptorSetLayoutCreateInfo layoutInfo{};
   layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-  layoutInfo.bindingCount = 4;
+  layoutInfo.bindingCount = 5;
   layoutInfo.pBindings = bindings;
   if (vkCreateDescriptorSetLayout(gfx_.device(), &layoutInfo, nullptr, &frameLayout_) !=
       VK_SUCCESS) {
@@ -181,6 +187,7 @@ void VoxelRenderer::createDescriptors() {
       {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, GfxDevice::kFramesInFlight},
       {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, GfxDevice::kFramesInFlight * 2},
       {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, GfxDevice::kFramesInFlight},
+      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, GfxDevice::kFramesInFlight},
   };
   VkDescriptorPoolCreateInfo poolInfo{};
   poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -240,7 +247,7 @@ void VoxelRenderer::createPipelines() {
 
 void VoxelRenderer::updateDescriptors(VoxelScene& scene) {
   if (outImage_.view == VK_NULL_HANDLE || scene.voxelBuffer().buffer == VK_NULL_HANDLE ||
-      scene.microBuffer().buffer == VK_NULL_HANDLE) {
+      scene.microBuffer().buffer == VK_NULL_HANDLE || !scene.hasSky()) {
     return;
   }
 
@@ -261,7 +268,12 @@ void VoxelRenderer::updateDescriptors(VoxelScene& scene) {
     microInfo.buffer = scene.microBuffer().buffer;
     microInfo.range = scene.microBuffer().size;
 
-    VkWriteDescriptorSet writes[4]{};
+    VkDescriptorImageInfo skyInfo{};
+    skyInfo.sampler = scene.sky().sampler;
+    skyInfo.imageView = scene.sky().image.view;
+    skyInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+    VkWriteDescriptorSet writes[5]{};
     writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[0].dstSet = frame.frameSet;
     writes[0].dstBinding = 0;
@@ -290,11 +302,19 @@ void VoxelRenderer::updateDescriptors(VoxelScene& scene) {
     writes[3].descriptorCount = 1;
     writes[3].pBufferInfo = &microInfo;
 
-    vkUpdateDescriptorSets(gfx_.device(), 4, writes, 0, nullptr);
+    writes[4].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[4].dstSet = frame.frameSet;
+    writes[4].dstBinding = 4;
+    writes[4].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[4].descriptorCount = 1;
+    writes[4].pImageInfo = &skyInfo;
+
+    vkUpdateDescriptorSets(gfx_.device(), 5, writes, 0, nullptr);
   }
 
   boundVoxelBuffer_ = scene.voxelBuffer().buffer;
   boundMicroBuffer_ = scene.microBuffer().buffer;
+  boundSkyView_ = scene.sky().image.view;
 }
 
 void VoxelRenderer::updateFrameUBO(VoxelScene& scene, uint32_t frameIndex) {
@@ -320,6 +340,12 @@ void VoxelRenderer::updateFrameUBO(VoxelScene& scene, uint32_t frameIndex) {
   ubo.projY = proj[1][1];
   ubo.nestedMicro = scene.nestedMicroVoxels() ? 1u : 0u;
   ubo.skipTrace = skipTrace_ ? 1u : 0u;
+  ubo.aoStrength = scene.aoStrength();
+  ubo.aoPower = scene.aoPower();
+  ubo.skyYaw = scene.skyYaw();
+  ubo.skyIntensity = scene.skyIntensity();
+  ubo.useSky = (scene.showSky() && scene.hasSky()) ? 1u : 0u;
+  ubo.padSky[0] = ubo.padSky[1] = ubo.padSky[2] = 0.0f;
 
   void* mapped = frames_[frameIndex].frameUBO.info.pMappedData;
   if (!mapped) {
@@ -340,7 +366,8 @@ void VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
     createOutputImage();
   }
   if (scene.voxelBuffer().buffer != boundVoxelBuffer_ ||
-      scene.microBuffer().buffer != boundMicroBuffer_ || outImage_.view == VK_NULL_HANDLE) {
+      scene.microBuffer().buffer != boundMicroBuffer_ ||
+      scene.sky().image.view != boundSkyView_ || outImage_.view == VK_NULL_HANDLE) {
     updateDescriptors(scene);
   }
 
@@ -550,6 +577,7 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
   if (scene.nestedMicroVoxels()) {
     ImGui::SliderFloat("Brush Radius", &scene.brushRadius(), 0.0f, 8.0f, "%.1f micro-voxels");
     ImGui::TextDisabled("Editing individual micro cells inside coarse bricks");
+    ImGui::TextDisabled("Empty micro bricks skip nested DDA (HAS_MICRO bit).");
   } else {
     ImGui::SliderFloat("Brush Radius", &scene.brushRadius(), 0.0f, 8.0f, "%.1f coarse voxels");
     ImGui::TextDisabled("Editing whole coarse cells (each owns an 8^3 brick)");
@@ -568,7 +596,7 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
   }
   ImGui::Separator();
 
-  const char* modes[] = {"Shaded", "Albedo", "Normal", "Steps", "Coord"};
+  const char* modes[] = {"Shaded", "Albedo", "Normal", "Steps", "Coord", "AO"};
   ImGui::Combo("Render Mode", &scene.renderMode(), modes, IM_ARRAYSIZE(modes));
 
   bool rebuild = false;
@@ -576,7 +604,16 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
   rebuild |= ImGui::DragFloat("Voxel Size", &scene.voxelSize(), 0.01f, 0.05f, 2.0f);
   ImGui::DragFloat3("Light Dir", &scene.lightDir().x, 0.01f);
   ImGui::SliderFloat("Ambient", &scene.ambient(), 0.0f, 1.0f);
-  ImGui::ColorEdit3("Sky Color", &scene.skyColor().x);
+  ImGui::SliderFloat("AO Strength", &scene.aoStrength(), 0.0f, 1.0f);
+  ImGui::SliderFloat("AO Power", &scene.aoPower(), 0.05f, 2.0f);
+  ImGui::TextDisabled("Neighbor voxel AO (Minecraft-style). Strength 0 disables.");
+  ImGui::Checkbox("Skybox", &scene.showSky());
+  ImGui::DragFloat("Sky Intensity", &scene.skyIntensity(), 0.01f, 0.0f, 8.0f);
+  ImGui::DragFloat("Sky Yaw", &scene.skyYaw(), 0.01f, -3.14159f, 3.14159f);
+  ImGui::ColorEdit3("Sky Color (fallback)", &scene.skyColor().x);
+  if (!scene.hasSky()) {
+    ImGui::TextDisabled("HDR sky missing; using flat sky color.");
+  }
   int maxSteps = static_cast<int>(scene.maxSteps());
   if (ImGui::SliderInt("Max Steps", &maxSteps, 16, 512)) {
     scene.maxSteps() = static_cast<uint32_t>(maxSteps);

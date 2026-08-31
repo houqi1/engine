@@ -34,7 +34,12 @@ private:
     float projY;
     uint32_t nestedMicro;
     uint32_t skipTrace;  // 1 = fill sky only (baseline bandwidth/dispatch cost)
-    float pad3;
+    float aoStrength;
+    float aoPower;
+    float skyYaw;
+    float skyIntensity;
+    uint32_t useSky;  // 1 = sample HDR equirect skybox
+    float padSky[3];
   };
 
   struct FrameResources {
@@ -79,6 +84,7 @@ private:
   std::array<FrameResources, GfxDevice::kFramesInFlight> frames_{};
   VkBuffer boundVoxelBuffer_ = VK_NULL_HANDLE;
   VkBuffer boundMicroBuffer_ = VK_NULL_HANDLE;
+  VkImageView boundSkyView_ = VK_NULL_HANDLE;
   bool imguiReady_ = false;
   float displayFps_ = 0.0f;
   bool skipTrace_ = false;
