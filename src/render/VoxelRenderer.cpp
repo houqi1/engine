@@ -79,10 +79,11 @@ void VoxelRenderer::resize() {
   createOutputImage();
   // Force descriptor refresh so storage-image views stay valid.
   boundVoxelBuffer_ = VK_NULL_HANDLE;
+  boundMicroBuffer_ = VK_NULL_HANDLE;
 }
 
 void VoxelRenderer::createDescriptors() {
-  VkDescriptorSetLayoutBinding bindings[3]{};
+  VkDescriptorSetLayoutBinding bindings[4]{};
   bindings[0].binding = 0;
   bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
   bindings[0].descriptorCount = 1;
@@ -98,9 +99,14 @@ void VoxelRenderer::createDescriptors() {
   bindings[2].descriptorCount = 1;
   bindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
+  bindings[3].binding = 3;
+  bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  bindings[3].descriptorCount = 1;
+  bindings[3].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
   VkDescriptorSetLayoutCreateInfo layoutInfo{};
   layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-  layoutInfo.bindingCount = 3;
+  layoutInfo.bindingCount = 4;
   layoutInfo.pBindings = bindings;
   if (vkCreateDescriptorSetLayout(gfx_.device(), &layoutInfo, nullptr, &frameLayout_) !=
       VK_SUCCESS) {
@@ -109,7 +115,7 @@ void VoxelRenderer::createDescriptors() {
 
   VkDescriptorPoolSize poolSizes[] = {
       {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, GfxDevice::kFramesInFlight},
-      {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, GfxDevice::kFramesInFlight},
+      {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, GfxDevice::kFramesInFlight * 2},
       {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, GfxDevice::kFramesInFlight},
   };
   VkDescriptorPoolCreateInfo poolInfo{};
@@ -169,7 +175,8 @@ void VoxelRenderer::createPipelines() {
 }
 
 void VoxelRenderer::updateDescriptors(VoxelScene& scene) {
-  if (outImage_.view == VK_NULL_HANDLE || scene.voxelBuffer().buffer == VK_NULL_HANDLE) {
+  if (outImage_.view == VK_NULL_HANDLE || scene.voxelBuffer().buffer == VK_NULL_HANDLE ||
+      scene.microBuffer().buffer == VK_NULL_HANDLE) {
     return;
   }
 
@@ -186,7 +193,11 @@ void VoxelRenderer::updateDescriptors(VoxelScene& scene) {
     imageInfo.imageView = outImage_.view;
     imageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
-    VkWriteDescriptorSet writes[3]{};
+    VkDescriptorBufferInfo microInfo{};
+    microInfo.buffer = scene.microBuffer().buffer;
+    microInfo.range = scene.microBuffer().size;
+
+    VkWriteDescriptorSet writes[4]{};
     writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[0].dstSet = frame.frameSet;
     writes[0].dstBinding = 0;
@@ -208,10 +219,18 @@ void VoxelRenderer::updateDescriptors(VoxelScene& scene) {
     writes[2].descriptorCount = 1;
     writes[2].pImageInfo = &imageInfo;
 
-    vkUpdateDescriptorSets(gfx_.device(), 3, writes, 0, nullptr);
+    writes[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[3].dstSet = frame.frameSet;
+    writes[3].dstBinding = 3;
+    writes[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[3].descriptorCount = 1;
+    writes[3].pBufferInfo = &microInfo;
+
+    vkUpdateDescriptorSets(gfx_.device(), 4, writes, 0, nullptr);
   }
 
   boundVoxelBuffer_ = scene.voxelBuffer().buffer;
+  boundMicroBuffer_ = scene.microBuffer().buffer;
 }
 
 void VoxelRenderer::updateFrameUBO(VoxelScene& scene, uint32_t frameIndex) {
@@ -235,6 +254,7 @@ void VoxelRenderer::updateFrameUBO(VoxelScene& scene, uint32_t frameIndex) {
   writeVec3(ubo.skyColor, scene.skyColor());
   ubo.renderMode = static_cast<uint32_t>(std::max(0, scene.renderMode()));
   ubo.projY = proj[1][1];
+  ubo.nestedMicro = scene.nestedMicroVoxels() ? 1u : 0u;
 
   void* mapped = frames_[frameIndex].frameUBO.info.pMappedData;
   if (!mapped) {
@@ -254,7 +274,8 @@ void VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
   if (outImage_.image == VK_NULL_HANDLE) {
     createOutputImage();
   }
-  if (scene.voxelBuffer().buffer != boundVoxelBuffer_ || outImage_.view == VK_NULL_HANDLE) {
+  if (scene.voxelBuffer().buffer != boundVoxelBuffer_ ||
+      scene.microBuffer().buffer != boundMicroBuffer_ || outImage_.view == VK_NULL_HANDLE) {
     updateDescriptors(scene);
   }
 
@@ -421,15 +442,28 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
   ImGui::Begin("Voxel DDA");
   ImGui::TextWrapped("GPU: %s", gfx_.deviceName().c_str());
   ImGui::Text("Display FPS: %.1f", displayFps);
-  ImGui::Text("Occupied voxels: %u / %u", scene.occupiedCount(), scene.voxelCount());
+  ImGui::Text("Occupied coarse: %u / %u", scene.occupiedCount(), scene.voxelCount());
+  ImGui::Text("Occupied micro: %u", scene.occupiedMicroCount());
   ImGui::Separator();
   ImGui::TextWrapped("LMB: remove  |  F: place on hit face  |  RMB drag: look");
   ImGui::SliderInt("Brush Material", &scene.brushMaterial(), 1, 2);
-  ImGui::SliderFloat("Brush Radius", &scene.brushRadius(), 0.0f, 8.0f, "%.1f voxels");
-  ImGui::TextDisabled("0 = single voxel; place/remove use a sphere brush");
+  ImGui::Checkbox("Edit/Render Nested 8^3 Micro", &scene.nestedMicroVoxels());
+  if (scene.nestedMicroVoxels()) {
+    ImGui::SliderFloat("Brush Radius", &scene.brushRadius(), 0.0f, 8.0f, "%.1f micro-voxels");
+    ImGui::TextDisabled("Editing individual micro cells inside coarse bricks");
+  } else {
+    ImGui::SliderFloat("Brush Radius", &scene.brushRadius(), 0.0f, 8.0f, "%.1f coarse voxels");
+    ImGui::TextDisabled("Editing whole coarse cells (each owns an 8^3 brick)");
+  }
   if (const std::optional<VoxelHit> hit = scene.lastHit()) {
-    ImGui::Text("Hit: (%d, %d, %d)  n=(%d,%d,%d)  mat=%u", hit->cell.x, hit->cell.y, hit->cell.z,
-                hit->normal.x, hit->normal.y, hit->normal.z, hit->material);
+    if (hit->hasMicro) {
+      ImGui::Text("Hit coarse=(%d,%d,%d) micro=(%d,%d,%d) n=(%d,%d,%d) mat=%u", hit->cell.x,
+                  hit->cell.y, hit->cell.z, hit->micro.x, hit->micro.y, hit->micro.z, hit->normal.x,
+                  hit->normal.y, hit->normal.z, hit->material);
+    } else {
+      ImGui::Text("Hit: (%d, %d, %d)  n=(%d,%d,%d)  mat=%u", hit->cell.x, hit->cell.y, hit->cell.z,
+                  hit->normal.x, hit->normal.y, hit->normal.z, hit->material);
+    }
   } else {
     ImGui::TextUnformatted("Hit: none");
   }
@@ -439,7 +473,7 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
   ImGui::Combo("Render Mode", &scene.renderMode(), modes, IM_ARRAYSIZE(modes));
 
   bool rebuild = false;
-  rebuild |= ImGui::SliderInt("Grid Size", &scene.gridSize(), 8, 128);
+  rebuild |= ImGui::SliderInt("Grid Size", &scene.gridSize(), 8, 64);
   rebuild |= ImGui::DragFloat("Voxel Size", &scene.voxelSize(), 0.01f, 0.05f, 2.0f);
   ImGui::DragFloat3("Light Dir", &scene.lightDir().x, 0.01f);
   ImGui::SliderFloat("Ambient", &scene.ambient(), 0.0f, 1.0f);
@@ -451,6 +485,7 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
   if (rebuild) {
     scene.rebuildVoxels(gfx_);
     boundVoxelBuffer_ = VK_NULL_HANDLE;
+    boundMicroBuffer_ = VK_NULL_HANDLE;
   }
   ImGui::End();
 

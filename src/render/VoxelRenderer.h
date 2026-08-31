@@ -32,7 +32,7 @@ private:
     float skyColor[3];
     uint32_t renderMode;
     float projY;
-    float pad1;
+    uint32_t nestedMicro;
     float pad2;
     float pad3;
   };
@@ -66,6 +66,7 @@ private:
 
   std::array<FrameResources, GfxDevice::kFramesInFlight> frames_{};
   VkBuffer boundVoxelBuffer_ = VK_NULL_HANDLE;
+  VkBuffer boundMicroBuffer_ = VK_NULL_HANDLE;
   bool imguiReady_ = false;
   float displayFps_ = 0.0f;
 };
