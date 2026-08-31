@@ -30,6 +30,10 @@ public:
   bool wasResized() const { return framebufferResized_; }
   void clearResizedFlag() { framebufferResized_ = false; }
 
+  // macOS/MoltenVK: force CAMetalLayer.displaySyncEnabled off before surface/swapchain.
+  // Safe no-op on other platforms.
+  void disableMetalDisplaySync() const;
+
   static void framebufferResizeCallback(GLFWwindow* window, int width, int height);
 
 private:

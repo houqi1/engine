@@ -106,8 +106,15 @@ function(ve_configure_target target_name)
   if(APPLE)
     target_compile_definitions(${target_name} PRIVATE VE_PLATFORM_MACOS=1)
     target_compile_options(${target_name} PRIVATE -Wno-nullability-completeness)
+    # Needed to force CAMetalLayer.displaySyncEnabled = NO under MoltenVK.
+    target_link_libraries(${target_name} PRIVATE "-framework Cocoa" "-framework QuartzCore")
   endif()
 endfunction()
+
+# Objective-C++ helpers live in Window.cpp on macOS.
+if(APPLE)
+  set_source_files_properties(src/core/Window.cpp PROPERTIES COMPILE_FLAGS "-x objective-c++")
+endif()
 
 # Shader output dir must exist before target compile defs reference it.
 set(VE_SHADER_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/shaders)

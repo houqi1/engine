@@ -124,6 +124,8 @@ void GfxDevice::createInstance() {
 }
 
 void GfxDevice::createSurface() {
+  // Ensure Metal display sync is off before MoltenVK binds the CAMetalLayer.
+  window_.disableMetalDisplaySync();
   if (glfwCreateWindowSurface(instance_.instance, window_.handle(), nullptr, &surface_) !=
       VK_SUCCESS) {
     fail("Failed to create window surface");
@@ -269,13 +271,32 @@ void GfxDevice::createAllocator() {
   }
 }
 
+const char* GfxDevice::presentModeName() const {
+  switch (presentMode_) {
+    case VK_PRESENT_MODE_IMMEDIATE_KHR:
+      return "IMMEDIATE (uncapped)";
+    case VK_PRESENT_MODE_MAILBOX_KHR:
+      return "MAILBOX (uncapped)";
+    case VK_PRESENT_MODE_FIFO_RELAXED_KHR:
+      return "FIFO_RELAXED";
+    case VK_PRESENT_MODE_FIFO_KHR:
+    default:
+      return "FIFO (VSync)";
+  }
+}
+
 void GfxDevice::createSwapchain() {
   const VkExtent2D extent = window_.framebufferExtent();
+  // Prefer uncapped present modes so Display FPS reflects real throughput.
+  // Fallback order: MAILBOX -> IMMEDIATE -> FIFO_RELAXED -> FIFO.
   auto swapRet =
       vkb::SwapchainBuilder{device_, surface_}
           .set_desired_format({VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR})
           .add_fallback_format({VK_FORMAT_B8G8R8A8_SRGB, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR})
-          .set_desired_present_mode(VK_PRESENT_MODE_FIFO_KHR)
+          .set_desired_present_mode(VK_PRESENT_MODE_MAILBOX_KHR)
+          .add_fallback_present_mode(VK_PRESENT_MODE_IMMEDIATE_KHR)
+          .add_fallback_present_mode(VK_PRESENT_MODE_FIFO_RELAXED_KHR)
+          .add_fallback_present_mode(VK_PRESENT_MODE_FIFO_KHR)
           .set_desired_extent(extent.width, extent.height)
           .add_image_usage_flags(VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)
           .build();
@@ -286,9 +307,15 @@ void GfxDevice::createSwapchain() {
   swapchain_ = swapRet.value();
   swapchainExtent_ = swapchain_.extent;
   swapchainFormat_ = swapchain_.image_format;
+  presentMode_ = swapchain_.present_mode;
   swapchainImages_ = swapchain_.get_images().value();
   swapchainImageViews_ = swapchain_.get_image_views().value();
   createSwapchainSync();
+
+  // MoltenVK may recreate/reconfigure the layer during swapchain build; re-assert.
+  window_.disableMetalDisplaySync();
+
+  std::cout << "Present mode: " << presentModeName() << std::endl;
 }
 
 void GfxDevice::createSwapchainSync() {

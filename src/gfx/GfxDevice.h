@@ -89,6 +89,10 @@ public:
   VmaAllocator allocator() const { return allocator_; }
   VkExtent2D swapchainExtent() const { return swapchainExtent_; }
   VkFormat swapchainFormat() const { return swapchainFormat_; }
+  VkPresentModeKHR presentMode() const { return presentMode_; }
+  const char* presentModeName() const;
+  bool vsyncEnabled() const { return presentMode_ == VK_PRESENT_MODE_FIFO_KHR ||
+                                     presentMode_ == VK_PRESENT_MODE_FIFO_RELAXED_KHR; }
   uint32_t framesInFlight() const { return kFramesInFlight; }
   bool swapchainWasRecreated() const { return swapchainRecreated_; }
   void clearSwapchainRecreatedFlag() { swapchainRecreated_ = false; }
@@ -132,6 +136,7 @@ private:
   vkb::Swapchain swapchain_{};
   VkExtent2D swapchainExtent_{};
   VkFormat swapchainFormat_ = VK_FORMAT_UNDEFINED;
+  VkPresentModeKHR presentMode_ = VK_PRESENT_MODE_FIFO_KHR;
   std::vector<VkImage> swapchainImages_;
   std::vector<VkImageView> swapchainImageViews_;
   std::vector<VkSemaphore> renderFinishedSemaphores_;

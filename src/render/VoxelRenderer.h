@@ -48,6 +48,10 @@ private:
   void destroyOutputImage();
   void updateDescriptors(VoxelScene& scene);
   void updateFrameUBO(VoxelScene& scene, uint32_t frameIndex);
+  void createTimestampPool();
+  void destroyTimestampPool();
+  void writeTimestamp(VkCommandBuffer cmd, uint32_t queryIndex, VkPipelineStageFlags2 stage) const;
+  void collectGpuTiming(uint32_t frameIndex);
   void initImGui();
   void shutdownImGui();
   void recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float displayFps);
@@ -69,4 +73,9 @@ private:
   VkBuffer boundMicroBuffer_ = VK_NULL_HANDLE;
   bool imguiReady_ = false;
   float displayFps_ = 0.0f;
+
+  VkQueryPool timestampPool_ = VK_NULL_HANDLE;
+  float timestampPeriodNs_ = 1.0f;
+  std::array<bool, GfxDevice::kFramesInFlight> timestampPending_{};
+  float gpuFrameMs_ = 0.0f;
 };

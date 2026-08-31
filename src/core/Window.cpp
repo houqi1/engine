@@ -2,6 +2,13 @@
 
 #include <stdexcept>
 
+#if defined(VE_PLATFORM_MACOS)
+#define GLFW_EXPOSE_NATIVE_COCOA
+#include <GLFW/glfw3native.h>
+#import <Cocoa/Cocoa.h>
+#import <QuartzCore/CAMetalLayer.h>
+#endif
+
 Window::Window(const WindowConfig& config) {
   if (!glfwInit()) {
     throw std::runtime_error("Failed to initialize GLFW");
@@ -18,6 +25,9 @@ Window::Window(const WindowConfig& config) {
 
   glfwSetWindowUserPointer(window_, this);
   glfwSetFramebufferSizeCallback(window_, framebufferResizeCallback);
+
+  // Important on macOS: configure the Metal layer before Vulkan surface creation.
+  disableMetalDisplaySync();
 }
 
 Window::~Window() {
@@ -51,4 +61,33 @@ void Window::framebufferResizeCallback(GLFWwindow* window, int /*width*/, int /*
   if (self) {
     self->framebufferResized_ = true;
   }
+}
+
+void Window::disableMetalDisplaySync() const {
+#if defined(VE_PLATFORM_MACOS)
+  if (!window_) {
+    return;
+  }
+  NSWindow* nsWindow = glfwGetCocoaWindow(window_);
+  if (!nsWindow) {
+    return;
+  }
+  NSView* view = [nsWindow contentView];
+  if (!view) {
+    return;
+  }
+  [view setWantsLayer:YES];
+  CAMetalLayer* layer = nullptr;
+  if ([view.layer isKindOfClass:[CAMetalLayer class]]) {
+    layer = (CAMetalLayer*)view.layer;
+  } else {
+    layer = [CAMetalLayer layer];
+    view.layer = layer;
+  }
+  if (@available(macOS 10.13, *)) {
+    layer.displaySyncEnabled = NO;
+  }
+#else
+  (void)window_;
+#endif
 }

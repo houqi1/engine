@@ -1196,16 +1196,20 @@ void Renderer::recordImGui(VkCommandBuffer cmd, const FrameContext& /*frame*/, S
   ImGui::TextWrapped("GPU: %s", gfx_.deviceName().c_str());
   ImGui::Text("MSAA: %ux", static_cast<uint32_t>(msaaSamples_));
   ImGui::Separator();
-  ImGui::Text("Timing (VSync ON)");
-  ImGui::Text("Display FPS: %.1f  (%.2f ms)", stats_.displayFps, stats_.displayFrameMs);
+  ImGui::Text("Present: %s", gfx_.presentModeName());
+  ImGui::Text("FPS: %.1f  (%.2f ms)", stats_.displayFps, stats_.displayFrameMs);
   ImGui::Text("CPU record:  %.2f ms", stats_.cpuRecordMs);
   ImGui::Text("GPU work:    %.2f ms", stats_.gpuFrameMs);
   if (stats_.gpuFrameMs > 1e-3f) {
-    ImGui::Text("GPU estimate: %.0f FPS  (if uncapped)", 1000.0f / stats_.gpuFrameMs);
+    ImGui::Text("GPU work FPS: %.0f", 1000.0f / stats_.gpuFrameMs);
   } else {
-    ImGui::Text("GPU estimate: n/a");
+    ImGui::Text("GPU work FPS: n/a");
   }
-  ImGui::TextDisabled("Display FPS is capped by refresh rate; GPU estimate is actual work cost.");
+  if (gfx_.vsyncEnabled()) {
+    ImGui::TextDisabled("VSync is on; FPS is refresh-capped.");
+  } else {
+    ImGui::TextDisabled("Uncapped present mode; FPS is real throughput.");
+  }
   ImGui::Separator();
   ImGui::Checkbox("Shadows", &showShadows_);
   ImGui::Checkbox("Skybox", &showSky_);

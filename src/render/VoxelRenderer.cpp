@@ -33,6 +33,7 @@ VoxelRenderer::~VoxelRenderer() {
   gfx_.waitIdle();
   shutdownImGui();
   destroyOutputImage();
+  destroyTimestampPool();
 
   if (computePipeline_) {
     vkDestroyPipeline(gfx_.device(), computePipeline_, nullptr);
@@ -54,6 +55,7 @@ VoxelRenderer::~VoxelRenderer() {
 void VoxelRenderer::init(VoxelScene& scene) {
   createDescriptors();
   createOutputImage();
+  createTimestampPool();
   createPipelines();
 
   for (auto& frame : frames_) {
@@ -72,6 +74,57 @@ void VoxelRenderer::init(VoxelScene& scene) {
 
   updateDescriptors(scene);
   initImGui();
+}
+
+void VoxelRenderer::createTimestampPool() {
+  VkPhysicalDeviceProperties props{};
+  vkGetPhysicalDeviceProperties(gfx_.physicalDevice(), &props);
+  timestampPeriodNs_ = props.limits.timestampPeriod;
+
+  VkQueryPoolCreateInfo info{};
+  info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+  info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+  info.queryCount = GfxDevice::kFramesInFlight * 2;
+  if (vkCreateQueryPool(gfx_.device(), &info, nullptr, &timestampPool_) != VK_SUCCESS) {
+    throw std::runtime_error("Failed to create voxel timestamp query pool");
+  }
+  timestampPending_.fill(false);
+}
+
+void VoxelRenderer::destroyTimestampPool() {
+  if (timestampPool_) {
+    vkDestroyQueryPool(gfx_.device(), timestampPool_, nullptr);
+    timestampPool_ = VK_NULL_HANDLE;
+  }
+}
+
+void VoxelRenderer::writeTimestamp(VkCommandBuffer cmd, uint32_t queryIndex,
+                                   VkPipelineStageFlags2 stage) const {
+  if (!timestampPool_) {
+    return;
+  }
+  vkCmdWriteTimestamp2(cmd, stage, timestampPool_, queryIndex);
+}
+
+void VoxelRenderer::collectGpuTiming(uint32_t frameIndex) {
+  if (!timestampPool_ || !timestampPending_[frameIndex]) {
+    return;
+  }
+
+  const uint32_t firstQuery = frameIndex * 2;
+  uint64_t stamps[2] = {0, 0};
+  const VkResult result =
+      vkGetQueryPoolResults(gfx_.device(), timestampPool_, firstQuery, 2, sizeof(stamps), stamps,
+                            sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
+  if (result != VK_SUCCESS) {
+    return;
+  }
+
+  const double deltaTicks = static_cast<double>(stamps[1] - stamps[0]);
+  const float gpuMs = static_cast<float>(deltaTicks * static_cast<double>(timestampPeriodNs_) * 1e-6);
+  constexpr float alpha = 0.1f;
+  gpuFrameMs_ = gpuFrameMs_ * (1.0f - alpha) + gpuMs * alpha;
+  timestampPending_[frameIndex] = false;
 }
 
 void VoxelRenderer::resize() {
@@ -289,8 +342,15 @@ void VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
     return;
   }
 
+  collectGpuTiming(frame.frameIndex);
   updateFrameUBO(scene, frame.frameIndex);
   VkDescriptorSet frameSet = frames_[frame.frameIndex].frameSet;
+
+  const uint32_t tsBegin = frame.frameIndex * 2;
+  if (timestampPool_) {
+    vkCmdResetQueryPool(frame.cmd, timestampPool_, tsBegin, 2);
+    writeTimestamp(frame.cmd, tsBegin, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT);
+  }
 
   // Compute writes the raycast result.
   gfx_.transitionImage(frame.cmd, outImage_.image, VK_IMAGE_LAYOUT_UNDEFINED,
@@ -364,6 +424,11 @@ void VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
                        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
                        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
                        0);
+
+  if (timestampPool_) {
+    writeTimestamp(frame.cmd, tsBegin + 1, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT);
+    timestampPending_[frame.frameIndex] = true;
+  }
 
   gfx_.endFrame(frame);
 }
@@ -441,7 +506,21 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
 
   ImGui::Begin("Voxel DDA");
   ImGui::TextWrapped("GPU: %s", gfx_.deviceName().c_str());
-  ImGui::Text("Display FPS: %.1f", displayFps);
+  ImGui::Text("Present: %s", gfx_.presentModeName());
+  ImGui::Text("Display FPS: %.1f  (%.2f ms)", displayFps,
+              displayFps > 1e-3f ? 1000.0f / displayFps : 0.0f);
+  ImGui::Text("GPU work:    %.2f ms", gpuFrameMs_);
+  if (gpuFrameMs_ > 1e-3f) {
+    ImGui::Text("GPU work FPS: %.0f", 1000.0f / gpuFrameMs_);
+  } else {
+    ImGui::Text("GPU work FPS: n/a");
+  }
+  if (gfx_.vsyncEnabled()) {
+    ImGui::TextDisabled("VSync present mode; Display FPS is refresh-capped.");
+  } else {
+    ImGui::TextDisabled("If Display FPS stays ~60 on macOS, compositor may still sync;");
+    ImGui::TextDisabled("trust GPU work FPS for uncapped cost.");
+  }
   ImGui::Text("Occupied coarse: %u / %u", scene.occupiedCount(), scene.voxelCount());
   ImGui::Text("Occupied micro: %u", scene.occupiedMicroCount());
   ImGui::Separator();
