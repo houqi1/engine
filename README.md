@@ -51,7 +51,7 @@ ImGui panel: grass density, wind, colors, enable/disable.
 | Target | Entry | Description |
 |--------|-------|-------------|
 | `vulkan_engine` | `src/main.cpp` | Grass / PBR demo |
-| `vulkan_engine_voxel` | `src/main_voxel.cpp` | Voxel sandbox (cube-per-voxel placeholder) |
+| `vulkan_engine_voxel` | `src/main_voxel.cpp` | Voxel sandbox (dense-grid Amanatides–Woo DDA) |
 
 Shared modules: `src/core`, `src/gfx`, ImGui backends.  
 Grass-only: `Scene`, `GrassSystem`, `Renderer`.  

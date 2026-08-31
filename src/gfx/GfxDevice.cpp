@@ -520,12 +520,26 @@ void GfxDevice::destroyBuffer(AllocatedBuffer& buffer) {
 }
 
 void GfxDevice::uploadToBuffer(AllocatedBuffer& dst, const void* data, VkDeviceSize size) {
+  uploadToBuffer(dst, data, size, 0);
+}
+
+void GfxDevice::uploadToBuffer(AllocatedBuffer& dst, const void* data, VkDeviceSize size,
+                               VkDeviceSize dstOffset) {
+  if (size == 0) {
+    return;
+  }
+  if (dstOffset + size > dst.size) {
+    fail("uploadToBuffer: write exceeds destination buffer size");
+  }
+
   AllocatedBuffer staging =
       createBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
   std::memcpy(staging.info.pMappedData, data, static_cast<size_t>(size));
 
   immediateSubmit([&](VkCommandBuffer cmd) {
     VkBufferCopy copy{};
+    copy.srcOffset = 0;
+    copy.dstOffset = dstOffset;
     copy.size = size;
     vkCmdCopyBuffer(cmd, staging.buffer, dst.buffer, 1, &copy);
   });

@@ -141,6 +141,7 @@ set(VE_SHADER_SOURCES
   ibl_cube.vert
   voxel.vert
   voxel.frag
+  voxel_dda.comp
 )
 
 set(VE_SPV_FILES "")

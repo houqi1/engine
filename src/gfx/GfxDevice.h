@@ -42,6 +42,8 @@ public:
                                VmaMemoryUsage memoryUsage);
   void destroyBuffer(AllocatedBuffer& buffer);
   void uploadToBuffer(AllocatedBuffer& dst, const void* data, VkDeviceSize size);
+  void uploadToBuffer(AllocatedBuffer& dst, const void* data, VkDeviceSize size,
+                      VkDeviceSize dstOffset);
 
   AllocatedImage createImage(VkExtent3D extent, VkFormat format, VkImageUsageFlags usage,
                              VkImageAspectFlags aspect, bool dedicated = false,

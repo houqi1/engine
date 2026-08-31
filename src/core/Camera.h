@@ -18,13 +18,13 @@ public:
   glm::mat4 view() const { return view_; }
   glm::mat4 proj() const { return proj_; }
   glm::vec3 position() const { return position_; }
+  glm::vec3 forward() const;
+  glm::vec3 right() const;
   float nearZ() const { return nearZ_; }
   float farZ() const { return farZ_; }
 
 private:
   void syncPositionFromOrbit();
-  glm::vec3 forward() const;
-  glm::vec3 right() const;
 
   float fovY_ = 60.0f;
   float nearZ_ = 0.1f;

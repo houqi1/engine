@@ -1,36 +1,19 @@
 #include "render/VoxelRenderer.h"
 
-#include "gfx/PipelineBuilder.h"
-
 #include <imgui.h>
 #include <imgui_impl_glfw.h>
 #include <imgui_impl_vulkan.h>
 
-#include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/matrix_inverse.hpp>
 #include <glm/gtc/type_ptr.hpp>
 
+#include <algorithm>
 #include <cstring>
+#include <optional>
 #include <stdexcept>
 #include <string>
-#include <vector>
 
 namespace {
-
-VkVertexInputBindingDescription vertexBinding() {
-  VkVertexInputBindingDescription binding{};
-  binding.binding = 0;
-  binding.stride = sizeof(Vertex);
-  binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
-  return binding;
-}
-
-std::vector<VkVertexInputAttributeDescription> vertexAttributes() {
-  return {
-      {0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, position)},
-      {1, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, normal)},
-      {2, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(Vertex, uv)},
-  };
-}
 
 void writeMat4(float* dst, const glm::mat4& m) {
   std::memcpy(dst, glm::value_ptr(m), sizeof(float) * 16);
@@ -44,15 +27,15 @@ void writeVec3(float* dst, const glm::vec3& v) {
 
 }  // namespace
 
-VoxelRenderer::VoxelRenderer(GfxDevice& gfx) : gfx_(gfx), msaaSamples_(gfx.msaaSamples()) {}
+VoxelRenderer::VoxelRenderer(GfxDevice& gfx) : gfx_(gfx) {}
 
 VoxelRenderer::~VoxelRenderer() {
   gfx_.waitIdle();
   shutdownImGui();
-  destroyMsaaTargets();
+  destroyOutputImage();
 
-  if (pipeline_) {
-    vkDestroyPipeline(gfx_.device(), pipeline_, nullptr);
+  if (computePipeline_) {
+    vkDestroyPipeline(gfx_.device(), computePipeline_, nullptr);
   }
   if (pipelineLayout_) {
     vkDestroyPipelineLayout(gfx_.device(), pipelineLayout_, nullptr);
@@ -68,13 +51,13 @@ VoxelRenderer::~VoxelRenderer() {
   }
 }
 
-void VoxelRenderer::init() {
+void VoxelRenderer::init(VoxelScene& scene) {
   createDescriptors();
-  createMsaaTargets();
+  createOutputImage();
   createPipelines();
 
   for (auto& frame : frames_) {
-    frame.frameUBO = gfx_.createBuffer(sizeof(VoxelFrameUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+    frame.frameUBO = gfx_.createBuffer(sizeof(VoxelDdaUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
                                        VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
 
     VkDescriptorSetAllocateInfo allocInfo{};
@@ -83,121 +66,179 @@ void VoxelRenderer::init() {
     allocInfo.descriptorSetCount = 1;
     allocInfo.pSetLayouts = &frameLayout_;
     if (vkAllocateDescriptorSets(gfx_.device(), &allocInfo, &frame.frameSet) != VK_SUCCESS) {
-      throw std::runtime_error("Failed to allocate voxel frame descriptor set");
+      throw std::runtime_error("Failed to allocate voxel DDA descriptor set");
     }
-
-    VkDescriptorBufferInfo bufferInfo{};
-    bufferInfo.buffer = frame.frameUBO.buffer;
-    bufferInfo.range = sizeof(VoxelFrameUBO);
-
-    VkWriteDescriptorSet write{};
-    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    write.dstSet = frame.frameSet;
-    write.dstBinding = 0;
-    write.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    write.descriptorCount = 1;
-    write.pBufferInfo = &bufferInfo;
-    vkUpdateDescriptorSets(gfx_.device(), 1, &write, 0, nullptr);
   }
 
+  updateDescriptors(scene);
   initImGui();
 }
 
 void VoxelRenderer::resize() {
-  destroyMsaaTargets();
-  createMsaaTargets();
+  destroyOutputImage();
+  createOutputImage();
+  // Force descriptor refresh so storage-image views stay valid.
+  boundVoxelBuffer_ = VK_NULL_HANDLE;
 }
 
 void VoxelRenderer::createDescriptors() {
-  VkDescriptorSetLayoutBinding binding{};
-  binding.binding = 0;
-  binding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-  binding.descriptorCount = 1;
-  binding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+  VkDescriptorSetLayoutBinding bindings[3]{};
+  bindings[0].binding = 0;
+  bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+  bindings[0].descriptorCount = 1;
+  bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+  bindings[1].binding = 1;
+  bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  bindings[1].descriptorCount = 1;
+  bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+  bindings[2].binding = 2;
+  bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+  bindings[2].descriptorCount = 1;
+  bindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
   VkDescriptorSetLayoutCreateInfo layoutInfo{};
   layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-  layoutInfo.bindingCount = 1;
-  layoutInfo.pBindings = &binding;
+  layoutInfo.bindingCount = 3;
+  layoutInfo.pBindings = bindings;
   if (vkCreateDescriptorSetLayout(gfx_.device(), &layoutInfo, nullptr, &frameLayout_) !=
       VK_SUCCESS) {
-    throw std::runtime_error("Failed to create voxel frame set layout");
+    throw std::runtime_error("Failed to create voxel DDA set layout");
   }
 
-  VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, GfxDevice::kFramesInFlight};
+  VkDescriptorPoolSize poolSizes[] = {
+      {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, GfxDevice::kFramesInFlight},
+      {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, GfxDevice::kFramesInFlight},
+      {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, GfxDevice::kFramesInFlight},
+  };
   VkDescriptorPoolCreateInfo poolInfo{};
   poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
   poolInfo.maxSets = GfxDevice::kFramesInFlight;
-  poolInfo.poolSizeCount = 1;
-  poolInfo.pPoolSizes = &poolSize;
+  poolInfo.poolSizeCount = static_cast<uint32_t>(std::size(poolSizes));
+  poolInfo.pPoolSizes = poolSizes;
   if (vkCreateDescriptorPool(gfx_.device(), &poolInfo, nullptr, &descriptorPool_) != VK_SUCCESS) {
-    throw std::runtime_error("Failed to create voxel descriptor pool");
+    throw std::runtime_error("Failed to create voxel DDA descriptor pool");
   }
 }
 
-void VoxelRenderer::createMsaaTargets() {
-  const VkExtent3D extent{gfx_.swapchainExtent().width, gfx_.swapchainExtent().height, 1};
-  depthMsaa_ = gfx_.createImage(extent, kDepthFormat, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
-                                VK_IMAGE_ASPECT_DEPTH_BIT, true, 1, msaaSamples_);
-  if (msaaSamples_ != VK_SAMPLE_COUNT_1_BIT) {
-    colorMsaa_ = gfx_.createImage(extent, gfx_.swapchainFormat(),
-                                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, VK_IMAGE_ASPECT_COLOR_BIT,
-                                  true, 1, msaaSamples_);
+void VoxelRenderer::createOutputImage() {
+  const VkExtent2D ext = gfx_.swapchainExtent();
+  if (ext.width == 0 || ext.height == 0) {
+    return;
   }
+  outImage_ = gfx_.createImage({ext.width, ext.height, 1}, kOutFormat,
+                               VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                               VK_IMAGE_ASPECT_COLOR_BIT, true);
 }
 
-void VoxelRenderer::destroyMsaaTargets() {
-  gfx_.destroyImage(colorMsaa_);
-  gfx_.destroyImage(depthMsaa_);
+void VoxelRenderer::destroyOutputImage() {
+  gfx_.destroyImage(outImage_);
 }
 
 void VoxelRenderer::createPipelines() {
   const std::string shaderDir = VE_SHADER_DIR;
-  VkShaderModule vert = gfx_.loadShaderModule(shaderDir + "/voxel.vert.spv");
-  VkShaderModule frag = gfx_.loadShaderModule(shaderDir + "/voxel.frag.spv");
-
-  VkPushConstantRange pushRange{};
-  pushRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
-  pushRange.offset = 0;
-  pushRange.size = sizeof(VoxelPushConstants);
+  VkShaderModule comp = gfx_.loadShaderModule(shaderDir + "/voxel_dda.comp.spv");
 
   VkPipelineLayoutCreateInfo layoutInfo{};
   layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
   layoutInfo.setLayoutCount = 1;
   layoutInfo.pSetLayouts = &frameLayout_;
-  layoutInfo.pushConstantRangeCount = 1;
-  layoutInfo.pPushConstantRanges = &pushRange;
   if (vkCreatePipelineLayout(gfx_.device(), &layoutInfo, nullptr, &pipelineLayout_) != VK_SUCCESS) {
-    throw std::runtime_error("Failed to create voxel pipeline layout");
+    vkDestroyShaderModule(gfx_.device(), comp, nullptr);
+    throw std::runtime_error("Failed to create voxel DDA pipeline layout");
   }
 
-  pipeline_ = PipelineBuilder()
-                  .setShaders(vert, frag)
-                  .setVertexInput(vertexBinding(), vertexAttributes())
-                  .setTopology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
-                  .setCullMode(VK_CULL_MODE_BACK_BIT, VK_FRONT_FACE_COUNTER_CLOCKWISE)
-                  .setMultisampling(msaaSamples_)
-                  .setDepthTest(true, true, VK_COMPARE_OP_GREATER_OR_EQUAL)
-                  .setColorFormat(gfx_.swapchainFormat())
-                  .setDepthFormat(kDepthFormat)
-                  .setLayout(pipelineLayout_)
-                  .build(gfx_.device());
+  VkPipelineShaderStageCreateInfo stage{};
+  stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+  stage.module = comp;
+  stage.pName = "main";
 
-  vkDestroyShaderModule(gfx_.device(), vert, nullptr);
-  vkDestroyShaderModule(gfx_.device(), frag, nullptr);
+  VkComputePipelineCreateInfo pipeInfo{};
+  pipeInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+  pipeInfo.stage = stage;
+  pipeInfo.layout = pipelineLayout_;
+  if (vkCreateComputePipelines(gfx_.device(), VK_NULL_HANDLE, 1, &pipeInfo, nullptr,
+                               &computePipeline_) != VK_SUCCESS) {
+    vkDestroyShaderModule(gfx_.device(), comp, nullptr);
+    throw std::runtime_error("Failed to create voxel DDA compute pipeline");
+  }
+
+  vkDestroyShaderModule(gfx_.device(), comp, nullptr);
+}
+
+void VoxelRenderer::updateDescriptors(VoxelScene& scene) {
+  if (outImage_.view == VK_NULL_HANDLE || scene.voxelBuffer().buffer == VK_NULL_HANDLE) {
+    return;
+  }
+
+  for (auto& frame : frames_) {
+    VkDescriptorBufferInfo uboInfo{};
+    uboInfo.buffer = frame.frameUBO.buffer;
+    uboInfo.range = sizeof(VoxelDdaUBO);
+
+    VkDescriptorBufferInfo voxelInfo{};
+    voxelInfo.buffer = scene.voxelBuffer().buffer;
+    voxelInfo.range = scene.voxelBuffer().size;
+
+    VkDescriptorImageInfo imageInfo{};
+    imageInfo.imageView = outImage_.view;
+    imageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+    VkWriteDescriptorSet writes[3]{};
+    writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[0].dstSet = frame.frameSet;
+    writes[0].dstBinding = 0;
+    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    writes[0].descriptorCount = 1;
+    writes[0].pBufferInfo = &uboInfo;
+
+    writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[1].dstSet = frame.frameSet;
+    writes[1].dstBinding = 1;
+    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[1].descriptorCount = 1;
+    writes[1].pBufferInfo = &voxelInfo;
+
+    writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[2].dstSet = frame.frameSet;
+    writes[2].dstBinding = 2;
+    writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    writes[2].descriptorCount = 1;
+    writes[2].pImageInfo = &imageInfo;
+
+    vkUpdateDescriptorSets(gfx_.device(), 3, writes, 0, nullptr);
+  }
+
+  boundVoxelBuffer_ = scene.voxelBuffer().buffer;
 }
 
 void VoxelRenderer::updateFrameUBO(VoxelScene& scene, uint32_t frameIndex) {
-  VoxelFrameUBO ubo{};
-  writeMat4(ubo.view, scene.camera().view());
-  writeMat4(ubo.proj, scene.camera().proj());
-  writeVec3(ubo.cameraPos, scene.camera().position());
-  writeVec3(ubo.lightDir, glm::normalize(scene.lightDir()));
+  const glm::mat4 view = scene.camera().view();
+  const glm::mat4 proj = scene.camera().proj();
 
-  auto& frame = frames_[frameIndex];
-  void* mapped = frame.frameUBO.info.pMappedData;
+  VoxelDdaUBO ubo{};
+  writeMat4(ubo.invView, glm::inverse(view));
+  writeMat4(ubo.invProj, glm::inverse(proj));
+  writeVec3(ubo.cameraPos, scene.camera().position());
+  ubo.voxelSize = scene.voxelSize();
+  writeVec3(ubo.lightDir, glm::normalize(scene.lightDir()));
+  ubo.ambient = scene.ambient();
+  writeVec3(ubo.gridOrigin, scene.gridOrigin());
+  ubo.projX = proj[0][0];
+  const glm::uvec3 dims = scene.gridDims();
+  ubo.gridSize[0] = dims.x;
+  ubo.gridSize[1] = dims.y;
+  ubo.gridSize[2] = dims.z;
+  ubo.maxSteps = scene.maxSteps();
+  writeVec3(ubo.skyColor, scene.skyColor());
+  ubo.renderMode = static_cast<uint32_t>(std::max(0, scene.renderMode()));
+  ubo.projY = proj[1][1];
+
+  void* mapped = frames_[frameIndex].frameUBO.info.pMappedData;
   if (!mapped) {
-    throw std::runtime_error("Voxel frame UBO is not host-mapped");
+    throw std::runtime_error("Voxel DDA UBO is not host-mapped");
   }
   std::memcpy(mapped, &ubo, sizeof(ubo));
 }
@@ -210,100 +251,74 @@ void VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
     gfx_.clearSwapchainRecreatedFlag();
   }
 
+  if (outImage_.image == VK_NULL_HANDLE) {
+    createOutputImage();
+  }
+  if (scene.voxelBuffer().buffer != boundVoxelBuffer_ || outImage_.view == VK_NULL_HANDLE) {
+    updateDescriptors(scene);
+  }
+
   FrameContext frame{};
   if (!gfx_.beginFrame(frame)) {
     return;
   }
 
+  if (outImage_.image == VK_NULL_HANDLE || scene.voxelBuffer().buffer == VK_NULL_HANDLE) {
+    gfx_.endFrame(frame);
+    return;
+  }
+
   updateFrameUBO(scene, frame.frameIndex);
   VkDescriptorSet frameSet = frames_[frame.frameIndex].frameSet;
-  const bool useMsaa = msaaSamples_ != VK_SAMPLE_COUNT_1_BIT;
 
-  gfx_.transitionImage(frame.cmd, frame.swapchainImage, VK_IMAGE_LAYOUT_UNDEFINED,
-                       VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
-                       0, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-                       VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
-  if (useMsaa) {
-    gfx_.transitionImage(frame.cmd, colorMsaa_.image, VK_IMAGE_LAYOUT_UNDEFINED,
-                         VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                         VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
-                         VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-                         VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
-  }
-  gfx_.transitionImage(frame.cmd, depthMsaa_.image, VK_IMAGE_LAYOUT_UNDEFINED,
-                       VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
-                       0, VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT,
-                       VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_IMAGE_ASPECT_DEPTH_BIT);
+  // Compute writes the raycast result.
+  gfx_.transitionImage(frame.cmd, outImage_.image, VK_IMAGE_LAYOUT_UNDEFINED,
+                       VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                       VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT);
 
-  VkClearValue colorClear{};
-  colorClear.color = {{0.08f, 0.09f, 0.12f, 1.0f}};
-  VkClearValue depthClear{};
-  depthClear.depthStencil = {0.0f, 0};
-
-  VkRenderingAttachmentInfo colorAttach{};
-  colorAttach.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-  colorAttach.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-  colorAttach.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-  colorAttach.clearValue = colorClear;
-  if (useMsaa) {
-    colorAttach.imageView = colorMsaa_.view;
-    colorAttach.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    colorAttach.resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT;
-    colorAttach.resolveImageView = frame.swapchainView;
-    colorAttach.resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-  } else {
-    colorAttach.imageView = frame.swapchainView;
-    colorAttach.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-  }
-
-  VkRenderingAttachmentInfo depthAttach{};
-  depthAttach.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-  depthAttach.imageView = depthMsaa_.view;
-  depthAttach.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-  depthAttach.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-  depthAttach.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-  depthAttach.clearValue = depthClear;
-
-  VkRenderingInfo rendering{};
-  rendering.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
-  rendering.renderArea.extent = frame.extent;
-  rendering.layerCount = 1;
-  rendering.colorAttachmentCount = 1;
-  rendering.pColorAttachments = &colorAttach;
-  rendering.pDepthAttachment = &depthAttach;
-  vkCmdBeginRendering(frame.cmd, &rendering);
-
-  VkViewport vp{0, 0, (float)frame.extent.width, (float)frame.extent.height, 0, 1};
-  VkRect2D scissor{{0, 0}, frame.extent};
-  vkCmdSetViewport(frame.cmd, 0, 1, &vp);
-  vkCmdSetScissor(frame.cmd, 0, 1, &scissor);
-
-  vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
-  vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 0, 1,
+  vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, computePipeline_);
+  vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_, 0, 1,
                           &frameSet, 0, nullptr);
 
-  Mesh& cube = scene.cubeMesh();
-  VkDeviceSize offset = 0;
-  vkCmdBindVertexBuffers(frame.cmd, 0, 1, &cube.vertexBuffer.buffer, &offset);
-  vkCmdBindIndexBuffer(frame.cmd, cube.indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT32);
+  const uint32_t groupsX = (frame.extent.width + 7u) / 8u;
+  const uint32_t groupsY = (frame.extent.height + 7u) / 8u;
+  vkCmdDispatch(frame.cmd, groupsX, groupsY, 1);
 
-  const float scale = scene.voxelSize() * 0.98f;
-  for (const VoxelInstance& voxel : scene.voxels()) {
-    VoxelPushConstants pc{};
-    const glm::mat4 model = glm::translate(glm::mat4(1.0f), voxel.position) *
-                            glm::scale(glm::mat4(1.0f), glm::vec3(scale));
-    writeMat4(pc.model, model);
-    pc.color[0] = voxel.color.r;
-    pc.color[1] = voxel.color.g;
-    pc.color[2] = voxel.color.b;
-    pc.color[3] = 1.0f;
-    vkCmdPushConstants(frame.cmd, pipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(pc), &pc);
-    vkCmdDrawIndexed(frame.cmd, cube.indexCount, 1, 0, 0, 0);
-  }
+  // Blit compute output into the swapchain.
+  gfx_.transitionImage(frame.cmd, outImage_.image, VK_IMAGE_LAYOUT_GENERAL,
+                       VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                       VK_ACCESS_2_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                       VK_ACCESS_2_TRANSFER_READ_BIT);
 
-  vkCmdEndRendering(frame.cmd);
+  gfx_.transitionImage(frame.cmd, frame.swapchainImage, VK_IMAGE_LAYOUT_UNDEFINED,
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                       VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
 
-  // ImGui is 1x-only: load resolved swapchain and overlay UI.
+  VkImageBlit blit{};
+  blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  blit.srcSubresource.layerCount = 1;
+  blit.srcOffsets[0] = {0, 0, 0};
+  blit.srcOffsets[1] = {static_cast<int32_t>(outImage_.extent.width),
+                        static_cast<int32_t>(outImage_.extent.height), 1};
+  blit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  blit.dstSubresource.layerCount = 1;
+  blit.dstOffsets[0] = {0, 0, 0};
+  blit.dstOffsets[1] = {static_cast<int32_t>(frame.extent.width),
+                        static_cast<int32_t>(frame.extent.height), 1};
+
+  vkCmdBlitImage(frame.cmd, outImage_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                 frame.swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+                 VK_FILTER_NEAREST);
+
+  gfx_.transitionImage(frame.cmd, frame.swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                       VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                       VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                       VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT);
+
+  VkViewport vp{0, 0, static_cast<float>(frame.extent.width),
+                static_cast<float>(frame.extent.height), 0, 1};
+  VkRect2D scissor{{0, 0}, frame.extent};
+
   VkRenderingAttachmentInfo uiAttach{};
   uiAttach.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
   uiAttach.imageView = frame.swapchainView;
@@ -403,21 +418,50 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
   ImGui_ImplGlfw_NewFrame();
   ImGui::NewFrame();
 
-  ImGui::Begin("Voxel Demo");
+  ImGui::Begin("Voxel DDA");
   ImGui::TextWrapped("GPU: %s", gfx_.deviceName().c_str());
   ImGui::Text("Display FPS: %.1f", displayFps);
-  ImGui::Text("MSAA: %ux", static_cast<uint32_t>(msaaSamples_));
+  ImGui::Text("Occupied voxels: %u / %u", scene.occupiedCount(), scene.voxelCount());
   ImGui::Separator();
-  ImGui::Text("Placeholder voxel shell (cube-per-voxel).");
-  ImGui::Text("Solid voxels: %zu", scene.voxels().size());
+  ImGui::TextWrapped("LMB: remove  |  F: place on hit face  |  RMB drag: look");
+  ImGui::SliderInt("Brush Material", &scene.brushMaterial(), 1, 2);
+  ImGui::SliderFloat("Brush Radius", &scene.brushRadius(), 0.0f, 8.0f, "%.1f voxels");
+  ImGui::TextDisabled("0 = single voxel; place/remove use a sphere brush");
+  if (const std::optional<VoxelHit> hit = scene.lastHit()) {
+    ImGui::Text("Hit: (%d, %d, %d)  n=(%d,%d,%d)  mat=%u", hit->cell.x, hit->cell.y, hit->cell.z,
+                hit->normal.x, hit->normal.y, hit->normal.z, hit->material);
+  } else {
+    ImGui::TextUnformatted("Hit: none");
+  }
+  ImGui::Separator();
+
+  const char* modes[] = {"Shaded", "Albedo", "Normal", "Steps", "Coord"};
+  ImGui::Combo("Render Mode", &scene.renderMode(), modes, IM_ARRAYSIZE(modes));
+
   bool rebuild = false;
-  rebuild |= ImGui::SliderInt("Grid Size", &scene.gridSize(), 8, 48);
-  rebuild |= ImGui::DragFloat("Voxel Size", &scene.voxelSize(), 0.01f, 0.1f, 1.0f);
+  rebuild |= ImGui::SliderInt("Grid Size", &scene.gridSize(), 8, 128);
+  rebuild |= ImGui::DragFloat("Voxel Size", &scene.voxelSize(), 0.01f, 0.05f, 2.0f);
   ImGui::DragFloat3("Light Dir", &scene.lightDir().x, 0.01f);
+  ImGui::SliderFloat("Ambient", &scene.ambient(), 0.0f, 1.0f);
+  ImGui::ColorEdit3("Sky Color", &scene.skyColor().x);
+  int maxSteps = static_cast<int>(scene.maxSteps());
+  if (ImGui::SliderInt("Max Steps", &maxSteps, 16, 512)) {
+    scene.maxSteps() = static_cast<uint32_t>(maxSteps);
+  }
   if (rebuild) {
-    scene.rebuildVoxels();
+    scene.rebuildVoxels(gfx_);
+    boundVoxelBuffer_ = VK_NULL_HANDLE;
   }
   ImGui::End();
+
+  // Simple screen-center crosshair for aim.
+  const ImGuiViewport* vp = ImGui::GetMainViewport();
+  const ImVec2 center(vp->GetCenter().x, vp->GetCenter().y);
+  ImDrawList* dl = ImGui::GetForegroundDrawList();
+  const float arm = 8.0f;
+  const ImU32 col = IM_COL32(255, 255, 255, 220);
+  dl->AddLine(ImVec2(center.x - arm, center.y), ImVec2(center.x + arm, center.y), col, 1.5f);
+  dl->AddLine(ImVec2(center.x, center.y - arm), ImVec2(center.x, center.y + arm), col, 1.5f);
 
   ImGui::Render();
   ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmd);

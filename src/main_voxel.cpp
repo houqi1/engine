@@ -67,9 +67,10 @@ int main() {
     scene.init(gfx);
 
     VoxelRenderer renderer(gfx);
-    renderer.init();
+    renderer.init(scene);
 
-    std::cout << "Voxel demo running. WASD move, Q/E up/down, right-drag look, Esc quit."
+    std::cout << "Voxel DDA demo running. WASD move, Q/E up/down, right-drag look.\n"
+              << "LMB remove voxel, F place voxel (against hit face), Esc quit."
               << std::endl;
 
     auto last = std::chrono::steady_clock::now();
@@ -94,6 +95,7 @@ int main() {
       scene.camera().handleInput(window.handle(), dt);
       scene.camera().update(aspect);
       scene.update(dt);
+      scene.handleEditInput(window.handle(), gfx);
       renderer.draw(scene, fps);
     }
 
