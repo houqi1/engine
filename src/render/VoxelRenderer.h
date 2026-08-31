@@ -33,13 +33,21 @@ private:
     uint32_t renderMode;
     float projY;
     uint32_t nestedMicro;
-    float pad2;
+    uint32_t skipTrace;  // 1 = fill sky only (baseline bandwidth/dispatch cost)
     float pad3;
   };
 
   struct FrameResources {
     AllocatedBuffer frameUBO{};
     VkDescriptorSet frameSet = VK_NULL_HANDLE;
+  };
+
+  enum TimestampSlot : uint32_t {
+    kTsFrameBegin = 0,
+    kTsAfterCompute = 1,
+    kTsAfterBlit = 2,
+    kTsFrameEnd = 3,
+    kTsPerFrame = 4,
   };
 
   void createDescriptors();
@@ -73,9 +81,13 @@ private:
   VkBuffer boundMicroBuffer_ = VK_NULL_HANDLE;
   bool imguiReady_ = false;
   float displayFps_ = 0.0f;
+  bool skipTrace_ = false;
 
   VkQueryPool timestampPool_ = VK_NULL_HANDLE;
   float timestampPeriodNs_ = 1.0f;
   std::array<bool, GfxDevice::kFramesInFlight> timestampPending_{};
   float gpuFrameMs_ = 0.0f;
+  float gpuComputeMs_ = 0.0f;
+  float gpuBlitMs_ = 0.0f;
+  float gpuUiMs_ = 0.0f;
 };

@@ -84,7 +84,7 @@ void VoxelRenderer::createTimestampPool() {
   VkQueryPoolCreateInfo info{};
   info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
   info.queryType = VK_QUERY_TYPE_TIMESTAMP;
-  info.queryCount = GfxDevice::kFramesInFlight * 2;
+  info.queryCount = GfxDevice::kFramesInFlight * kTsPerFrame;
   if (vkCreateQueryPool(gfx_.device(), &info, nullptr, &timestampPool_) != VK_SUCCESS) {
     throw std::runtime_error("Failed to create voxel timestamp query pool");
   }
@@ -111,19 +111,30 @@ void VoxelRenderer::collectGpuTiming(uint32_t frameIndex) {
     return;
   }
 
-  const uint32_t firstQuery = frameIndex * 2;
-  uint64_t stamps[2] = {0, 0};
-  const VkResult result =
-      vkGetQueryPoolResults(gfx_.device(), timestampPool_, firstQuery, 2, sizeof(stamps), stamps,
-                            sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
+  const uint32_t firstQuery = frameIndex * kTsPerFrame;
+  uint64_t stamps[kTsPerFrame] = {};
+  const VkResult result = vkGetQueryPoolResults(
+      gfx_.device(), timestampPool_, firstQuery, kTsPerFrame, sizeof(stamps), stamps,
+      sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
   if (result != VK_SUCCESS) {
     return;
   }
 
-  const double deltaTicks = static_cast<double>(stamps[1] - stamps[0]);
-  const float gpuMs = static_cast<float>(deltaTicks * static_cast<double>(timestampPeriodNs_) * 1e-6);
-  constexpr float alpha = 0.1f;
-  gpuFrameMs_ = gpuFrameMs_ * (1.0f - alpha) + gpuMs * alpha;
+  auto toMs = [&](uint64_t a, uint64_t b) {
+    const double deltaTicks = static_cast<double>(b - a);
+    return static_cast<float>(deltaTicks * static_cast<double>(timestampPeriodNs_) * 1e-6);
+  };
+
+  const float totalMs = toMs(stamps[kTsFrameBegin], stamps[kTsFrameEnd]);
+  const float computeMs = toMs(stamps[kTsFrameBegin], stamps[kTsAfterCompute]);
+  const float blitMs = toMs(stamps[kTsAfterCompute], stamps[kTsAfterBlit]);
+  const float uiMs = toMs(stamps[kTsAfterBlit], stamps[kTsFrameEnd]);
+
+  constexpr float alpha = 0.15f;
+  gpuFrameMs_ = gpuFrameMs_ * (1.0f - alpha) + totalMs * alpha;
+  gpuComputeMs_ = gpuComputeMs_ * (1.0f - alpha) + computeMs * alpha;
+  gpuBlitMs_ = gpuBlitMs_ * (1.0f - alpha) + blitMs * alpha;
+  gpuUiMs_ = gpuUiMs_ * (1.0f - alpha) + uiMs * alpha;
   timestampPending_[frameIndex] = false;
 }
 
@@ -308,6 +319,7 @@ void VoxelRenderer::updateFrameUBO(VoxelScene& scene, uint32_t frameIndex) {
   ubo.renderMode = static_cast<uint32_t>(std::max(0, scene.renderMode()));
   ubo.projY = proj[1][1];
   ubo.nestedMicro = scene.nestedMicroVoxels() ? 1u : 0u;
+  ubo.skipTrace = skipTrace_ ? 1u : 0u;
 
   void* mapped = frames_[frameIndex].frameUBO.info.pMappedData;
   if (!mapped) {
@@ -346,10 +358,10 @@ void VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
   updateFrameUBO(scene, frame.frameIndex);
   VkDescriptorSet frameSet = frames_[frame.frameIndex].frameSet;
 
-  const uint32_t tsBegin = frame.frameIndex * 2;
+  const uint32_t tsBase = frame.frameIndex * kTsPerFrame;
   if (timestampPool_) {
-    vkCmdResetQueryPool(frame.cmd, timestampPool_, tsBegin, 2);
-    writeTimestamp(frame.cmd, tsBegin, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT);
+    vkCmdResetQueryPool(frame.cmd, timestampPool_, tsBase, kTsPerFrame);
+    writeTimestamp(frame.cmd, tsBase + kTsFrameBegin, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT);
   }
 
   // Compute writes the raycast result.
@@ -364,6 +376,10 @@ void VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
   const uint32_t groupsX = (frame.extent.width + 7u) / 8u;
   const uint32_t groupsY = (frame.extent.height + 7u) / 8u;
   vkCmdDispatch(frame.cmd, groupsX, groupsY, 1);
+
+  if (timestampPool_) {
+    writeTimestamp(frame.cmd, tsBase + kTsAfterCompute, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+  }
 
   // Blit compute output into the swapchain.
   gfx_.transitionImage(frame.cmd, outImage_.image, VK_IMAGE_LAYOUT_GENERAL,
@@ -390,6 +406,10 @@ void VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
   vkCmdBlitImage(frame.cmd, outImage_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                  frame.swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
                  VK_FILTER_NEAREST);
+
+  if (timestampPool_) {
+    writeTimestamp(frame.cmd, tsBase + kTsAfterBlit, VK_PIPELINE_STAGE_2_TRANSFER_BIT);
+  }
 
   gfx_.transitionImage(frame.cmd, frame.swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
@@ -426,7 +446,7 @@ void VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
                        0);
 
   if (timestampPool_) {
-    writeTimestamp(frame.cmd, tsBegin + 1, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT);
+    writeTimestamp(frame.cmd, tsBase + kTsFrameEnd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT);
     timestampPending_[frame.frameIndex] = true;
   }
 
@@ -509,17 +529,17 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
   ImGui::Text("Present: %s", gfx_.presentModeName());
   ImGui::Text("Display FPS: %.1f  (%.2f ms)", displayFps,
               displayFps > 1e-3f ? 1000.0f / displayFps : 0.0f);
-  ImGui::Text("GPU work:    %.2f ms", gpuFrameMs_);
-  if (gpuFrameMs_ > 1e-3f) {
-    ImGui::Text("GPU work FPS: %.0f", 1000.0f / gpuFrameMs_);
-  } else {
-    ImGui::Text("GPU work FPS: n/a");
-  }
+  ImGui::Text("GPU total:   %.2f ms  (%.0f FPS)", gpuFrameMs_,
+              gpuFrameMs_ > 1e-3f ? 1000.0f / gpuFrameMs_ : 0.0f);
+  ImGui::Text("  compute:   %.2f ms", gpuComputeMs_);
+  ImGui::Text("  blit:      %.2f ms", gpuBlitMs_);
+  ImGui::Text("  ui/other:  %.2f ms", gpuUiMs_);
+  ImGui::Checkbox("Skip Trace (baseline)", &skipTrace_);
+  ImGui::TextDisabled("Baseline keeps dispatch+imageStore but skips DDA.");
   if (gfx_.vsyncEnabled()) {
     ImGui::TextDisabled("VSync present mode; Display FPS is refresh-capped.");
   } else {
-    ImGui::TextDisabled("If Display FPS stays ~60 on macOS, compositor may still sync;");
-    ImGui::TextDisabled("trust GPU work FPS for uncapped cost.");
+    ImGui::TextDisabled("Compare nested on/off and Skip Trace to locate the bottleneck.");
   }
   ImGui::Text("Occupied coarse: %u / %u", scene.occupiedCount(), scene.voxelCount());
   ImGui::Text("Occupied micro: %u", scene.occupiedMicroCount());
