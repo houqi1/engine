@@ -62,10 +62,6 @@ layout(set = 0, binding = 5, std430) readonly buffer ObjectBuffer {
     GpuVoxelObject objects[];
 };
 
-layout(set = 0, binding = 6, std430) readonly buffer FinePool {
-    uint fines[];
-} fineSlabs[8];
-
 const uint MODE_SHADED = 0u;
 const uint MODE_ALBEDO = 1u;
 const uint MODE_NORMAL = 2u;
@@ -73,12 +69,10 @@ const uint MODE_STEPS = 3u;
 const uint MODE_COORD = 4u;
 const uint MODE_AO = 5u;
 const uint MICRO_WORDS = 16u;
-const uint BRICK_PAGE_WORDS = 17u;
+const uint FINE_WORDS = 128u;
+const uint BRICK_PAGE_WORDS = MICRO_WORDS + FINE_WORDS;
 const uint PAGES_PER_SLAB = 1024u;
-const uint FINE_WORDS_PER_TABLE = 128u;
-const uint FINE_TABLES_PER_SLAB = 1024u;
 const uint INVALID_BRICK_PAGE = 0xFFFFFFFFu;
-const uint INVALID_FINE_TABLE = 0xFFFFFFFFu;
 const uint FLAG_NESTED = 1u;
 const uint FLAG_ENABLED = 2u;
 const float FLT_MAX = 3.4028235e+38;
@@ -142,20 +136,6 @@ uint loadBrickWord(uint page, uint wordIndex) {
     return brickSlabs[7].bricks[idx];
 }
 
-uint loadFineWord(uint table, uint wordIndex) {
-    uint slab = table / FINE_TABLES_PER_SLAB;
-    uint local = table % FINE_TABLES_PER_SLAB;
-    uint idx = local * FINE_WORDS_PER_TABLE + wordIndex;
-    if (slab == 0u) return fineSlabs[0].fines[idx];
-    if (slab == 1u) return fineSlabs[1].fines[idx];
-    if (slab == 2u) return fineSlabs[2].fines[idx];
-    if (slab == 3u) return fineSlabs[3].fines[idx];
-    if (slab == 4u) return fineSlabs[4].fines[idx];
-    if (slab == 5u) return fineSlabs[5].fines[idx];
-    if (slab == 6u) return fineSlabs[6].fines[idx];
-    return fineSlabs[7].fines[idx];
-}
-
 bool getMicroVoxel(uint page, ivec3 c) {
     if (any(lessThan(c, ivec3(0))) || any(greaterThanEqual(c, ivec3(8)))) {
         return false;
@@ -179,12 +159,8 @@ bool getFineVoxel(uint page, ivec3 micro, ivec3 fine) {
     if (page == INVALID_BRICK_PAGE) {
         return true;
     }
-    uint tid = loadBrickWord(page, 16u);
-    if (tid == INVALID_FINE_TABLE) {
-        return true;
-    }
     uint microBit = uint(micro.y * 64 + micro.z * 8 + micro.x);
-    uint packed = loadFineWord(tid, microBit >> 2);
+    uint packed = loadBrickWord(page, MICRO_WORDS + (microBit >> 2));
     uint byte = (packed >> ((microBit & 3u) * 8u)) & 255u;
     uint fbit = uint(fine.y * 4 + fine.z * 2 + fine.x);
     return ((byte >> fbit) & 1u) != 0u;
@@ -515,6 +491,11 @@ ObjectHit traverseObject(GpuVoxelObject o, vec3 Ow, vec3 Dw) {
     vec3 normalLocal = -vec3(mask) * sgn;
     vec3 normalWorld = normalize(mat3(o.objectToWorld) * normalLocal);
     vec3 albedo = albedoForVoxel(matId);
+    if (usedFine) {
+        // Make the 2x2x2 grid visible even when a micro is otherwise full.
+        float chk = float((finePos.x + finePos.y + finePos.z) & 1);
+        albedo *= mix(0.68, 1.0, chk);
+    }
 
     ivec3 solidPos = usedFine ? (mapPos * 16 + microPos * 2 + finePos)
                               : (usedMicro ? (mapPos * 8 + microPos) : mapPos);

@@ -86,12 +86,8 @@ void VoxelScene::init(GfxDevice& gfx) {
 void VoxelScene::cleanup(GfxDevice& gfx) {
   gfx.destroyBuffer(voxelBuffer_);
   gfx.destroyBuffer(dummyBrickSlabBuffer_);
-  gfx.destroyBuffer(dummyFineSlabBuffer_);
   gfx.destroyBuffer(objectBuffer_);
   for (BrickSlab& s : slabs_) {
-    gfx.destroyBuffer(s.gpu);
-  }
-  for (FineSlab& s : fineSlabs_) {
     gfx.destroyBuffer(s.gpu);
   }
   TextureFactory::destroy(gfx, sky_);
@@ -99,15 +95,10 @@ void VoxelScene::cleanup(GfxDevice& gfx) {
   objectsGpu_.clear();
   voxelsCpu_.clear();
   slabs_.clear();
-  fineSlabs_.clear();
   freePages_.clear();
-  freeFineTables_.clear();
   dirtyPages_.clear();
-  dirtyFineTables_.clear();
   nextPage_ = 0;
-  nextFineTable_ = 0;
   allocatedPageCount_ = 0;
-  allocatedFineCount_ = 0;
   occupiedCount_ = 0;
   occupiedMicroCount_ = 0;
   occupiedFineCount_ = 0;
@@ -188,17 +179,6 @@ void VoxelScene::ensureSlabCpu(uint32_t slabIndex) {
   }
 }
 
-void VoxelScene::ensureFineSlabCpu(uint32_t slabIndex) {
-  while (fineSlabs_.size() <= slabIndex) {
-    if (fineSlabs_.size() >= kMaxFineSlabs) {
-      throw std::runtime_error("Fine slab limit reached");
-    }
-    FineSlab s;
-    s.words.assign(kFineWordsPerSlab, 0u);
-    fineSlabs_.push_back(std::move(s));
-  }
-}
-
 uint32_t* VoxelScene::brickPageWords(uint32_t page) {
   const uint32_t si = page / kPagesPerSlab;
   const uint32_t li = page % kPagesPerSlab;
@@ -212,27 +192,25 @@ const uint32_t* VoxelScene::brickPageWords(uint32_t page) const {
   return slabs_[si].words.data() + static_cast<size_t>(li) * static_cast<size_t>(kBrickPageWords);
 }
 
-uint32_t* VoxelScene::fineTableWords(uint32_t table) {
-  const uint32_t si = table / kFineTablesPerSlab;
-  const uint32_t li = table % kFineTablesPerSlab;
-  ensureFineSlabCpu(si);
-  return fineSlabs_[si].words.data() +
-         static_cast<size_t>(li) * static_cast<size_t>(kFineWordsPerTable);
+uint8_t VoxelScene::readFineByte(uint32_t page, uint32_t microBit) const {
+  const uint32_t packed = brickPageWords(page)[kMicroWords + microBit / 4u];
+  return static_cast<uint8_t>((packed >> ((microBit % 4u) * 8u)) & 255u);
 }
 
-const uint32_t* VoxelScene::fineTableWords(uint32_t table) const {
-  const uint32_t si = table / kFineTablesPerSlab;
-  const uint32_t li = table % kFineTablesPerSlab;
-  return fineSlabs_[si].words.data() +
-         static_cast<size_t>(li) * static_cast<size_t>(kFineWordsPerTable);
+void VoxelScene::writeFineByte(uint32_t page, uint32_t microBit, uint8_t value) {
+  uint32_t* w = brickPageWords(page);
+  const uint32_t idx = static_cast<uint32_t>(kMicroWords) + microBit / 4u;
+  const uint32_t shift = (microBit % 4u) * 8u;
+  w[idx] = (w[idx] & ~(0xFFu << shift)) | (static_cast<uint32_t>(value) << shift);
 }
 
-uint8_t* VoxelScene::fineTableBytes(uint32_t table) {
-  return reinterpret_cast<uint8_t*>(fineTableWords(table));
-}
-
-const uint8_t* VoxelScene::fineTableBytes(uint32_t table) const {
-  return reinterpret_cast<const uint8_t*>(fineTableWords(table));
+void VoxelScene::fillFineFromOccupancy(uint32_t page) {
+  const uint32_t* occ = brickPageWords(page);
+  for (int i = 0; i < kMicroCount; ++i) {
+    const uint32_t word = static_cast<uint32_t>(i) / 32u;
+    const uint32_t mask = 1u << (static_cast<uint32_t>(i) % 32u);
+    writeFineByte(page, static_cast<uint32_t>(i), (occ[word] & mask) ? 0xFFu : 0x00u);
+  }
 }
 
 bool VoxelScene::brickPageEmpty(uint32_t page) const {
@@ -283,19 +261,9 @@ void VoxelScene::recountOccupiedFine() {
     if (freeP[p]) {
       continue;
     }
-    const uint32_t* w = brickPageWords(p);
-    const uint32_t tid = w[kMicroWords];
-    if (tid == kInvalidFineTable) {
-      uint32_t bits = 0;
-      for (int i = 0; i < kMicroWords; ++i) {
-        bits += static_cast<uint32_t>(std::popcount(w[i]));
-      }
-      occupiedFineCount_ += bits * static_cast<uint32_t>(kFineCount);
-      continue;
-    }
-    const uint8_t* bytes = fineTableBytes(tid);
     for (int i = 0; i < kFineTableBytes; ++i) {
-      occupiedFineCount_ += static_cast<uint32_t>(std::popcount(static_cast<unsigned>(bytes[i])));
+      occupiedFineCount_ +=
+          static_cast<uint32_t>(std::popcount(static_cast<unsigned>(readFineByte(p, static_cast<uint32_t>(i)))));
     }
   }
 }
@@ -317,7 +285,7 @@ uint32_t VoxelScene::allocBrickPage(const uint32_t* words16) {
   for (int i = 0; i < kMicroWords; ++i) {
     dst[i] = words16[i];
   }
-  dst[kMicroWords] = kInvalidFineTable;
+  fillFineFromOccupancy(page);
   dirtyPages_.insert(page);
   ++allocatedPageCount_;
   return page;
@@ -332,73 +300,14 @@ void VoxelScene::freeBrickPage(uint32_t page) {
     return;
   }
   uint32_t* w = brickPageWords(page);
-  if (w[kMicroWords] != kInvalidFineTable) {
-    freeFineTable(w[kMicroWords]);
-  }
   for (int i = 0; i < kBrickPageWords; ++i) {
     w[i] = 0u;
   }
-  w[kMicroWords] = kInvalidFineTable;
   freePages_.push_back(page);
   dirtyPages_.insert(page);
   if (allocatedPageCount_ > 0) {
     --allocatedPageCount_;
   }
-}
-
-uint32_t VoxelScene::allocFineTable(uint32_t page) {
-  uint32_t table = kInvalidFineTable;
-  if (!freeFineTables_.empty()) {
-    table = freeFineTables_.back();
-    freeFineTables_.pop_back();
-  } else {
-    table = nextFineTable_++;
-    if (table / kFineTablesPerSlab >= kMaxFineSlabs) {
-      --nextFineTable_;
-      throw std::runtime_error("Fine slab limit reached");
-    }
-    ensureFineSlabCpu(table / kFineTablesPerSlab);
-  }
-  uint8_t* bytes = fineTableBytes(table);
-  const uint32_t* occ = brickPageWords(page);
-  for (int i = 0; i < kMicroCount; ++i) {
-    const uint32_t word = static_cast<uint32_t>(i) / 32u;
-    const uint32_t mask = 1u << (static_cast<uint32_t>(i) % 32u);
-    bytes[i] = (occ[word] & mask) ? 0xFFu : 0x00u;
-  }
-  dirtyFineTables_.insert(table);
-  ++allocatedFineCount_;
-  return table;
-}
-
-void VoxelScene::freeFineTable(uint32_t table) {
-  if (table == kInvalidFineTable) {
-    return;
-  }
-  const uint32_t si = table / kFineTablesPerSlab;
-  if (si >= fineSlabs_.size()) {
-    return;
-  }
-  uint32_t* w = fineTableWords(table);
-  for (int i = 0; i < kFineWordsPerTable; ++i) {
-    w[i] = 0u;
-  }
-  freeFineTables_.push_back(table);
-  dirtyFineTables_.insert(table);
-  if (allocatedFineCount_ > 0) {
-    --allocatedFineCount_;
-  }
-}
-
-uint32_t VoxelScene::ensureFineTable(uint32_t page) {
-  uint32_t* w = brickPageWords(page);
-  if (w[kMicroWords] != kInvalidFineTable) {
-    return w[kMicroWords];
-  }
-  const uint32_t tid = allocFineTable(page);
-  w[kMicroWords] = tid;
-  dirtyPages_.insert(page);
-  return tid;
 }
 
 uint32_t VoxelScene::ensureBrickPage(VoxelObject& o, uint32_t coarseIndex, bool fillSolid) {
@@ -442,12 +351,7 @@ bool VoxelScene::getFine(const VoxelObject& o, const glm::ivec3& coarse, const g
   if (c.brickPage == kInvalidBrickPage) {
     return true;
   }
-  const uint32_t* w = brickPageWords(c.brickPage);
-  const uint32_t tid = w[kMicroWords];
-  if (tid == kInvalidFineTable) {
-    return true;
-  }
-  const uint8_t byte = fineTableBytes(tid)[microBitIndex(micro)];
+  const uint8_t byte = readFineByte(c.brickPage, microBitIndex(micro));
   return (byte & (1u << fineBitIndex(fine))) != 0u;
 }
 
@@ -513,9 +417,11 @@ bool VoxelScene::setMicroCpu(VoxelObject& o, const glm::ivec3& coarse, const glm
   }
   if (solid) {
     dst |= mask;
+    writeFineByte(page, bit, 0xFFu);
     ++occupiedMicroCount_;
   } else {
     dst &= ~mask;
+    writeFineByte(page, bit, 0u);
     occupiedMicroCount_ = occupiedMicroCount_ > 0 ? occupiedMicroCount_ - 1 : 0;
   }
   dirtyPages_.insert(page);
@@ -552,36 +458,47 @@ bool VoxelScene::setFineCpu(VoxelObject& o, const glm::ivec3& coarse, const glm:
   }
 
   const uint32_t page = c.brickPage;
-  const bool microWas = getMicro(o, coarse, micro);
+  const uint32_t bit = microBitIndex(micro);
+  const uint32_t word = bit / 32u;
+  const uint32_t omask = 1u << (bit % 32u);
+  uint32_t& occ = brickPageWords(page)[word];
+  const bool microWas = (occ & omask) != 0u;
   if (!microWas && !solid) {
     return false;
   }
-
-  const uint32_t* hdr = brickPageWords(page);
-  if (microWas && solid && hdr[kMicroWords] == kInvalidFineTable) {
+  uint8_t byte = readFineByte(page, bit);
+  if (microWas && solid && byte == 0xFFu) {
     return false;
   }
 
-  // Snapshot occupancy into a table before flipping this micro's bit.
-  const uint32_t tid = ensureFineTable(page);
-  uint8_t& byte = fineTableBytes(tid)[microBitIndex(micro)];
   const uint8_t fmask = static_cast<uint8_t>(1u << fineBitIndex(fine));
   const bool was = (byte & fmask) != 0u;
   if (was == solid) {
     return false;
   }
   if (solid) {
-    byte |= fmask;
+    byte = static_cast<uint8_t>(byte | fmask);
+    writeFineByte(page, bit, byte);
     if (!microWas) {
-      setMicroCpu(o, coarse, micro, true);
+      occ |= omask;
+      ++occupiedMicroCount_;
     }
   } else {
     byte = static_cast<uint8_t>(byte & ~fmask);
-    if (byte == 0u) {
-      setMicroCpu(o, coarse, micro, false);
+    writeFineByte(page, bit, byte);
+    if (byte == 0u && microWas) {
+      occ &= ~omask;
+      occupiedMicroCount_ = occupiedMicroCount_ > 0 ? occupiedMicroCount_ - 1 : 0;
     }
   }
-  dirtyFineTables_.insert(tid);
+  dirtyPages_.insert(page);
+
+  if (brickPageEmpty(page)) {
+    freeBrickPage(page);
+    c.brickPage = kInvalidBrickPage;
+    c.material = 0;
+    occupiedCount_ = occupiedCount_ > 0 ? occupiedCount_ - 1 : 0;
+  }
   return true;
 }
 
@@ -642,7 +559,6 @@ void VoxelScene::fillGpuObjectRecords() {
 void VoxelScene::ensureGpuBuffers(GfxDevice& gfx) {
   const VkDeviceSize voxelBytes = sizeof(CoarseCell) * std::max<size_t>(voxelsCpu_.size(), 1);
   const VkDeviceSize slabBytes = sizeof(uint32_t) * kWordsPerSlab;
-  const VkDeviceSize fineSlabBytes = sizeof(uint32_t) * kFineWordsPerSlab;
   const VkDeviceSize objectBytes = sizeof(GpuVoxelObject) * std::max<size_t>(objectsGpu_.size(), 1);
 
   if (voxelBuffer_.buffer == VK_NULL_HANDLE || voxelBuffer_.size < voxelBytes) {
@@ -651,19 +567,13 @@ void VoxelScene::ensureGpuBuffers(GfxDevice& gfx) {
                                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                                     VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
   }
-  if (dummyBrickSlabBuffer_.buffer == VK_NULL_HANDLE) {
+  if (dummyBrickSlabBuffer_.buffer == VK_NULL_HANDLE || dummyBrickSlabBuffer_.size < slabBytes) {
+    gfx.destroyBuffer(dummyBrickSlabBuffer_);
     dummyBrickSlabBuffer_ = gfx.createBuffer(slabBytes,
                                              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                                              VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
     std::vector<uint32_t> zeros(kWordsPerSlab, 0u);
     gfx.uploadToBuffer(dummyBrickSlabBuffer_, zeros.data(), slabBytes);
-  }
-  if (dummyFineSlabBuffer_.buffer == VK_NULL_HANDLE) {
-    dummyFineSlabBuffer_ = gfx.createBuffer(fineSlabBytes,
-                                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                                            VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
-    std::vector<uint32_t> zeros(kFineWordsPerSlab, 0u);
-    gfx.uploadToBuffer(dummyFineSlabBuffer_, zeros.data(), fineSlabBytes);
   }
   for (BrickSlab& s : slabs_) {
     if (s.gpu.buffer == VK_NULL_HANDLE) {
@@ -671,14 +581,6 @@ void VoxelScene::ensureGpuBuffers(GfxDevice& gfx) {
                                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                                VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
       gfx.uploadToBuffer(s.gpu, s.words.data(), slabBytes);
-    }
-  }
-  for (FineSlab& s : fineSlabs_) {
-    if (s.gpu.buffer == VK_NULL_HANDLE) {
-      s.gpu = gfx.createBuffer(fineSlabBytes,
-                               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                               VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
-      gfx.uploadToBuffer(s.gpu, s.words.data(), fineSlabBytes);
     }
   }
   if (objectBuffer_.buffer == VK_NULL_HANDLE || objectBuffer_.size < objectBytes) {
@@ -704,22 +606,6 @@ void VoxelScene::flushDirtyPages(GfxDevice& gfx) {
   dirtyPages_.clear();
 }
 
-void VoxelScene::flushDirtyFineTables(GfxDevice& gfx) {
-  for (uint32_t table : dirtyFineTables_) {
-    const uint32_t si = table / kFineTablesPerSlab;
-    const uint32_t li = table % kFineTablesPerSlab;
-    if (si >= fineSlabs_.size() || fineSlabs_[si].gpu.buffer == VK_NULL_HANDLE) {
-      continue;
-    }
-    const uint32_t* src = fineTableWords(table);
-    gfx.uploadToBuffer(fineSlabs_[si].gpu, src,
-                       sizeof(uint32_t) * static_cast<size_t>(kFineWordsPerTable),
-                       sizeof(uint32_t) * static_cast<VkDeviceSize>(li) *
-                           static_cast<VkDeviceSize>(kFineWordsPerTable));
-  }
-  dirtyFineTables_.clear();
-}
-
 void VoxelScene::flushObject(GfxDevice& gfx, int objectIndex) {
   if (objectIndex < 0 || objectIndex >= static_cast<int>(objects_.size())) {
     return;
@@ -734,7 +620,6 @@ void VoxelScene::flushObject(GfxDevice& gfx, int objectIndex) {
   }
   ensureGpuBuffers(gfx);
   flushDirtyPages(gfx);
-  flushDirtyFineTables(gfx);
 }
 
 void VoxelScene::uploadObjectTransforms(GfxDevice& gfx) {
@@ -804,7 +689,14 @@ void VoxelScene::buildSpinnerObject(VoxelObject& o) {
             static_cast<uint32_t>(z) * static_cast<uint32_t>(kSpinnerN) *
                 static_cast<uint32_t>(kSpinnerN);
         o.cells[idx].material = kSpinnerMat;
-        o.cells[idx].brickPage = allocBrickPage(kMicroTemplateWords);
+        const uint32_t page = allocBrickPage(kMicroTemplateWords);
+        o.cells[idx].brickPage = page;
+        // 3D checker in each occupied micro so 2x2x2 is visible without editing.
+        for (int mi = 0; mi < kMicroCount; ++mi) {
+          if (readFineByte(page, static_cast<uint32_t>(mi)) == 0xFFu) {
+            writeFineByte(page, static_cast<uint32_t>(mi), 0x96u);
+          }
+        }
       }
     }
   }
@@ -819,19 +711,11 @@ void VoxelScene::rebuildVoxels(GfxDevice& gfx) {
   for (BrickSlab& s : slabs_) {
     gfx.destroyBuffer(s.gpu);
   }
-  for (FineSlab& s : fineSlabs_) {
-    gfx.destroyBuffer(s.gpu);
-  }
   slabs_.clear();
-  fineSlabs_.clear();
   freePages_.clear();
-  freeFineTables_.clear();
   dirtyPages_.clear();
-  dirtyFineTables_.clear();
   nextPage_ = 0;
-  nextFineTable_ = 0;
   allocatedPageCount_ = 0;
-  allocatedFineCount_ = 0;
 
   objects_.clear();
   objects_.resize(2);
@@ -1238,7 +1122,7 @@ void VoxelScene::handleEditInput(GLFWwindow* window, GfxDevice& gfx) {
   const uint32_t mat = static_cast<uint32_t>(std::clamp(brushMaterial_, 1, 255));
 
   int changed = 0;
-  if (nestedMicroVoxels_ && hit->hasFine) {
+  if (nestedMicroVoxels_ && (hit->hasFine || hit->hasMicro)) {
     glm::ivec3 fine = hit->fine;
     glm::ivec3 micro = hit->micro;
     glm::ivec3 coarse = hit->cell;
@@ -1266,27 +1150,6 @@ void VoxelScene::handleEditInput(GLFWwindow* window, GfxDevice& gfx) {
       }
       if (inBounds(o, placeCoarse) && microInBounds(placeMicro) && fineInBounds(placeFine)) {
         changed = applyFineSphereBrush(o, placeCoarse, placeMicro, placeFine, radius, true, mat);
-      }
-    }
-  } else if (nestedMicroVoxels_ && hit->hasMicro) {
-    glm::ivec3 micro = hit->micro;
-    glm::ivec3 coarse = hit->cell;
-    if (removeEdge) {
-      changed = applyMicroSphereBrush(o, coarse, micro, radius, false, mat);
-    } else if (placeEdge) {
-      glm::ivec3 placeMicro = micro + hit->normal;
-      glm::ivec3 placeCoarse = coarse;
-      for (int a = 0; a < 3; ++a) {
-        if (placeMicro[a] < 0) {
-          placeMicro[a] = kMicroRes - 1;
-          placeCoarse[a] -= 1;
-        } else if (placeMicro[a] >= kMicroRes) {
-          placeMicro[a] = 0;
-          placeCoarse[a] += 1;
-        }
-      }
-      if (inBounds(o, placeCoarse) && microInBounds(placeMicro)) {
-        changed = applyMicroSphereBrush(o, placeCoarse, placeMicro, radius, true, mat);
       }
     }
   } else {
