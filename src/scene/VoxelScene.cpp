@@ -675,7 +675,8 @@ void VoxelScene::buildSpinnerObject(VoxelObject& o) {
       static_cast<size_t>(kSpinnerN) * static_cast<size_t>(kSpinnerN) * static_cast<size_t>(kSpinnerN);
   o.cells.assign(count, CoarseCell{});
 
-  constexpr uint32_t kSpinnerMat = 2u;
+  // Same material as ground so albedo stays unified.
+  constexpr uint32_t kSpinnerMat = 1u;
   for (int z = 0; z < kSpinnerN; ++z) {
     for (int y = 0; y < kSpinnerN; ++y) {
       for (int x = 0; x < kSpinnerN; ++x) {
@@ -691,12 +692,6 @@ void VoxelScene::buildSpinnerObject(VoxelObject& o) {
         o.cells[idx].material = kSpinnerMat;
         const uint32_t page = allocBrickPage(kMicroTemplateWords);
         o.cells[idx].brickPage = page;
-        // 3D checker in each occupied micro so 2x2x2 is visible without editing.
-        for (int mi = 0; mi < kMicroCount; ++mi) {
-          if (readFineByte(page, static_cast<uint32_t>(mi)) == 0xFFu) {
-            writeFineByte(page, static_cast<uint32_t>(mi), 0x96u);
-          }
-        }
       }
     }
   }

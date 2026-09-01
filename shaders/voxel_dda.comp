@@ -209,9 +209,7 @@ bool neighborSolid(GpuVoxelObject o, ivec3 solidPos, ivec3 offset, uint space) {
 }
 
 vec3 albedoForVoxel(uint matId) {
-    if (matId == 2u) {
-        return vec3(0.75, 0.45, 0.28);
-    }
+    // Unified albedo for all voxel materials.
     return vec3(0.62, 0.64, 0.68);
 }
 
@@ -491,11 +489,6 @@ ObjectHit traverseObject(GpuVoxelObject o, vec3 Ow, vec3 Dw) {
     vec3 normalLocal = -vec3(mask) * sgn;
     vec3 normalWorld = normalize(mat3(o.objectToWorld) * normalLocal);
     vec3 albedo = albedoForVoxel(matId);
-    if (usedFine) {
-        // Make the 2x2x2 grid visible even when a micro is otherwise full.
-        float chk = float((finePos.x + finePos.y + finePos.z) & 1);
-        albedo *= mix(0.68, 1.0, chk);
-    }
 
     ivec3 solidPos = usedFine ? (mapPos * 16 + microPos * 2 + finePos)
                               : (usedMicro ? (mapPos * 8 + microPos) : mapPos);
