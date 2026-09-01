@@ -1,0 +1,254 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant, std430) uniform PC {
+    vec3 bmin;
+    float voxelSize;
+    int N;
+    int conservative;
+    int sampleColor;
+    int triCount;
+} pc;
+
+struct GpuTri {
+    vec4 p0;
+    vec4 p1;
+    vec4 p2;
+    vec4 uv0uv1;
+    vec4 uv2pad;
+    vec4 kd;
+};
+
+layout(set = 0, binding = 0, std430) readonly buffer Tris {
+    GpuTri tris[];
+};
+
+layout(set = 0, binding = 1, std430) buffer Occupancy {
+    uint occ[];
+};
+
+layout(set = 0, binding = 2, std430) buffer Seeds {
+    uint seedRgb[];
+};
+
+layout(set = 0, binding = 3) uniform sampler2D albedoMap;
+
+bool separated(float p0, float p1, float rad) {
+    float mn = min(p0, p1);
+    float mx = max(p0, p1);
+    return (mn > rad) || (mx < -rad);
+}
+
+bool planeBoxOverlap(vec3 n, vec3 vert, vec3 maxbox) {
+    vec3 vmin;
+    vec3 vmax;
+    for (int q = 0; q < 3; ++q) {
+        float v = vert[q];
+        if (n[q] > 0.0) {
+            vmin[q] = -maxbox[q] - v;
+            vmax[q] = maxbox[q] - v;
+        } else {
+            vmin[q] = maxbox[q] - v;
+            vmax[q] = -maxbox[q] - v;
+        }
+    }
+    if (dot(n, vmin) > 0.0) {
+        return false;
+    }
+    return dot(n, vmax) >= 0.0;
+}
+
+// Akenine-Möller triangle vs AABB.
+bool triBoxOverlap(vec3 boxcenter, vec3 boxhalf, vec3 a, vec3 b, vec3 c) {
+    vec3 v0 = a - boxcenter;
+    vec3 v1 = b - boxcenter;
+    vec3 v2 = c - boxcenter;
+    vec3 e0 = v1 - v0;
+    vec3 e1 = v2 - v1;
+    vec3 e2 = v0 - v2;
+
+    vec3 fe = abs(e0);
+    if (separated(e0.z * v0.y - e0.y * v0.z, e0.z * v2.y - e0.y * v2.z,
+                  fe.z * boxhalf.y + fe.y * boxhalf.z)) {
+        return false;
+    }
+    if (separated(-e0.z * v0.x + e0.x * v0.z, -e0.z * v2.x + e0.x * v2.z,
+                  fe.z * boxhalf.x + fe.x * boxhalf.z)) {
+        return false;
+    }
+    if (separated(e0.y * v1.x - e0.x * v1.y, e0.y * v2.x - e0.x * v2.y,
+                  fe.y * boxhalf.x + fe.x * boxhalf.y)) {
+        return false;
+    }
+
+    fe = abs(e1);
+    if (separated(e1.z * v0.y - e1.y * v0.z, e1.z * v2.y - e1.y * v2.z,
+                  fe.z * boxhalf.y + fe.y * boxhalf.z)) {
+        return false;
+    }
+    if (separated(-e1.z * v0.x + e1.x * v0.z, -e1.z * v2.x + e1.x * v2.z,
+                  fe.z * boxhalf.x + fe.x * boxhalf.z)) {
+        return false;
+    }
+    if (separated(e1.y * v0.x - e1.x * v0.y, e1.y * v1.x - e1.x * v1.y,
+                  fe.y * boxhalf.x + fe.x * boxhalf.y)) {
+        return false;
+    }
+
+    fe = abs(e2);
+    if (separated(e2.z * v0.y - e2.y * v0.z, e2.z * v1.y - e2.y * v1.z,
+                  fe.z * boxhalf.y + fe.y * boxhalf.z)) {
+        return false;
+    }
+    if (separated(-e2.z * v0.x + e2.x * v0.z, -e2.z * v1.x + e2.x * v1.z,
+                  fe.z * boxhalf.x + fe.x * boxhalf.z)) {
+        return false;
+    }
+    if (separated(e2.y * v1.x - e2.x * v1.y, e2.y * v2.x - e2.x * v2.y,
+                  fe.y * boxhalf.x + fe.x * boxhalf.y)) {
+        return false;
+    }
+
+    vec3 tmin = min(v0, min(v1, v2));
+    vec3 tmax = max(v0, max(v1, v2));
+    if (tmin.x > boxhalf.x || tmax.x < -boxhalf.x) {
+        return false;
+    }
+    if (tmin.y > boxhalf.y || tmax.y < -boxhalf.y) {
+        return false;
+    }
+    if (tmin.z > boxhalf.z || tmax.z < -boxhalf.z) {
+        return false;
+    }
+    return planeBoxOverlap(cross(e0, e1), v0, boxhalf);
+}
+
+vec3 closestPointOnTriangle(vec3 p, vec3 a, vec3 b, vec3 c) {
+    vec3 ab = b - a;
+    vec3 ac = c - a;
+    vec3 ap = p - a;
+    float d1 = dot(ab, ap);
+    float d2 = dot(ac, ap);
+    if (d1 <= 0.0 && d2 <= 0.0) {
+        return a;
+    }
+    vec3 bp = p - b;
+    float d3 = dot(ab, bp);
+    float d4 = dot(ac, bp);
+    if (d3 >= 0.0 && d4 <= d3) {
+        return b;
+    }
+    float vc = d1 * d4 - d3 * d2;
+    if (vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0) {
+        float v = d1 / (d1 - d3);
+        return a + v * ab;
+    }
+    vec3 cp = p - c;
+    float d5 = dot(ab, cp);
+    float d6 = dot(ac, cp);
+    if (d6 >= 0.0 && d5 <= d6) {
+        return c;
+    }
+    float vb = d5 * d2 - d1 * d6;
+    if (vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0) {
+        float w = d2 / (d2 - d6);
+        return a + w * ac;
+    }
+    float va = d3 * d6 - d5 * d4;
+    if (va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0) {
+        float w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+        return b + w * (c - b);
+    }
+    float denom = 1.0 / (va + vb + vc);
+    float v = vb * denom;
+    float w = vc * denom;
+    return a + ab * v + ac * w;
+}
+
+vec3 barycentric(vec3 p, vec3 a, vec3 b, vec3 c) {
+    vec3 v0 = b - a;
+    vec3 v1 = c - a;
+    vec3 v2 = p - a;
+    float d00 = dot(v0, v0);
+    float d01 = dot(v0, v1);
+    float d11 = dot(v1, v1);
+    float d20 = dot(v2, v0);
+    float d21 = dot(v2, v1);
+    float denom = d00 * d11 - d01 * d01;
+    if (abs(denom) < 1e-20) {
+        return vec3(1.0, 0.0, 0.0);
+    }
+    float v = (d11 * d20 - d01 * d21) / denom;
+    float w = (d00 * d21 - d01 * d20) / denom;
+    float u = 1.0 - v - w;
+    return vec3(u, v, w);
+}
+
+uint packRgba(vec3 rgb) {
+    vec3 c = clamp(rgb, 0.0, 1.0);
+    uint r = uint(c.r * 255.0 + 0.5);
+    uint g = uint(c.g * 255.0 + 0.5);
+    uint b = uint(c.b * 255.0 + 0.5);
+    return (255u << 24) | (r << 16) | (g << 8) | b;
+}
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    if (tid >= uint(pc.triCount) || pc.N <= 0) {
+        return;
+    }
+
+    GpuTri t = tris[tid];
+    vec3 a = t.p0.xyz;
+    vec3 b = t.p1.xyz;
+    vec3 c = t.p2.xyz;
+    float vs = max(pc.voxelSize, 1e-8);
+    int n = pc.N;
+    vec3 invVs = vec3(1.0 / vs);
+
+    vec3 tmin = min(a, min(b, c));
+    vec3 tmax = max(a, max(b, c));
+    ivec3 i0 = ivec3(floor((tmin - pc.bmin) * invVs));
+    ivec3 i1 = ivec3(floor((tmax - pc.bmin) * invVs));
+    if (pc.conservative != 0) {
+        i0 -= ivec3(1);
+        i1 += ivec3(1);
+    }
+    i0 = clamp(i0, ivec3(0), ivec3(n - 1));
+    i1 = clamp(i1, ivec3(0), ivec3(n - 1));
+
+    vec3 halfSize = vec3(0.5 * vs);
+    vec2 uv0 = t.uv0uv1.xy;
+    vec2 uv1 = t.uv0uv1.zw;
+    vec2 uv2 = t.uv2pad.xy;
+    float hasTex = t.uv2pad.w;
+    vec3 kd = t.kd.rgb;
+
+    for (int z = i0.z; z <= i1.z; ++z) {
+        for (int y = i0.y; y <= i1.y; ++y) {
+            for (int x = i0.x; x <= i1.x; ++x) {
+                vec3 boxMin = pc.bmin + vec3(x, y, z) * vs;
+                vec3 center = boxMin + halfSize;
+                if (!triBoxOverlap(center, halfSize, a, b, c)) {
+                    continue;
+                }
+                uint idx = uint(x) + uint(y) * uint(n) + uint(z) * uint(n) * uint(n);
+                atomicMax(occ[idx], 1u);
+                if (pc.sampleColor == 0) {
+                    continue;
+                }
+                vec3 q = closestPointOnTriangle(center, a, b, c);
+                vec3 bary = barycentric(q, a, b, c);
+                vec2 uv = bary.x * uv0 + bary.y * uv1 + bary.z * uv2;
+                vec3 rgb = kd;
+                if (hasTex > 0.5) {
+                    rgb *= textureLod(albedoMap, uv, 0.0).rgb;
+                }
+                uint packed = packRgba(rgb);
+                uint expected = 0u;
+                atomicCompSwap(seedRgb[idx], expected, packed);
+            }
+        }
+    }
+}

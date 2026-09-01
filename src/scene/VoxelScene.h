@@ -3,12 +3,15 @@
 #include "core/Camera.h"
 #include "gfx/GpuTypes.h"
 #include "gfx/Texture.h"
+#include "voxel/MeshVoxelizer.h"
 
 #include <glm/glm.hpp>
 #include <glm/gtc/quaternion.hpp>
 
+#include <array>
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <unordered_set>
 #include <vector>
 
@@ -50,6 +53,7 @@ static_assert(sizeof(CoarseCell) == 8, "CoarseCell size mismatch");
 struct VoxelObject {
   static constexpr uint32_t kFlagNestedMicro = 1u;
   static constexpr uint32_t kFlagEnabled = 2u;
+  static constexpr uint32_t kFlagImportPalette = 4u;
 
   glm::vec3 position{0.0f};
   glm::quat rotation{1.0f, 0.0f, 0.0f, 0.0f};
@@ -58,6 +62,7 @@ struct VoxelObject {
   bool nestedMicro = true;
   bool editable = true;
   bool enabled = true;
+  bool useImportPalette = false;
 
   std::vector<CoarseCell> cells;
   uint32_t voxelOffset = 0;
@@ -88,6 +93,14 @@ public:
   void handleEditInput(GLFWwindow* window, GfxDevice& gfx);
   void rebuildVoxels(GfxDevice& gfx);
   void uploadObjectTransforms(GfxDevice& gfx);
+  bool importSurfaceMesh(GfxDevice& gfx, const std::string& path, const MeshVoxelizeConfig& cfg);
+  void removeImportedMesh(GfxDevice& gfx);
+  const std::string& importStatus() const { return importStatus_; }
+  std::string& importPath() { return importPath_; }
+  int& importGridN() { return importGridN_; }
+  int& importPadding() { return importPadding_; }
+  bool& importSampleColor() { return importSampleColor_; }
+  const AllocatedBuffer& paletteBuffer() const { return paletteBuffer_; }
 
   Camera& camera() { return camera_; }
   const Camera& camera() const { return camera_; }
@@ -162,8 +175,10 @@ private:
 
   void buildGroundObject(VoxelObject& o);
   void buildSpinnerObject(VoxelObject& o);
+  void applyImportedObject(GfxDevice& gfx, VoxelObject&& imported);
   void packObjectPool();
   void fillGpuObjectRecords();
+  void uploadPalette(GfxDevice& gfx);
   uint32_t* brickPageWords(uint32_t page);
   const uint32_t* brickPageWords(uint32_t page) const;
   uint8_t readFineByte(uint32_t page, uint32_t microBit) const;
@@ -196,6 +211,16 @@ private:
   AllocatedBuffer voxelBuffer_{};
   AllocatedBuffer dummyBrickSlabBuffer_{};
   AllocatedBuffer objectBuffer_{};
+  AllocatedBuffer paletteBuffer_{};
+  MeshVoxelizerGpu voxelizeGpu_{};
+  std::array<glm::vec4, 256> importPalette_{};
+  std::string importPath_;
+  std::string lastImportedPath_;
+  std::string importStatus_{"No import"};
+  int importGridN_ = 48;
+  int importPadding_ = 1;
+  bool importSampleColor_ = false;
+  bool importConservative_ = true;
 
   std::vector<VoxelObject> objects_;
   std::vector<GpuVoxelObject> objectsGpu_;
@@ -227,7 +252,7 @@ private:
   bool nestedMicroVoxels_ = true;
   float time_ = 0.0f;
   float spinSpeed_ = 0.8f;
-  bool spinnerEnabled_ = true;
+  bool spinnerEnabled_ = false;
 
   bool prevLmb_ = false;
   bool prevF_ = false;

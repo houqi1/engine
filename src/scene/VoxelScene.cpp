@@ -13,6 +13,7 @@
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
@@ -81,12 +82,25 @@ void VoxelScene::init(GfxDevice& gfx) {
   }
 
   rebuildVoxels(gfx);
+
+  const std::string pirateObj =
+      std::string(VE_ASSETS_DIR) + "/meshes/pirate-building/Piratebuilding.obj";
+  if (std::filesystem::exists(pirateObj)) {
+    MeshVoxelizeConfig cfg;
+    cfg.gridN = importGridN_;
+    cfg.padding = importPadding_;
+    cfg.sampleColor = false;
+    cfg.conservative = importConservative_;
+    importSurfaceMesh(gfx, pirateObj, cfg);
+  }
 }
 
 void VoxelScene::cleanup(GfxDevice& gfx) {
+  voxelizeGpu_.destroy(gfx);
   gfx.destroyBuffer(voxelBuffer_);
   gfx.destroyBuffer(dummyBrickSlabBuffer_);
   gfx.destroyBuffer(objectBuffer_);
+  gfx.destroyBuffer(paletteBuffer_);
   for (BrickSlab& s : slabs_) {
     gfx.destroyBuffer(s.gpu);
   }
@@ -550,6 +564,9 @@ void VoxelScene::fillGpuObjectRecords() {
     if (o.enabled) {
       g.flags |= VoxelObject::kFlagEnabled;
     }
+    if (o.useImportPalette) {
+      g.flags |= VoxelObject::kFlagImportPalette;
+    }
     g.voxelOffset = o.voxelOffset;
     g._unusedMicroOffset = 0;
     g._pad1[0] = g._pad1[1] = 0;
@@ -589,6 +606,21 @@ void VoxelScene::ensureGpuBuffers(GfxDevice& gfx) {
                                      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                                      VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
   }
+  const VkDeviceSize paletteBytes = sizeof(glm::vec4) * 256;
+  if (paletteBuffer_.buffer == VK_NULL_HANDLE || paletteBuffer_.size < paletteBytes) {
+    gfx.destroyBuffer(paletteBuffer_);
+    paletteBuffer_ = gfx.createBuffer(
+        paletteBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+    uploadPalette(gfx);
+  }
+}
+
+void VoxelScene::uploadPalette(GfxDevice& gfx) {
+  if (paletteBuffer_.buffer == VK_NULL_HANDLE) {
+    return;
+  }
+  gfx.uploadToBuffer(paletteBuffer_, importPalette_.data(), sizeof(glm::vec4) * 256);
 }
 
 void VoxelScene::flushDirtyPages(GfxDevice& gfx) {
@@ -727,6 +759,96 @@ void VoxelScene::rebuildVoxels(GfxDevice& gfx) {
   gfx.uploadToBuffer(objectBuffer_, objectsGpu_.data(),
                      sizeof(GpuVoxelObject) * objectsGpu_.size());
   dirtyPages_.clear();
+
+  if (!lastImportedPath_.empty()) {
+    MeshVoxelizeConfig cfg;
+    cfg.gridN = importGridN_;
+    cfg.padding = importPadding_;
+    cfg.sampleColor = importSampleColor_;
+    cfg.conservative = importConservative_;
+    importSurfaceMesh(gfx, lastImportedPath_, cfg);
+  }
+}
+
+void VoxelScene::applyImportedObject(GfxDevice& gfx, VoxelObject&& imported) {
+  if (objects_.size() >= 3) {
+    objects_[2] = std::move(imported);
+  } else {
+    objects_.push_back(std::move(imported));
+  }
+  packObjectPool();
+  fillGpuObjectRecords();
+  ensureGpuBuffers(gfx);
+  if (!voxelsCpu_.empty()) {
+    gfx.uploadToBuffer(voxelBuffer_, voxelsCpu_.data(), sizeof(CoarseCell) * voxelsCpu_.size());
+  }
+  gfx.uploadToBuffer(objectBuffer_, objectsGpu_.data(),
+                     sizeof(GpuVoxelObject) * objectsGpu_.size());
+  uploadPalette(gfx);
+}
+
+bool VoxelScene::importSurfaceMesh(GfxDevice& gfx, const std::string& path,
+                                   const MeshVoxelizeConfig& cfg) {
+  MeshVoxelizeResult r = voxelizeObjSurface(gfx, voxelizeGpu_, path, cfg);
+  if (!r.ok) {
+    importStatus_ = r.error;
+    return false;
+  }
+
+  VoxelObject o;
+  o.gridSize = r.n;
+  o.voxelSize = r.voxelSize;
+  o.nestedMicro = nestedMicroVoxels_;
+  o.editable = true;
+  o.enabled = true;
+  o.useImportPalette = cfg.sampleColor;
+  o.rotation = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+  const float extent = static_cast<float>(r.n) * r.voxelSize;
+  o.position = glm::vec3(0.0f, 0.5f * extent + 2.5f * voxelSize_, 0.0f);
+  o.cells.assign(static_cast<size_t>(r.n) * static_cast<size_t>(r.n) * static_cast<size_t>(r.n),
+                 CoarseCell{});
+  for (size_t i = 0; i < r.material.size() && i < o.cells.size(); ++i) {
+    o.cells[i].material = r.material[i];
+    o.cells[i].brickPage = kInvalidBrickPage;
+  }
+
+  importPalette_.fill(glm::vec4(0.62f, 0.64f, 0.68f, 1.0f));
+  importPalette_[0] = glm::vec4(0.0f, 0.0f, 0.0f, 1.0f);
+  for (uint32_t i = 0; i < 256; ++i) {
+    importPalette_[i] = glm::vec4(r.palette[i], 1.0f);
+  }
+
+  importPath_ = path;
+  lastImportedPath_ = path;
+  importGridN_ = cfg.gridN;
+  importPadding_ = cfg.padding;
+  importSampleColor_ = cfg.sampleColor;
+  applyImportedObject(gfx, std::move(o));
+
+  importStatus_ = "Imported " + path + "  N=" + std::to_string(r.n) +
+                  "  occupied=" + std::to_string(r.occupied);
+  if (!r.warning.empty()) {
+    importStatus_ += "  (" + r.warning + ")";
+  }
+  return true;
+}
+
+void VoxelScene::removeImportedMesh(GfxDevice& gfx) {
+  lastImportedPath_.clear();
+  if (objects_.size() < 3) {
+    importStatus_ = "No imported mesh";
+    return;
+  }
+  objects_.resize(2);
+  packObjectPool();
+  fillGpuObjectRecords();
+  ensureGpuBuffers(gfx);
+  if (!voxelsCpu_.empty()) {
+    gfx.uploadToBuffer(voxelBuffer_, voxelsCpu_.data(), sizeof(CoarseCell) * voxelsCpu_.size());
+  }
+  gfx.uploadToBuffer(objectBuffer_, objectsGpu_.data(),
+                     sizeof(GpuVoxelObject) * objectsGpu_.size());
+  importStatus_ = "Removed imported mesh";
 }
 
 int VoxelScene::applyCoarseSphereBrush(VoxelObject& o, const glm::ivec3& center, float radius,

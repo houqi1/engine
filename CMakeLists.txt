@@ -71,6 +71,7 @@ set(VE_VOXEL_SOURCES
   src/main_voxel.cpp
   src/scene/VoxelScene.cpp
   src/render/VoxelRenderer.cpp
+  src/voxel/MeshVoxelizer.cpp
 )
 
 function(ve_configure_target target_name)
@@ -149,6 +150,7 @@ set(VE_SHADER_SOURCES
   voxel.vert
   voxel.frag
   voxel_dda.comp
+  voxelize_surface.comp
 )
 
 set(VE_SPV_FILES "")

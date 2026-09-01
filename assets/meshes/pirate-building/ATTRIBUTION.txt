@@ -1,0 +1,9 @@
+Pirate building mesh used by the voxel demo auto-import.
+
+Source files (copied into this folder for portable clones):
+  Piratebuilding.obj
+  Piratehousediffuse1.png
+  Plane.001_D.png
+  grasswater.png
+
+Original local pack: Downloads/pirate-building (Sketchfab-style export).

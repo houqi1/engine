@@ -84,6 +84,7 @@ private:
   std::array<VkBuffer, VoxelScene::kMaxBrickSlabs> boundBrickSlabs_{};
   uint32_t boundBrickSlabCount_ = 0;
   VkBuffer boundObjectBuffer_ = VK_NULL_HANDLE;
+  VkBuffer boundPaletteBuffer_ = VK_NULL_HANDLE;
   VkImageView boundSkyView_ = VK_NULL_HANDLE;
   bool imguiReady_ = false;
   float displayFps_ = 0.0f;

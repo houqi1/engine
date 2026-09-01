@@ -146,11 +146,12 @@ void VoxelRenderer::resize() {
   boundBrickSlabs_.fill(VK_NULL_HANDLE);
   boundBrickSlabCount_ = 0;
   boundObjectBuffer_ = VK_NULL_HANDLE;
+  boundPaletteBuffer_ = VK_NULL_HANDLE;
   boundSkyView_ = VK_NULL_HANDLE;
 }
 
 void VoxelRenderer::createDescriptors() {
-  VkDescriptorSetLayoutBinding bindings[6]{};
+  VkDescriptorSetLayoutBinding bindings[7]{};
   bindings[0].binding = 0;
   bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
   bindings[0].descriptorCount = 1;
@@ -181,9 +182,14 @@ void VoxelRenderer::createDescriptors() {
   bindings[5].descriptorCount = 1;
   bindings[5].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
+  bindings[6].binding = 6;
+  bindings[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  bindings[6].descriptorCount = 1;
+  bindings[6].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
   VkDescriptorSetLayoutCreateInfo layoutInfo{};
   layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-  layoutInfo.bindingCount = 6;
+  layoutInfo.bindingCount = 7;
   layoutInfo.pBindings = bindings;
   if (vkCreateDescriptorSetLayout(gfx_.device(), &layoutInfo, nullptr, &frameLayout_) !=
       VK_SUCCESS) {
@@ -193,7 +199,7 @@ void VoxelRenderer::createDescriptors() {
   VkDescriptorPoolSize poolSizes[] = {
       {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, GfxDevice::kFramesInFlight},
       {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-       GfxDevice::kFramesInFlight * (2u + VoxelScene::kMaxBrickSlabs)},
+       GfxDevice::kFramesInFlight * (3u + VoxelScene::kMaxBrickSlabs)},
       {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, GfxDevice::kFramesInFlight},
       {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, GfxDevice::kFramesInFlight},
   };
@@ -256,7 +262,8 @@ void VoxelRenderer::createPipelines() {
 void VoxelRenderer::updateDescriptors(VoxelScene& scene) {
   if (outImage_.view == VK_NULL_HANDLE || scene.voxelBuffer().buffer == VK_NULL_HANDLE ||
       scene.dummyBrickSlabBuffer().buffer == VK_NULL_HANDLE ||
-      scene.objectBuffer().buffer == VK_NULL_HANDLE || !scene.hasSky()) {
+      scene.objectBuffer().buffer == VK_NULL_HANDLE ||
+      scene.paletteBuffer().buffer == VK_NULL_HANDLE || !scene.hasSky()) {
     return;
   }
 
@@ -293,7 +300,11 @@ void VoxelRenderer::updateDescriptors(VoxelScene& scene) {
     objectInfo.buffer = scene.objectBuffer().buffer;
     objectInfo.range = scene.objectBuffer().size;
 
-    VkWriteDescriptorSet writes[6]{};
+    VkDescriptorBufferInfo paletteInfo{};
+    paletteInfo.buffer = scene.paletteBuffer().buffer;
+    paletteInfo.range = scene.paletteBuffer().size;
+
+    VkWriteDescriptorSet writes[7]{};
     writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[0].dstSet = frame.frameSet;
     writes[0].dstBinding = 0;
@@ -336,7 +347,14 @@ void VoxelRenderer::updateDescriptors(VoxelScene& scene) {
     writes[5].descriptorCount = 1;
     writes[5].pBufferInfo = &objectInfo;
 
-    vkUpdateDescriptorSets(gfx_.device(), 6, writes, 0, nullptr);
+    writes[6].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[6].dstSet = frame.frameSet;
+    writes[6].dstBinding = 6;
+    writes[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[6].descriptorCount = 1;
+    writes[6].pBufferInfo = &paletteInfo;
+
+    vkUpdateDescriptorSets(gfx_.device(), 7, writes, 0, nullptr);
   }
 
   boundVoxelBuffer_ = scene.voxelBuffer().buffer;
@@ -346,6 +364,7 @@ void VoxelRenderer::updateDescriptors(VoxelScene& scene) {
     boundBrickSlabs_[i] = scene.brickSlabBuffer(i).buffer;
   }
   boundObjectBuffer_ = scene.objectBuffer().buffer;
+  boundPaletteBuffer_ = scene.paletteBuffer().buffer;
   boundSkyView_ = scene.sky().image.view;
 }
 
@@ -398,6 +417,7 @@ void VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
   }
   if (scene.voxelBuffer().buffer != boundVoxelBuffer_ || brickSlabsChanged ||
       scene.objectBuffer().buffer != boundObjectBuffer_ ||
+      scene.paletteBuffer().buffer != boundPaletteBuffer_ ||
       scene.sky().image.view != boundSkyView_ || outImage_.view == VK_NULL_HANDLE) {
     updateDescriptors(scene);
   }
@@ -619,8 +639,9 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
     ImGui::SliderFloat("Brush Radius", &scene.brushRadius(), 0.0f, 8.0f, "%.1f coarse voxels");
     ImGui::TextDisabled("Editing whole coarse cells (each owns an 8^3 brick)");
   }
-  ImGui::Checkbox("Spinner Enabled", &scene.spinnerEnabled());
+  ImGui::Checkbox("Show Rotating Object", &scene.spinnerEnabled());
   ImGui::SliderFloat("Spin Speed", &scene.spinSpeed(), -3.0f, 3.0f, "%.2f rad/s");
+  ImGui::TextDisabled("Uncheck to hide the spinning voxel object.");
   if (const std::optional<VoxelHit> hit = scene.lastHit()) {
     if (hit->hasFine || hit->hasMicro) {
       ImGui::Text("Hit obj=%d c=(%d,%d,%d) m=(%d,%d,%d) f=(%d,%d,%d) n=(%d,%d,%d) mat=%u",
@@ -635,6 +656,36 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
   } else {
     ImGui::TextUnformatted("Hit: none");
   }
+  ImGui::Separator();
+  ImGui::TextUnformatted("Import Mesh (GPU surface voxelize)");
+  char pathBuf[512]{};
+  const std::string defaultObj = std::string(VE_ASSETS_DIR) + "/meshes/cube.obj";
+  const std::string& srcPath = scene.importPath().empty() ? defaultObj : scene.importPath();
+  std::strncpy(pathBuf, srcPath.c_str(), sizeof(pathBuf) - 1);
+  if (ImGui::InputText("OBJ Path", pathBuf, sizeof(pathBuf))) {
+    scene.importPath() = pathBuf;
+  }
+  ImGui::SliderInt("Import Grid N", &scene.importGridN(), 8, 64);
+  ImGui::SliderInt("Import Padding", &scene.importPadding(), 0, 4);
+  ImGui::Checkbox("Sample Mesh Color", &scene.importSampleColor());
+  if (ImGui::Button("Import Surface OBJ")) {
+    MeshVoxelizeConfig cfg;
+    cfg.gridN = scene.importGridN();
+    cfg.padding = scene.importPadding();
+    cfg.sampleColor = scene.importSampleColor();
+    const std::string path = scene.importPath().empty() ? defaultObj : scene.importPath();
+    scene.importSurfaceMesh(gfx_, path, cfg);
+    boundVoxelBuffer_ = VK_NULL_HANDLE;
+    boundObjectBuffer_ = VK_NULL_HANDLE;
+    boundPaletteBuffer_ = VK_NULL_HANDLE;
+  }
+  ImGui::SameLine();
+  if (ImGui::Button("Remove Imported")) {
+    scene.removeImportedMesh(gfx_);
+    boundVoxelBuffer_ = VK_NULL_HANDLE;
+    boundObjectBuffer_ = VK_NULL_HANDLE;
+  }
+  ImGui::TextWrapped("%s", scene.importStatus().c_str());
   ImGui::Separator();
 
   const char* modes[] = {"Shaded", "Albedo", "Normal", "Steps", "Coord", "AO"};

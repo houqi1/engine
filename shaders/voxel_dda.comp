@@ -51,7 +51,7 @@ struct GpuVoxelObject {
     float _pad1;
     float _pad2;
     uvec3 gridSize;
-    uint flags;  // bit0 nestedMicro, bit1 enabled
+    uint flags;  // bit0 nestedMicro, bit1 enabled, bit2 importPalette
     uint voxelOffset;
     uint _unusedMicroOffset;
     uint _pad3;
@@ -60,6 +60,10 @@ struct GpuVoxelObject {
 
 layout(set = 0, binding = 5, std430) readonly buffer ObjectBuffer {
     GpuVoxelObject objects[];
+};
+
+layout(set = 0, binding = 6, std430) readonly buffer ImportPalette {
+    vec4 importPalette[256];
 };
 
 const uint MODE_SHADED = 0u;
@@ -75,6 +79,7 @@ const uint PAGES_PER_SLAB = 1024u;
 const uint INVALID_BRICK_PAGE = 0xFFFFFFFFu;
 const uint FLAG_NESTED = 1u;
 const uint FLAG_ENABLED = 2u;
+const uint FLAG_IMPORT_PALETTE = 4u;
 const float FLT_MAX = 3.4028235e+38;
 const float kPi = 3.14159265359;
 
@@ -208,8 +213,10 @@ bool neighborSolid(GpuVoxelObject o, ivec3 solidPos, ivec3 offset, uint space) {
     return space == 1u ? solidMicroGlobal(o, p) : solidCoarse(o, p);
 }
 
-vec3 albedoForVoxel(uint matId) {
-    // Unified albedo for all voxel materials.
+vec3 albedoForVoxel(GpuVoxelObject o, uint matId) {
+    if ((o.flags & FLAG_IMPORT_PALETTE) != 0u && matId > 0u && matId < 256u) {
+        return importPalette[matId].rgb;
+    }
     return vec3(0.62, 0.64, 0.68);
 }
 
@@ -488,7 +495,7 @@ ObjectHit traverseObject(GpuVoxelObject o, vec3 Ow, vec3 Dw) {
 
     vec3 normalLocal = -vec3(mask) * sgn;
     vec3 normalWorld = normalize(mat3(o.objectToWorld) * normalLocal);
-    vec3 albedo = albedoForVoxel(matId);
+    vec3 albedo = albedoForVoxel(o, matId);
 
     ivec3 solidPos = usedFine ? (mapPos * 16 + microPos * 2 + finePos)
                               : (usedMicro ? (mapPos * 8 + microPos) : mapPos);

@@ -524,7 +524,7 @@ AllocatedBuffer GfxDevice::createBuffer(VkDeviceSize size, VkBufferUsageFlags us
   allocInfo.usage = memoryUsage;
   if (memoryUsage == VMA_MEMORY_USAGE_AUTO_PREFER_HOST ||
       memoryUsage == VMA_MEMORY_USAGE_CPU_TO_GPU || memoryUsage == VMA_MEMORY_USAGE_CPU_ONLY) {
-    allocInfo.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+    allocInfo.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
                       VMA_ALLOCATION_CREATE_MAPPED_BIT;
   } else {
     allocInfo.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
