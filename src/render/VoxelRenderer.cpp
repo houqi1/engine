@@ -143,7 +143,8 @@ void VoxelRenderer::resize() {
   createOutputImage();
   // Force descriptor refresh so storage-image views stay valid.
   boundVoxelBuffer_ = VK_NULL_HANDLE;
-  boundMicroBuffer_ = VK_NULL_HANDLE;
+  boundBrickSlabs_.fill(VK_NULL_HANDLE);
+  boundBrickSlabCount_ = 0;
   boundObjectBuffer_ = VK_NULL_HANDLE;
   boundSkyView_ = VK_NULL_HANDLE;
 }
@@ -167,7 +168,7 @@ void VoxelRenderer::createDescriptors() {
 
   bindings[3].binding = 3;
   bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  bindings[3].descriptorCount = 1;
+  bindings[3].descriptorCount = VoxelScene::kMaxBrickSlabs;
   bindings[3].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
   bindings[4].binding = 4;
@@ -191,7 +192,8 @@ void VoxelRenderer::createDescriptors() {
 
   VkDescriptorPoolSize poolSizes[] = {
       {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, GfxDevice::kFramesInFlight},
-      {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, GfxDevice::kFramesInFlight * 3},
+      {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+       GfxDevice::kFramesInFlight * (2u + VoxelScene::kMaxBrickSlabs)},
       {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, GfxDevice::kFramesInFlight},
       {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, GfxDevice::kFramesInFlight},
   };
@@ -253,8 +255,8 @@ void VoxelRenderer::createPipelines() {
 
 void VoxelRenderer::updateDescriptors(VoxelScene& scene) {
   if (outImage_.view == VK_NULL_HANDLE || scene.voxelBuffer().buffer == VK_NULL_HANDLE ||
-      scene.microBuffer().buffer == VK_NULL_HANDLE || scene.objectBuffer().buffer == VK_NULL_HANDLE ||
-      !scene.hasSky()) {
+      scene.dummyBrickSlabBuffer().buffer == VK_NULL_HANDLE ||
+      scene.objectBuffer().buffer == VK_NULL_HANDLE || !scene.hasSky()) {
     return;
   }
 
@@ -271,9 +273,16 @@ void VoxelRenderer::updateDescriptors(VoxelScene& scene) {
     imageInfo.imageView = outImage_.view;
     imageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
-    VkDescriptorBufferInfo microInfo{};
-    microInfo.buffer = scene.microBuffer().buffer;
-    microInfo.range = scene.microBuffer().size;
+    VkDescriptorBufferInfo brickInfos[VoxelScene::kMaxBrickSlabs]{};
+    for (uint32_t i = 0; i < VoxelScene::kMaxBrickSlabs; ++i) {
+      if (i < scene.brickSlabCount() && scene.brickSlabBuffer(i).buffer != VK_NULL_HANDLE) {
+        brickInfos[i].buffer = scene.brickSlabBuffer(i).buffer;
+        brickInfos[i].range = scene.brickSlabBuffer(i).size;
+      } else {
+        brickInfos[i].buffer = scene.dummyBrickSlabBuffer().buffer;
+        brickInfos[i].range = scene.dummyBrickSlabBuffer().size;
+      }
+    }
 
     VkDescriptorImageInfo skyInfo{};
     skyInfo.sampler = scene.sky().sampler;
@@ -310,8 +319,8 @@ void VoxelRenderer::updateDescriptors(VoxelScene& scene) {
     writes[3].dstSet = frame.frameSet;
     writes[3].dstBinding = 3;
     writes[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    writes[3].descriptorCount = 1;
-    writes[3].pBufferInfo = &microInfo;
+    writes[3].descriptorCount = VoxelScene::kMaxBrickSlabs;
+    writes[3].pBufferInfo = brickInfos;
 
     writes[4].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[4].dstSet = frame.frameSet;
@@ -331,7 +340,11 @@ void VoxelRenderer::updateDescriptors(VoxelScene& scene) {
   }
 
   boundVoxelBuffer_ = scene.voxelBuffer().buffer;
-  boundMicroBuffer_ = scene.microBuffer().buffer;
+  boundBrickSlabCount_ = scene.brickSlabCount();
+  boundBrickSlabs_.fill(VK_NULL_HANDLE);
+  for (uint32_t i = 0; i < boundBrickSlabCount_; ++i) {
+    boundBrickSlabs_[i] = scene.brickSlabBuffer(i).buffer;
+  }
   boundObjectBuffer_ = scene.objectBuffer().buffer;
   boundSkyView_ = scene.sky().image.view;
 }
@@ -379,8 +392,11 @@ void VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
   if (outImage_.image == VK_NULL_HANDLE) {
     createOutputImage();
   }
-  if (scene.voxelBuffer().buffer != boundVoxelBuffer_ ||
-      scene.microBuffer().buffer != boundMicroBuffer_ ||
+  bool brickSlabsChanged = scene.brickSlabCount() != boundBrickSlabCount_;
+  for (uint32_t i = 0; i < scene.brickSlabCount() && !brickSlabsChanged; ++i) {
+    brickSlabsChanged = scene.brickSlabBuffer(i).buffer != boundBrickSlabs_[i];
+  }
+  if (scene.voxelBuffer().buffer != boundVoxelBuffer_ || brickSlabsChanged ||
       scene.objectBuffer().buffer != boundObjectBuffer_ ||
       scene.sky().image.view != boundSkyView_ || outImage_.view == VK_NULL_HANDLE) {
     updateDescriptors(scene);
@@ -587,7 +603,9 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
   }
   ImGui::Text("Objects: %u", scene.objectCount());
   ImGui::Text("Occupied coarse: %u / %u", scene.occupiedCount(), scene.voxelCount());
-  ImGui::Text("Occupied micro: %u", scene.occupiedMicroCount());
+  ImGui::Text("Brick pages: %u  slabs: %u  pool: %.1f KB", scene.allocatedBrickPages(),
+              scene.brickSlabCount(), static_cast<float>(scene.brickPoolBytes()) / 1024.0f);
+  ImGui::Text("Occupied brick voxels: %u", scene.occupiedMicroCount());
   ImGui::Separator();
   ImGui::TextWrapped("LMB: remove hit object  |  F: place on hit face  |  RMB drag: look");
   ImGui::SliderInt("Brush Material", &scene.brushMaterial(), 1, 2);
@@ -595,7 +613,7 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
   if (scene.nestedMicroVoxels()) {
     ImGui::SliderFloat("Brush Radius", &scene.brushRadius(), 0.0f, 8.0f, "%.1f micro-voxels");
     ImGui::TextDisabled("Editing individual micro cells inside coarse bricks");
-    ImGui::TextDisabled("Empty micro bricks skip nested DDA (HAS_MICRO bit).");
+    ImGui::TextDisabled("Inner DDA only if a brick page is allocated (sparse pool).");
   } else {
     ImGui::SliderFloat("Brush Radius", &scene.brushRadius(), 0.0f, 8.0f, "%.1f coarse voxels");
     ImGui::TextDisabled("Editing whole coarse cells (each owns an 8^3 brick)");
@@ -643,7 +661,8 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
   if (rebuild) {
     scene.rebuildVoxels(gfx_);
     boundVoxelBuffer_ = VK_NULL_HANDLE;
-    boundMicroBuffer_ = VK_NULL_HANDLE;
+    boundBrickSlabs_.fill(VK_NULL_HANDLE);
+  boundBrickSlabCount_ = 0;
     boundObjectBuffer_ = VK_NULL_HANDLE;
   }
   ImGui::End();

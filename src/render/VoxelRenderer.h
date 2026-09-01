@@ -81,7 +81,8 @@ private:
 
   std::array<FrameResources, GfxDevice::kFramesInFlight> frames_{};
   VkBuffer boundVoxelBuffer_ = VK_NULL_HANDLE;
-  VkBuffer boundMicroBuffer_ = VK_NULL_HANDLE;
+  std::array<VkBuffer, VoxelScene::kMaxBrickSlabs> boundBrickSlabs_{};
+  uint32_t boundBrickSlabCount_ = 0;
   VkBuffer boundObjectBuffer_ = VK_NULL_HANDLE;
   VkImageView boundSkyView_ = VK_NULL_HANDLE;
   bool imguiReady_ = false;

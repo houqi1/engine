@@ -25,15 +25,20 @@ layout(set = 0, binding = 0, std140) uniform VoxelDdaUBO {
     float _pad2;
 } ubo;
 
+struct CoarseCell {
+    uint material;
+    uint brickPage;  // 0xFFFFFFFFu = none
+};
+
 layout(set = 0, binding = 1, std430) readonly buffer VoxelGrid {
-    uint voxels[];
+    CoarseCell cells[];
 };
 
 layout(set = 0, binding = 2, rgba8) writeonly uniform image2D outImage;
 
-layout(set = 0, binding = 3, std430) readonly buffer MicroGrid {
-    uint micro[];
-};
+layout(set = 0, binding = 3, std430) readonly buffer BrickPool {
+    uint bricks[];
+} brickSlabs[8];
 
 layout(set = 0, binding = 4) uniform sampler2D skyMap;
 
@@ -48,7 +53,7 @@ struct GpuVoxelObject {
     uvec3 gridSize;
     uint flags;  // bit0 nestedMicro, bit1 enabled
     uint voxelOffset;
-    uint microOffset;
+    uint _unusedMicroOffset;
     uint _pad3;
     uint _pad4;
 };
@@ -64,6 +69,8 @@ const uint MODE_STEPS = 3u;
 const uint MODE_COORD = 4u;
 const uint MODE_AO = 5u;
 const uint MICRO_WORDS = 16u;
+const uint PAGES_PER_SLAB = 1024u;
+const uint INVALID_BRICK_PAGE = 0xFFFFFFFFu;
 const uint FLAG_NESTED = 1u;
 const uint FLAG_ENABLED = 2u;
 const float FLT_MAX = 3.4028235e+38;
@@ -108,33 +115,40 @@ bool insideGrid(GpuVoxelObject o, ivec3 p) {
     return all(greaterThanEqual(p, ivec3(0))) && all(lessThan(p, ivec3(o.gridSize)));
 }
 
-uint readVoxel(GpuVoxelObject o, ivec3 p) {
-    return voxels[voxelIndex(o, p)];
+CoarseCell readCell(GpuVoxelObject o, ivec3 p) {
+    return cells[voxelIndex(o, p)];
 }
 
-bool getMicroVoxel(GpuVoxelObject o, ivec3 coarse, ivec3 c) {
+uint loadBrickWord(uint page, uint wordIndex) {
+    uint slab = page / PAGES_PER_SLAB;
+    uint local = page % PAGES_PER_SLAB;
+    uint idx = local * MICRO_WORDS + wordIndex;
+    // Unrolled so MoltenVK does not need nonuniform buffer-array indexing.
+    if (slab == 0u) return brickSlabs[0].bricks[idx];
+    if (slab == 1u) return brickSlabs[1].bricks[idx];
+    if (slab == 2u) return brickSlabs[2].bricks[idx];
+    if (slab == 3u) return brickSlabs[3].bricks[idx];
+    if (slab == 4u) return brickSlabs[4].bricks[idx];
+    if (slab == 5u) return brickSlabs[5].bricks[idx];
+    if (slab == 6u) return brickSlabs[6].bricks[idx];
+    return brickSlabs[7].bricks[idx];
+}
+
+bool getMicroVoxel(uint page, ivec3 c) {
     if (any(lessThan(c, ivec3(0))) || any(greaterThanEqual(c, ivec3(8)))) {
         return false;
     }
+    // Unallocated solid coarse = virtual full 8^3 (same as pre-sparse ground).
+    if (page == INVALID_BRICK_PAGE) {
+        return true;
+    }
     uint bit = uint(c.y * 64 + c.z * 8 + c.x);
-    uint base = o.microOffset + voxelIndexLocal(o, coarse) * MICRO_WORDS;
-    uint word = micro[base + (bit >> 5)];
+    uint word = loadBrickWord(page, bit >> 5);
     return ((word >> (bit & 31u)) & 1u) != 0u;
 }
 
-const uint VOXEL_MAT_MASK = 0x7FFFFFFFu;
-const uint VOXEL_HAS_MICRO_BIT = 0x80000000u;
-
-uint voxelMaterial(uint raw) {
-    return raw & VOXEL_MAT_MASK;
-}
-
-bool voxelHasMicro(uint raw) {
-    return (raw & VOXEL_HAS_MICRO_BIT) != 0u;
-}
-
 bool solidCoarse(GpuVoxelObject o, ivec3 p) {
-    return insideGrid(o, p) && voxelMaterial(readVoxel(o, p)) != 0u;
+    return insideGrid(o, p) && readCell(o, p).material != 0u;
 }
 
 bool solidMicroGlobal(GpuVoxelObject o, ivec3 g) {
@@ -143,11 +157,14 @@ bool solidMicroGlobal(GpuVoxelObject o, ivec3 g) {
     if (!insideGrid(o, coarse)) {
         return false;
     }
-    uint raw = readVoxel(o, coarse);
-    if (voxelMaterial(raw) == 0u) {
+    CoarseCell cell = readCell(o, coarse);
+    if (cell.material == 0u) {
         return false;
     }
-    return getMicroVoxel(o, coarse, local);
+    if (cell.brickPage == INVALID_BRICK_PAGE) {
+        return true;
+    }
+    return getMicroVoxel(cell.brickPage, local);
 }
 
 bool neighborSolid(GpuVoxelObject o, ivec3 solidPos, ivec3 offset, bool microSpace) {
@@ -210,7 +227,7 @@ float evalVoxelAo(GpuVoxelObject o, ivec3 solidPos, bvec3 mask, vec3 sgn, vec3 u
     return mix(1.0, ao, clamp(ubo.aoStrength, 0.0, 1.0));
 }
 
-bool traceMicro(GpuVoxelObject o, ivec3 coarse, vec3 localPos, vec3 rd, vec3 sgn, bvec3 enterMask,
+bool traceMicro(uint page, vec3 localPos, vec3 rd, vec3 sgn, bvec3 enterMask,
                 out ivec3 outMicro, out bvec3 outMask, out vec3 outUvw, inout uint outSteps) {
     localPos = clamp(localPos, vec3(0.0001), vec3(7.9999));
     ivec3 mapPos = ivec3(floor(localPos));
@@ -220,7 +237,7 @@ bool traceMicro(GpuVoxelObject o, ivec3 coarse, vec3 localPos, vec3 rd, vec3 sgn
     ivec3 rayStep = ivec3(sgn);
     outUvw = clamp(localPos - vec3(mapPos), vec3(0.0), vec3(1.0));
 
-    if (getMicroVoxel(o, coarse, mapPos)) {
+    if (getMicroVoxel(page, mapPos)) {
         outMicro = mapPos;
         outMask = mask;
         return true;
@@ -234,7 +251,7 @@ bool traceMicro(GpuVoxelObject o, ivec3 coarse, vec3 localPos, vec3 rd, vec3 sgn
         if (any(lessThan(mapPos, ivec3(0))) || any(greaterThanEqual(mapPos, ivec3(8)))) {
             return false;
         }
-        if (getMicroVoxel(o, coarse, mapPos)) {
+        if (getMicroVoxel(page, mapPos)) {
             float tHit = dot(sideDist - deltaDist, vec3(mask));
             vec3 hitPos = localPos + rd * tHit;
             outUvw = clamp(hitPos - vec3(mapPos), vec3(0.0), vec3(1.0));
@@ -322,8 +339,8 @@ ObjectHit traverseObject(GpuVoxelObject o, vec3 Ow, vec3 Dw) {
             break;
         }
 
-        uint rawVoxel = readVoxel(o, mapPos);
-        matId = voxelMaterial(rawVoxel);
+        CoarseCell cell = readCell(o, mapPos);
+        matId = cell.material;
         if (matId != 0u) {
             if (!nested) {
                 if (mapPos == startPos) {
@@ -338,32 +355,30 @@ ObjectHit traverseObject(GpuVoxelObject o, vec3 Ow, vec3 Dw) {
                 break;
             }
 
-            if (voxelHasMicro(rawVoxel)) {
-                vec3 local01;
-                float tCoarse = tEnter;
-                if (mapPos == startPos) {
-                    local01 = clamp(pos - vec3(mapPos), vec3(0.0), vec3(0.9999));
-                } else {
-                    vec3 mini = ((vec3(mapPos) - ro) + 0.5 - 0.5 * sgn) * invDir;
-                    float d = max(mini.x, max(mini.y, mini.z));
-                    tCoarse = d;
-                    vec3 intersect = ro + rd * d;
-                    local01 = clamp(intersect - vec3(mapPos), vec3(0.0), vec3(0.9999));
-                }
+            vec3 local01;
+            float tCoarse = tEnter;
+            if (mapPos == startPos) {
+                local01 = clamp(pos - vec3(mapPos), vec3(0.0), vec3(0.9999));
+            } else {
+                vec3 mini = ((vec3(mapPos) - ro) + 0.5 - 0.5 * sgn) * invDir;
+                float d = max(mini.x, max(mini.y, mini.z));
+                tCoarse = d;
+                vec3 intersect = ro + rd * d;
+                local01 = clamp(intersect - vec3(mapPos), vec3(0.0), vec3(0.9999));
+            }
 
-                ivec3 hitMicro;
-                bvec3 microMask;
-                vec3 microUvw;
-                if (traceMicro(o, mapPos, local01 * 8.0, rd, sgn, mask, hitMicro, microMask, microUvw,
-                               steps)) {
-                    hit = true;
-                    usedMicro = true;
-                    microPos = hitMicro;
-                    mask = microMask;
-                    hitUvw = microUvw;
-                    tHitLocal = tCoarse;  // coarse entry; good enough for closest-object compare
-                    break;
-                }
+            ivec3 hitMicro;
+            bvec3 microMask;
+            vec3 microUvw;
+            if (traceMicro(cell.brickPage, local01 * 8.0, rd, sgn, mask, hitMicro, microMask, microUvw,
+                           steps)) {
+                hit = true;
+                usedMicro = true;
+                microPos = hitMicro;
+                mask = microMask;
+                hitUvw = microUvw;
+                tHitLocal = tCoarse;
+                break;
             }
         }
 

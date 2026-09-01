@@ -9,17 +9,18 @@
 
 #include <cstdint>
 #include <optional>
+#include <unordered_set>
 #include <vector>
 
 struct GLFWwindow;
 class GfxDevice;
 
 struct VoxelHit {
-  glm::ivec3 cell{0};     // coarse cell
-  glm::ivec3 micro{0};    // micro cell inside coarse [0,8)
-  glm::ivec3 normal{0};   // outward face normal in object-local axes
+  glm::ivec3 cell{0};
+  glm::ivec3 micro{0};
+  glm::ivec3 normal{0};
   uint32_t material = 0;
-  bool hasMicro = false;  // true when nested pick hit a micro voxel
+  bool hasMicro = false;
   int objectIndex = 0;
 };
 
@@ -32,30 +33,33 @@ struct GpuVoxelObject {
   uint32_t gridSize[3];
   uint32_t flags;  // bit0 = nestedMicro, bit1 = enabled
   uint32_t voxelOffset;
-  uint32_t microOffset;
+  uint32_t _unusedMicroOffset;
   uint32_t _pad1[2];
 };
 static_assert(sizeof(GpuVoxelObject) == 176, "GpuVoxelObject std430 size mismatch");
+
+// Must match shaders/voxel_dda.comp std430 CoarseCell.
+struct CoarseCell {
+  uint32_t material = 0;                              // 0 = air
+  uint32_t brickPage = 0xFFFFFFFFu;                   // INVALID = no brick page
+};
+static_assert(sizeof(CoarseCell) == 8, "CoarseCell size mismatch");
 
 struct VoxelObject {
   static constexpr uint32_t kFlagNestedMicro = 1u;
   static constexpr uint32_t kFlagEnabled = 2u;
 
   glm::vec3 position{0.0f};
-  glm::quat rotation{1.0f, 0.0f, 0.0f, 0.0f};  // w,x,y,z
+  glm::quat rotation{1.0f, 0.0f, 0.0f, 0.0f};
   float voxelSize = 0.35f;
   int gridSize = 16;
   bool nestedMicro = true;
   bool editable = true;
   bool enabled = true;
 
-  std::vector<uint32_t> voxelsCpu;
-  std::vector<uint32_t> microCpu;
-
+  std::vector<CoarseCell> cells;
   uint32_t voxelOffset = 0;
-  uint32_t microOffset = 0;
 
-  // Maps local meters (grid corner = 0) -> world. Rotate about grid center.
   glm::mat4 objectToWorld() const;
   glm::mat4 worldToObject() const;
 };
@@ -63,39 +67,43 @@ struct VoxelObject {
 class VoxelScene {
 public:
   static constexpr int kMicroRes = 8;
-  static constexpr int kMicroCount = kMicroRes * kMicroRes * kMicroRes;  // 512
-  static constexpr int kMicroWords = kMicroCount / 32;                  // 16
+  static constexpr int kMicroCount = kMicroRes * kMicroRes * kMicroRes;
+  static constexpr int kMicroWords = kMicroCount / 32;
+  static constexpr uint32_t kInvalidBrickPage = 0xFFFFFFFFu;
+  static constexpr uint32_t kPagesPerSlab = 1024u;
+  static constexpr uint32_t kMaxBrickSlabs = 8u;
+  static constexpr uint32_t kWordsPerSlab = kPagesPerSlab * static_cast<uint32_t>(kMicroWords);
 
   void init(GfxDevice& gfx);
   void cleanup(GfxDevice& gfx);
   void update(float dt);
   void handleEditInput(GLFWwindow* window, GfxDevice& gfx);
   void rebuildVoxels(GfxDevice& gfx);
-
-  // Upload object matrices to objectBuffer_ (call each frame from renderer).
   void uploadObjectTransforms(GfxDevice& gfx);
 
   Camera& camera() { return camera_; }
   const Camera& camera() const { return camera_; }
 
   const AllocatedBuffer& voxelBuffer() const { return voxelBuffer_; }
-  const AllocatedBuffer& microBuffer() const { return microBuffer_; }
+  const AllocatedBuffer& dummyBrickSlabBuffer() const { return dummyBrickSlabBuffer_; }
   const AllocatedBuffer& objectBuffer() const { return objectBuffer_; }
+  uint32_t brickSlabCount() const { return static_cast<uint32_t>(slabs_.size()); }
+  const AllocatedBuffer& brickSlabBuffer(uint32_t i) const { return slabs_[i].gpu; }
   uint32_t objectCount() const { return static_cast<uint32_t>(objects_.size()); }
-  const std::vector<GpuVoxelObject>& gpuObjects() const { return objectsGpu_; }
 
   uint32_t voxelCount() const { return static_cast<uint32_t>(voxelsCpu_.size()); }
   uint32_t occupiedCount() const { return occupiedCount_; }
   uint32_t occupiedMicroCount() const { return occupiedMicroCount_; }
+  uint32_t allocatedBrickPages() const { return allocatedPageCount_; }
+  uint32_t brickPoolBytes() const {
+    return static_cast<uint32_t>(slabs_.size() * kWordsPerSlab * sizeof(uint32_t));
+  }
 
-  // Phase 1 ImGui: these control the ground object (objects_[0]).
   int& gridSize() { return gridSize_; }
   float& voxelSize() { return voxelSize_; }
   glm::vec3& lightDir() { return lightDir_; }
   glm::vec3 gridOrigin() const;
-  glm::uvec3 gridDims() const {
-    return glm::uvec3(static_cast<uint32_t>(gridSize_));
-  }
+  glm::uvec3 gridDims() const { return glm::uvec3(static_cast<uint32_t>(gridSize_)); }
 
   float& ambient() { return ambient_; }
   float& aoStrength() { return aoStrength_; }
@@ -117,41 +125,34 @@ public:
   std::optional<VoxelHit> lastHit() const { return lastHit_; }
 
 private:
-  VoxelObject* ground();
-  const VoxelObject* ground() const;
-
   bool inBounds(const VoxelObject& o, const glm::ivec3& p) const;
   uint32_t indexOf(const VoxelObject& o, const glm::ivec3& p) const;
   uint32_t getVoxel(const VoxelObject& o, const glm::ivec3& p) const;
-  bool setVoxelCpu(VoxelObject& o, const glm::ivec3& p, uint32_t material);
+  CoarseCell& cellAt(VoxelObject& o, uint32_t idx);
+  const CoarseCell& cellAt(const VoxelObject& o, uint32_t idx) const;
 
   bool microInBounds(const glm::ivec3& m) const;
   uint32_t microBitIndex(const glm::ivec3& m) const;
   bool getMicro(const VoxelObject& o, const glm::ivec3& coarse, const glm::ivec3& micro) const;
+  bool setVoxelCpu(VoxelObject& o, const glm::ivec3& p, uint32_t material);
   bool setMicroCpu(VoxelObject& o, const glm::ivec3& coarse, const glm::ivec3& micro, bool solid);
-  void fillMicroBrickTemplate(VoxelObject& o, uint32_t coarseIndex);
-  void fillMicroBrickSolid(VoxelObject& o, uint32_t coarseIndex);
-  void clearMicroBrick(VoxelObject& o, uint32_t coarseIndex);
-  bool microBrickEmpty(const VoxelObject& o, uint32_t coarseIndex) const;
-  void syncHasMicroFlag(VoxelObject& o, uint32_t coarseIndex);
+  bool brickPageEmpty(uint32_t page) const;
+  uint32_t allocBrickPage(const uint32_t* words16);
+  void freeBrickPage(uint32_t page);
+  uint32_t ensureBrickPage(VoxelObject& o, uint32_t coarseIndex, bool fillSolid);
   void ensureCoarseBrick(VoxelObject& o, const glm::ivec3& coarse, uint32_t material);
+  void recountOccupiedMicro();
 
-  // Packed in voxelsCpu_/GPU SSBO: low bits = material, bit31 = brick has any micro solid.
-  static constexpr uint32_t kVoxelMatMask = 0x7FFFFFFFu;
-  static constexpr uint32_t kVoxelHasMicroBit = 0x80000000u;
-  static uint32_t materialOf(uint32_t packed) { return packed & kVoxelMatMask; }
-  static bool hasMicroOf(uint32_t packed) { return (packed & kVoxelHasMicroBit) != 0u; }
-  static uint32_t packVoxel(uint32_t material, bool hasMicro) {
-    const uint32_t mat = material & kVoxelMatMask;
-    return (mat == 0u) ? 0u : (mat | (hasMicro ? kVoxelHasMicroBit : 0u));
-  }
-
-  void buildGroundObject(VoxelObject& o) const;
-  void buildSpinnerObject(VoxelObject& o) const;
+  void buildGroundObject(VoxelObject& o);
+  void buildSpinnerObject(VoxelObject& o);
   void packObjectPool();
   void fillGpuObjectRecords();
+  uint32_t* brickPageWords(uint32_t page);
+  const uint32_t* brickPageWords(uint32_t page) const;
+  void ensureSlabCpu(uint32_t slabIndex);
   void ensureGpuBuffers(GfxDevice& gfx);
   void flushObject(GfxDevice& gfx, int objectIndex);
+  void flushDirtyPages(GfxDevice& gfx);
 
   int applyCoarseSphereBrush(VoxelObject& o, const glm::ivec3& center, float radius,
                              uint32_t material, bool placeOnlyEmpty);
@@ -166,15 +167,24 @@ private:
                                        const glm::vec3& Dw) const;
   std::optional<VoxelHit> pickCenterRay() const;
 
+  struct BrickSlab {
+    std::vector<uint32_t> words;
+    AllocatedBuffer gpu{};
+  };
+
   Camera camera_;
   AllocatedBuffer voxelBuffer_{};
-  AllocatedBuffer microBuffer_{};
+  AllocatedBuffer dummyBrickSlabBuffer_{};
   AllocatedBuffer objectBuffer_{};
 
   std::vector<VoxelObject> objects_;
   std::vector<GpuVoxelObject> objectsGpu_;
-  std::vector<uint32_t> voxelsCpu_;  // pooled
-  std::vector<uint32_t> microCpu_;   // pooled
+  std::vector<CoarseCell> voxelsCpu_;
+  std::vector<BrickSlab> slabs_;
+  std::vector<uint32_t> freePages_;
+  std::unordered_set<uint32_t> dirtyPages_;
+  uint32_t nextPage_ = 0;
+  uint32_t allocatedPageCount_ = 0;
 
   int gridSize_ = 48;
   float voxelSize_ = 0.35f;
