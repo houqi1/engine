@@ -62,6 +62,10 @@ layout(set = 0, binding = 5, std430) readonly buffer ObjectBuffer {
     GpuVoxelObject objects[];
 };
 
+layout(set = 0, binding = 6, std430) readonly buffer FinePool {
+    uint fines[];
+} fineSlabs[8];
+
 const uint MODE_SHADED = 0u;
 const uint MODE_ALBEDO = 1u;
 const uint MODE_NORMAL = 2u;
@@ -69,8 +73,12 @@ const uint MODE_STEPS = 3u;
 const uint MODE_COORD = 4u;
 const uint MODE_AO = 5u;
 const uint MICRO_WORDS = 16u;
+const uint BRICK_PAGE_WORDS = 17u;
 const uint PAGES_PER_SLAB = 1024u;
+const uint FINE_WORDS_PER_TABLE = 128u;
+const uint FINE_TABLES_PER_SLAB = 1024u;
 const uint INVALID_BRICK_PAGE = 0xFFFFFFFFu;
+const uint INVALID_FINE_TABLE = 0xFFFFFFFFu;
 const uint FLAG_NESTED = 1u;
 const uint FLAG_ENABLED = 2u;
 const float FLT_MAX = 3.4028235e+38;
@@ -122,7 +130,7 @@ CoarseCell readCell(GpuVoxelObject o, ivec3 p) {
 uint loadBrickWord(uint page, uint wordIndex) {
     uint slab = page / PAGES_PER_SLAB;
     uint local = page % PAGES_PER_SLAB;
-    uint idx = local * MICRO_WORDS + wordIndex;
+    uint idx = local * BRICK_PAGE_WORDS + wordIndex;
     // Unrolled so MoltenVK does not need nonuniform buffer-array indexing.
     if (slab == 0u) return brickSlabs[0].bricks[idx];
     if (slab == 1u) return brickSlabs[1].bricks[idx];
@@ -132,6 +140,20 @@ uint loadBrickWord(uint page, uint wordIndex) {
     if (slab == 5u) return brickSlabs[5].bricks[idx];
     if (slab == 6u) return brickSlabs[6].bricks[idx];
     return brickSlabs[7].bricks[idx];
+}
+
+uint loadFineWord(uint table, uint wordIndex) {
+    uint slab = table / FINE_TABLES_PER_SLAB;
+    uint local = table % FINE_TABLES_PER_SLAB;
+    uint idx = local * FINE_WORDS_PER_TABLE + wordIndex;
+    if (slab == 0u) return fineSlabs[0].fines[idx];
+    if (slab == 1u) return fineSlabs[1].fines[idx];
+    if (slab == 2u) return fineSlabs[2].fines[idx];
+    if (slab == 3u) return fineSlabs[3].fines[idx];
+    if (slab == 4u) return fineSlabs[4].fines[idx];
+    if (slab == 5u) return fineSlabs[5].fines[idx];
+    if (slab == 6u) return fineSlabs[6].fines[idx];
+    return fineSlabs[7].fines[idx];
 }
 
 bool getMicroVoxel(uint page, ivec3 c) {
@@ -145,6 +167,27 @@ bool getMicroVoxel(uint page, ivec3 c) {
     uint bit = uint(c.y * 64 + c.z * 8 + c.x);
     uint word = loadBrickWord(page, bit >> 5);
     return ((word >> (bit & 31u)) & 1u) != 0u;
+}
+
+bool getFineVoxel(uint page, ivec3 micro, ivec3 fine) {
+    if (any(lessThan(fine, ivec3(0))) || any(greaterThanEqual(fine, ivec3(2)))) {
+        return false;
+    }
+    if (!getMicroVoxel(page, micro)) {
+        return false;
+    }
+    if (page == INVALID_BRICK_PAGE) {
+        return true;
+    }
+    uint tid = loadBrickWord(page, 16u);
+    if (tid == INVALID_FINE_TABLE) {
+        return true;
+    }
+    uint microBit = uint(micro.y * 64 + micro.z * 8 + micro.x);
+    uint packed = loadFineWord(tid, microBit >> 2);
+    uint byte = (packed >> ((microBit & 3u) * 8u)) & 255u;
+    uint fbit = uint(fine.y * 4 + fine.z * 2 + fine.x);
+    return ((byte >> fbit) & 1u) != 0u;
 }
 
 bool solidCoarse(GpuVoxelObject o, ivec3 p) {
@@ -167,9 +210,26 @@ bool solidMicroGlobal(GpuVoxelObject o, ivec3 g) {
     return getMicroVoxel(cell.brickPage, local);
 }
 
-bool neighborSolid(GpuVoxelObject o, ivec3 solidPos, ivec3 offset, bool microSpace) {
+bool solidFineGlobal(GpuVoxelObject o, ivec3 g) {
+    ivec3 coarse = g >> 4;
+    ivec3 micro = (g >> 1) & ivec3(7);
+    ivec3 fine = g & ivec3(1);
+    if (!insideGrid(o, coarse)) {
+        return false;
+    }
+    CoarseCell cell = readCell(o, coarse);
+    if (cell.material == 0u) {
+        return false;
+    }
+    return getFineVoxel(cell.brickPage, micro, fine);
+}
+
+bool neighborSolid(GpuVoxelObject o, ivec3 solidPos, ivec3 offset, uint space) {
     ivec3 p = solidPos + offset;
-    return microSpace ? solidMicroGlobal(o, p) : solidCoarse(o, p);
+    if (space == 2u) {
+        return solidFineGlobal(o, p);
+    }
+    return space == 1u ? solidMicroGlobal(o, p) : solidCoarse(o, p);
 }
 
 vec3 albedoForVoxel(uint matId) {
@@ -192,17 +252,17 @@ float vertexAo(vec2 side, float corner) {
     return (side.x + side.y + max(corner, side.x * side.y)) / 3.0;
 }
 
-vec4 voxelAo(GpuVoxelObject o, ivec3 aoPos, ivec3 d1, ivec3 d2, bool microSpace) {
+vec4 voxelAo(GpuVoxelObject o, ivec3 aoPos, ivec3 d1, ivec3 d2, uint space) {
     vec4 side = vec4(
-        float(neighborSolid(o, aoPos, d1, microSpace)),
-        float(neighborSolid(o, aoPos, d2, microSpace)),
-        float(neighborSolid(o, aoPos, -d1, microSpace)),
-        float(neighborSolid(o, aoPos, -d2, microSpace)));
+        float(neighborSolid(o, aoPos, d1, space)),
+        float(neighborSolid(o, aoPos, d2, space)),
+        float(neighborSolid(o, aoPos, -d1, space)),
+        float(neighborSolid(o, aoPos, -d2, space)));
     vec4 corner = vec4(
-        float(neighborSolid(o, aoPos, d1 + d2, microSpace)),
-        float(neighborSolid(o, aoPos, -d1 + d2, microSpace)),
-        float(neighborSolid(o, aoPos, -d1 - d2, microSpace)),
-        float(neighborSolid(o, aoPos, d1 - d2, microSpace)));
+        float(neighborSolid(o, aoPos, d1 + d2, space)),
+        float(neighborSolid(o, aoPos, -d1 + d2, space)),
+        float(neighborSolid(o, aoPos, -d1 - d2, space)),
+        float(neighborSolid(o, aoPos, d1 - d2, space)));
     vec4 ao;
     ao.x = vertexAo(side.xy, corner.x);
     ao.y = vertexAo(side.yz, corner.y);
@@ -216,31 +276,75 @@ vec2 faceUv(bvec3 mask, vec3 uvw) {
                 dot(vec3(mask) * uvw.zxy, vec3(1.0)));
 }
 
-float evalVoxelAo(GpuVoxelObject o, ivec3 solidPos, bvec3 mask, vec3 sgn, vec3 uvw, bool microSpace) {
+float evalVoxelAo(GpuVoxelObject o, ivec3 solidPos, bvec3 mask, vec3 sgn, vec3 uvw, uint space) {
     ivec3 aoPos = solidPos + ivec3(-vec3(mask) * sgn);
     ivec3 d1 = ivec3(vec3(mask).zxy);
     ivec3 d2 = ivec3(vec3(mask).yzx);
-    vec4 corners = voxelAo(o, aoPos, d1, d2, microSpace);
+    vec4 corners = voxelAo(o, aoPos, d1, d2, space);
     vec2 uv = clamp(faceUv(mask, uvw), vec2(0.0), vec2(1.0));
     float ao = mix(mix(corners.z, corners.w, uv.x), mix(corners.y, corners.x, uv.x), uv.y);
     ao = pow(clamp(ao, 0.0, 1.0), max(ubo.aoPower, 1e-3));
     return mix(1.0, ao, clamp(ubo.aoStrength, 0.0, 1.0));
 }
 
-bool traceMicro(uint page, vec3 localPos, vec3 rd, vec3 sgn, bvec3 enterMask,
-                out ivec3 outMicro, out bvec3 outMask, out vec3 outUvw, inout uint outSteps) {
-    localPos = clamp(localPos, vec3(0.0001), vec3(7.9999));
+bool traceFine(uint page, ivec3 micro, vec3 localPos, vec3 rd, vec3 sgn, bvec3 enterMask,
+               out ivec3 outFine, out bvec3 outMask, out vec3 outUvw, out float outT,
+               inout uint outSteps) {
+    localPos = clamp(localPos, vec3(0.0001), vec3(1.9999));
     ivec3 mapPos = ivec3(floor(localPos));
     vec3 deltaDist = abs(1.0 / rd);
     vec3 sideDist = (sgn * (vec3(mapPos) - localPos) + (sgn * 0.5 + 0.5)) * deltaDist;
     bvec3 mask = enterMask;
     ivec3 rayStep = ivec3(sgn);
     outUvw = clamp(localPos - vec3(mapPos), vec3(0.0), vec3(1.0));
+    outT = 0.0;
 
-    if (getMicroVoxel(page, mapPos)) {
-        outMicro = mapPos;
+    if (getFineVoxel(page, micro, mapPos)) {
+        outFine = mapPos;
         outMask = mask;
         return true;
+    }
+
+    for (int i = 0; i < 8; ++i) {
+        outSteps += 1u;
+        mask = stepMask(sideDist);
+        sideDist += vec3(mask) * deltaDist;
+        mapPos += ivec3(vec3(mask)) * rayStep;
+        if (any(lessThan(mapPos, ivec3(0))) || any(greaterThanEqual(mapPos, ivec3(2)))) {
+            return false;
+        }
+        if (getFineVoxel(page, micro, mapPos)) {
+            float tHit = dot(sideDist - deltaDist, vec3(mask));
+            vec3 hitPos = localPos + rd * tHit;
+            outUvw = clamp(hitPos - vec3(mapPos), vec3(0.0), vec3(1.0));
+            outFine = mapPos;
+            outMask = mask;
+            outT = tHit;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool traceMicro(uint page, vec3 localPos, vec3 rd, vec3 sgn, bvec3 enterMask,
+                out ivec3 outMicro, out ivec3 outFine, out bvec3 outMask, out vec3 outUvw,
+                out float outTMicro, out float outTFine, inout uint outSteps) {
+    localPos = clamp(localPos, vec3(0.0001), vec3(7.9999));
+    ivec3 mapPos = ivec3(floor(localPos));
+    vec3 deltaDist = abs(1.0 / rd);
+    vec3 sideDist = (sgn * (vec3(mapPos) - localPos) + (sgn * 0.5 + 0.5)) * deltaDist;
+    bvec3 mask = enterMask;
+    ivec3 rayStep = ivec3(sgn);
+    outTMicro = 0.0;
+    outTFine = 0.0;
+
+    if (getMicroVoxel(page, mapPos)) {
+        vec3 local01 = clamp(localPos - vec3(mapPos), vec3(0.0), vec3(0.9999));
+        if (traceFine(page, mapPos, local01 * 2.0, rd, sgn, mask, outFine, outMask, outUvw, outTFine,
+                      outSteps)) {
+            outMicro = mapPos;
+            return true;
+        }
     }
 
     for (int i = 0; i < 32; ++i) {
@@ -254,10 +358,13 @@ bool traceMicro(uint page, vec3 localPos, vec3 rd, vec3 sgn, bvec3 enterMask,
         if (getMicroVoxel(page, mapPos)) {
             float tHit = dot(sideDist - deltaDist, vec3(mask));
             vec3 hitPos = localPos + rd * tHit;
-            outUvw = clamp(hitPos - vec3(mapPos), vec3(0.0), vec3(1.0));
-            outMicro = mapPos;
-            outMask = mask;
-            return true;
+            vec3 local01 = clamp(hitPos - vec3(mapPos), vec3(0.0), vec3(0.9999));
+            if (traceFine(page, mapPos, local01 * 2.0, rd, sgn, mask, outFine, outMask, outUvw,
+                          outTFine, outSteps)) {
+                outMicro = mapPos;
+                outTMicro = tHit;
+                return true;
+            }
         }
     }
     return false;
@@ -327,7 +434,9 @@ ObjectHit traverseObject(GpuVoxelObject o, vec3 Ow, vec3 Dw) {
     bool hit = false;
     uint matId = 0u;
     ivec3 microPos = ivec3(0);
+    ivec3 finePos = ivec3(0);
     bool usedMicro = false;
+    bool usedFine = false;
     vec3 hitUvw = vec3(0.5);
     float tHitLocal = tEnter;
     uint steps = 0u;
@@ -368,16 +477,21 @@ ObjectHit traverseObject(GpuVoxelObject o, vec3 Ow, vec3 Dw) {
             }
 
             ivec3 hitMicro;
+            ivec3 hitFine;
             bvec3 microMask;
             vec3 microUvw;
-            if (traceMicro(cell.brickPage, local01 * 8.0, rd, sgn, mask, hitMicro, microMask, microUvw,
-                           steps)) {
+            float tMicro = 0.0;
+            float tFine = 0.0;
+            if (traceMicro(cell.brickPage, local01 * 8.0, rd, sgn, mask, hitMicro, hitFine, microMask,
+                           microUvw, tMicro, tFine, steps)) {
                 hit = true;
                 usedMicro = true;
+                usedFine = true;
                 microPos = hitMicro;
+                finePos = hitFine;
                 mask = microMask;
                 hitUvw = microUvw;
-                tHitLocal = tCoarse;
+                tHitLocal = tCoarse + tMicro / 8.0 + tFine / 16.0;
                 break;
             }
         }
@@ -402,8 +516,10 @@ ObjectHit traverseObject(GpuVoxelObject o, vec3 Ow, vec3 Dw) {
     vec3 normalWorld = normalize(mat3(o.objectToWorld) * normalLocal);
     vec3 albedo = albedoForVoxel(matId);
 
-    ivec3 solidPos = usedMicro ? (mapPos * 8 + microPos) : mapPos;
-    float ao = evalVoxelAo(o, solidPos, mask, sgn, hitUvw, usedMicro);
+    ivec3 solidPos = usedFine ? (mapPos * 16 + microPos * 2 + finePos)
+                              : (usedMicro ? (mapPos * 8 + microPos) : mapPos);
+    uint aoSpace = usedFine ? 2u : (usedMicro ? 1u : 0u);
+    float ao = evalVoxelAo(o, solidPos, mask, sgn, hitUvw, aoSpace);
 
     vec3 hitLocalMeters = (ro + rd * tHitLocal) * o.voxelSize;
     vec3 hitWorld = (o.objectToWorld * vec4(hitLocalMeters, 1.0)).xyz;
@@ -415,8 +531,9 @@ ObjectHit traverseObject(GpuVoxelObject o, vec3 Ow, vec3 Dw) {
     } else if (ubo.renderMode == MODE_NORMAL) {
         result.color = normalWorld * 0.5 + 0.5;
     } else if (ubo.renderMode == MODE_COORD) {
-        result.color = usedMicro ? (vec3(microPos) / 7.0)
-                                 : (vec3(mapPos) / max(vec3(o.gridSize - uvec3(1u)), vec3(1.0)));
+        result.color = usedFine ? (vec3(finePos) * 0.5)
+                                : (usedMicro ? (vec3(microPos) / 7.0)
+                                             : (vec3(mapPos) / max(vec3(o.gridSize - uvec3(1u)), vec3(1.0))));
     } else if (ubo.renderMode == MODE_AO) {
         result.color = vec3(ao);
     } else {

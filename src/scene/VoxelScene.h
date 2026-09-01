@@ -18,9 +18,11 @@ class GfxDevice;
 struct VoxelHit {
   glm::ivec3 cell{0};
   glm::ivec3 micro{0};
+  glm::ivec3 fine{0};
   glm::ivec3 normal{0};
   uint32_t material = 0;
   bool hasMicro = false;
+  bool hasFine = false;
   int objectIndex = 0;
 };
 
@@ -69,10 +71,21 @@ public:
   static constexpr int kMicroRes = 8;
   static constexpr int kMicroCount = kMicroRes * kMicroRes * kMicroRes;
   static constexpr int kMicroWords = kMicroCount / 32;
+  static constexpr int kBrickPageWords = kMicroWords + 1;  // occupancy + fineTableId
+  static constexpr int kFineRes = 2;
+  static constexpr int kFineCount = kFineRes * kFineRes * kFineRes;
+  static constexpr int kFineTableBytes = kMicroCount;  // one uint8 per 8^3 micro
+  static constexpr int kFineWordsPerTable = kFineTableBytes / 4;
   static constexpr uint32_t kInvalidBrickPage = 0xFFFFFFFFu;
+  static constexpr uint32_t kInvalidFineTable = 0xFFFFFFFFu;
   static constexpr uint32_t kPagesPerSlab = 1024u;
   static constexpr uint32_t kMaxBrickSlabs = 8u;
-  static constexpr uint32_t kWordsPerSlab = kPagesPerSlab * static_cast<uint32_t>(kMicroWords);
+  static constexpr uint32_t kWordsPerSlab =
+      kPagesPerSlab * static_cast<uint32_t>(kBrickPageWords);
+  static constexpr uint32_t kFineTablesPerSlab = 1024u;
+  static constexpr uint32_t kMaxFineSlabs = 8u;
+  static constexpr uint32_t kFineWordsPerSlab =
+      kFineTablesPerSlab * static_cast<uint32_t>(kFineWordsPerTable);
 
   void init(GfxDevice& gfx);
   void cleanup(GfxDevice& gfx);
@@ -86,17 +99,25 @@ public:
 
   const AllocatedBuffer& voxelBuffer() const { return voxelBuffer_; }
   const AllocatedBuffer& dummyBrickSlabBuffer() const { return dummyBrickSlabBuffer_; }
+  const AllocatedBuffer& dummyFineSlabBuffer() const { return dummyFineSlabBuffer_; }
   const AllocatedBuffer& objectBuffer() const { return objectBuffer_; }
   uint32_t brickSlabCount() const { return static_cast<uint32_t>(slabs_.size()); }
   const AllocatedBuffer& brickSlabBuffer(uint32_t i) const { return slabs_[i].gpu; }
+  uint32_t fineSlabCount() const { return static_cast<uint32_t>(fineSlabs_.size()); }
+  const AllocatedBuffer& fineSlabBuffer(uint32_t i) const { return fineSlabs_[i].gpu; }
   uint32_t objectCount() const { return static_cast<uint32_t>(objects_.size()); }
 
   uint32_t voxelCount() const { return static_cast<uint32_t>(voxelsCpu_.size()); }
   uint32_t occupiedCount() const { return occupiedCount_; }
   uint32_t occupiedMicroCount() const { return occupiedMicroCount_; }
+  uint32_t occupiedFineCount() const { return occupiedFineCount_; }
   uint32_t allocatedBrickPages() const { return allocatedPageCount_; }
+  uint32_t allocatedFineTables() const { return allocatedFineCount_; }
   uint32_t brickPoolBytes() const {
     return static_cast<uint32_t>(slabs_.size() * kWordsPerSlab * sizeof(uint32_t));
+  }
+  uint32_t finePoolBytes() const {
+    return static_cast<uint32_t>(fineSlabs_.size() * kFineWordsPerSlab * sizeof(uint32_t));
   }
 
   int& gridSize() { return gridSize_; }
@@ -132,16 +153,26 @@ private:
   const CoarseCell& cellAt(const VoxelObject& o, uint32_t idx) const;
 
   bool microInBounds(const glm::ivec3& m) const;
+  bool fineInBounds(const glm::ivec3& f) const;
   uint32_t microBitIndex(const glm::ivec3& m) const;
+  uint32_t fineBitIndex(const glm::ivec3& f) const;
   bool getMicro(const VoxelObject& o, const glm::ivec3& coarse, const glm::ivec3& micro) const;
+  bool getFine(const VoxelObject& o, const glm::ivec3& coarse, const glm::ivec3& micro,
+               const glm::ivec3& fine) const;
   bool setVoxelCpu(VoxelObject& o, const glm::ivec3& p, uint32_t material);
   bool setMicroCpu(VoxelObject& o, const glm::ivec3& coarse, const glm::ivec3& micro, bool solid);
+  bool setFineCpu(VoxelObject& o, const glm::ivec3& coarse, const glm::ivec3& micro,
+                  const glm::ivec3& fine, bool solid);
   bool brickPageEmpty(uint32_t page) const;
   uint32_t allocBrickPage(const uint32_t* words16);
   void freeBrickPage(uint32_t page);
+  uint32_t allocFineTable(uint32_t page);
+  void freeFineTable(uint32_t table);
   uint32_t ensureBrickPage(VoxelObject& o, uint32_t coarseIndex, bool fillSolid);
+  uint32_t ensureFineTable(uint32_t page);
   void ensureCoarseBrick(VoxelObject& o, const glm::ivec3& coarse, uint32_t material);
   void recountOccupiedMicro();
+  void recountOccupiedFine();
 
   void buildGroundObject(VoxelObject& o);
   void buildSpinnerObject(VoxelObject& o);
@@ -149,15 +180,23 @@ private:
   void fillGpuObjectRecords();
   uint32_t* brickPageWords(uint32_t page);
   const uint32_t* brickPageWords(uint32_t page) const;
+  uint32_t* fineTableWords(uint32_t table);
+  const uint32_t* fineTableWords(uint32_t table) const;
+  uint8_t* fineTableBytes(uint32_t table);
+  const uint8_t* fineTableBytes(uint32_t table) const;
   void ensureSlabCpu(uint32_t slabIndex);
+  void ensureFineSlabCpu(uint32_t slabIndex);
   void ensureGpuBuffers(GfxDevice& gfx);
   void flushObject(GfxDevice& gfx, int objectIndex);
   void flushDirtyPages(GfxDevice& gfx);
+  void flushDirtyFineTables(GfxDevice& gfx);
 
   int applyCoarseSphereBrush(VoxelObject& o, const glm::ivec3& center, float radius,
                              uint32_t material, bool placeOnlyEmpty);
   int applyMicroSphereBrush(VoxelObject& o, const glm::ivec3& coarse, const glm::ivec3& micro,
                             float radius, bool solid, uint32_t placeMaterial);
+  int applyFineSphereBrush(VoxelObject& o, const glm::ivec3& coarse, const glm::ivec3& micro,
+                           const glm::ivec3& fine, float radius, bool solid, uint32_t placeMaterial);
 
   struct PickResult {
     VoxelHit hit{};
@@ -171,20 +210,30 @@ private:
     std::vector<uint32_t> words;
     AllocatedBuffer gpu{};
   };
+  struct FineSlab {
+    std::vector<uint32_t> words;
+    AllocatedBuffer gpu{};
+  };
 
   Camera camera_;
   AllocatedBuffer voxelBuffer_{};
   AllocatedBuffer dummyBrickSlabBuffer_{};
+  AllocatedBuffer dummyFineSlabBuffer_{};
   AllocatedBuffer objectBuffer_{};
 
   std::vector<VoxelObject> objects_;
   std::vector<GpuVoxelObject> objectsGpu_;
   std::vector<CoarseCell> voxelsCpu_;
   std::vector<BrickSlab> slabs_;
+  std::vector<FineSlab> fineSlabs_;
   std::vector<uint32_t> freePages_;
+  std::vector<uint32_t> freeFineTables_;
   std::unordered_set<uint32_t> dirtyPages_;
+  std::unordered_set<uint32_t> dirtyFineTables_;
   uint32_t nextPage_ = 0;
+  uint32_t nextFineTable_ = 0;
   uint32_t allocatedPageCount_ = 0;
+  uint32_t allocatedFineCount_ = 0;
 
   int gridSize_ = 48;
   float voxelSize_ = 0.35f;
@@ -200,6 +249,7 @@ private:
   uint32_t maxSteps_ = 192;
   uint32_t occupiedCount_ = 0;
   uint32_t occupiedMicroCount_ = 0;
+  uint32_t occupiedFineCount_ = 0;
   int renderMode_ = 0;
   int brushMaterial_ = 1;
   float brushRadius_ = 0.0f;

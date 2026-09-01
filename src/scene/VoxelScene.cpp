@@ -86,8 +86,12 @@ void VoxelScene::init(GfxDevice& gfx) {
 void VoxelScene::cleanup(GfxDevice& gfx) {
   gfx.destroyBuffer(voxelBuffer_);
   gfx.destroyBuffer(dummyBrickSlabBuffer_);
+  gfx.destroyBuffer(dummyFineSlabBuffer_);
   gfx.destroyBuffer(objectBuffer_);
   for (BrickSlab& s : slabs_) {
+    gfx.destroyBuffer(s.gpu);
+  }
+  for (FineSlab& s : fineSlabs_) {
     gfx.destroyBuffer(s.gpu);
   }
   TextureFactory::destroy(gfx, sky_);
@@ -95,12 +99,18 @@ void VoxelScene::cleanup(GfxDevice& gfx) {
   objectsGpu_.clear();
   voxelsCpu_.clear();
   slabs_.clear();
+  fineSlabs_.clear();
   freePages_.clear();
+  freeFineTables_.clear();
   dirtyPages_.clear();
+  dirtyFineTables_.clear();
   nextPage_ = 0;
+  nextFineTable_ = 0;
   allocatedPageCount_ = 0;
+  allocatedFineCount_ = 0;
   occupiedCount_ = 0;
   occupiedMicroCount_ = 0;
+  occupiedFineCount_ = 0;
   lastHit_.reset();
 }
 
@@ -134,6 +144,10 @@ bool VoxelScene::microInBounds(const glm::ivec3& m) const {
   return m.x >= 0 && m.y >= 0 && m.z >= 0 && m.x < kMicroRes && m.y < kMicroRes && m.z < kMicroRes;
 }
 
+bool VoxelScene::fineInBounds(const glm::ivec3& f) const {
+  return f.x >= 0 && f.y >= 0 && f.z >= 0 && f.x < kFineRes && f.y < kFineRes && f.z < kFineRes;
+}
+
 uint32_t VoxelScene::indexOf(const VoxelObject& o, const glm::ivec3& p) const {
   const uint32_t n = static_cast<uint32_t>(o.gridSize);
   return static_cast<uint32_t>(p.x) + static_cast<uint32_t>(p.y) * n +
@@ -142,6 +156,10 @@ uint32_t VoxelScene::indexOf(const VoxelObject& o, const glm::ivec3& p) const {
 
 uint32_t VoxelScene::microBitIndex(const glm::ivec3& m) const {
   return static_cast<uint32_t>(m.y * 64 + m.z * 8 + m.x);
+}
+
+uint32_t VoxelScene::fineBitIndex(const glm::ivec3& f) const {
+  return static_cast<uint32_t>(f.y * 4 + f.z * 2 + f.x);
 }
 
 CoarseCell& VoxelScene::cellAt(VoxelObject& o, uint32_t idx) {
@@ -170,17 +188,51 @@ void VoxelScene::ensureSlabCpu(uint32_t slabIndex) {
   }
 }
 
+void VoxelScene::ensureFineSlabCpu(uint32_t slabIndex) {
+  while (fineSlabs_.size() <= slabIndex) {
+    if (fineSlabs_.size() >= kMaxFineSlabs) {
+      throw std::runtime_error("Fine slab limit reached");
+    }
+    FineSlab s;
+    s.words.assign(kFineWordsPerSlab, 0u);
+    fineSlabs_.push_back(std::move(s));
+  }
+}
+
 uint32_t* VoxelScene::brickPageWords(uint32_t page) {
   const uint32_t si = page / kPagesPerSlab;
   const uint32_t li = page % kPagesPerSlab;
   ensureSlabCpu(si);
-  return slabs_[si].words.data() + static_cast<size_t>(li) * static_cast<size_t>(kMicroWords);
+  return slabs_[si].words.data() + static_cast<size_t>(li) * static_cast<size_t>(kBrickPageWords);
 }
 
 const uint32_t* VoxelScene::brickPageWords(uint32_t page) const {
   const uint32_t si = page / kPagesPerSlab;
   const uint32_t li = page % kPagesPerSlab;
-  return slabs_[si].words.data() + static_cast<size_t>(li) * static_cast<size_t>(kMicroWords);
+  return slabs_[si].words.data() + static_cast<size_t>(li) * static_cast<size_t>(kBrickPageWords);
+}
+
+uint32_t* VoxelScene::fineTableWords(uint32_t table) {
+  const uint32_t si = table / kFineTablesPerSlab;
+  const uint32_t li = table % kFineTablesPerSlab;
+  ensureFineSlabCpu(si);
+  return fineSlabs_[si].words.data() +
+         static_cast<size_t>(li) * static_cast<size_t>(kFineWordsPerTable);
+}
+
+const uint32_t* VoxelScene::fineTableWords(uint32_t table) const {
+  const uint32_t si = table / kFineTablesPerSlab;
+  const uint32_t li = table % kFineTablesPerSlab;
+  return fineSlabs_[si].words.data() +
+         static_cast<size_t>(li) * static_cast<size_t>(kFineWordsPerTable);
+}
+
+uint8_t* VoxelScene::fineTableBytes(uint32_t table) {
+  return reinterpret_cast<uint8_t*>(fineTableWords(table));
+}
+
+const uint8_t* VoxelScene::fineTableBytes(uint32_t table) const {
+  return reinterpret_cast<const uint8_t*>(fineTableWords(table));
 }
 
 bool VoxelScene::brickPageEmpty(uint32_t page) const {
@@ -219,6 +271,35 @@ void VoxelScene::recountOccupiedMicro() {
   }
 }
 
+void VoxelScene::recountOccupiedFine() {
+  occupiedFineCount_ = 0;
+  std::vector<uint8_t> freeP(nextPage_, 0);
+  for (uint32_t p : freePages_) {
+    if (p < nextPage_) {
+      freeP[p] = 1;
+    }
+  }
+  for (uint32_t p = 0; p < nextPage_; ++p) {
+    if (freeP[p]) {
+      continue;
+    }
+    const uint32_t* w = brickPageWords(p);
+    const uint32_t tid = w[kMicroWords];
+    if (tid == kInvalidFineTable) {
+      uint32_t bits = 0;
+      for (int i = 0; i < kMicroWords; ++i) {
+        bits += static_cast<uint32_t>(std::popcount(w[i]));
+      }
+      occupiedFineCount_ += bits * static_cast<uint32_t>(kFineCount);
+      continue;
+    }
+    const uint8_t* bytes = fineTableBytes(tid);
+    for (int i = 0; i < kFineTableBytes; ++i) {
+      occupiedFineCount_ += static_cast<uint32_t>(std::popcount(static_cast<unsigned>(bytes[i])));
+    }
+  }
+}
+
 uint32_t VoxelScene::allocBrickPage(const uint32_t* words16) {
   uint32_t page = kInvalidBrickPage;
   if (!freePages_.empty()) {
@@ -236,6 +317,7 @@ uint32_t VoxelScene::allocBrickPage(const uint32_t* words16) {
   for (int i = 0; i < kMicroWords; ++i) {
     dst[i] = words16[i];
   }
+  dst[kMicroWords] = kInvalidFineTable;
   dirtyPages_.insert(page);
   ++allocatedPageCount_;
   return page;
@@ -250,14 +332,73 @@ void VoxelScene::freeBrickPage(uint32_t page) {
     return;
   }
   uint32_t* w = brickPageWords(page);
-  for (int i = 0; i < kMicroWords; ++i) {
+  if (w[kMicroWords] != kInvalidFineTable) {
+    freeFineTable(w[kMicroWords]);
+  }
+  for (int i = 0; i < kBrickPageWords; ++i) {
     w[i] = 0u;
   }
+  w[kMicroWords] = kInvalidFineTable;
   freePages_.push_back(page);
   dirtyPages_.insert(page);
   if (allocatedPageCount_ > 0) {
     --allocatedPageCount_;
   }
+}
+
+uint32_t VoxelScene::allocFineTable(uint32_t page) {
+  uint32_t table = kInvalidFineTable;
+  if (!freeFineTables_.empty()) {
+    table = freeFineTables_.back();
+    freeFineTables_.pop_back();
+  } else {
+    table = nextFineTable_++;
+    if (table / kFineTablesPerSlab >= kMaxFineSlabs) {
+      --nextFineTable_;
+      throw std::runtime_error("Fine slab limit reached");
+    }
+    ensureFineSlabCpu(table / kFineTablesPerSlab);
+  }
+  uint8_t* bytes = fineTableBytes(table);
+  const uint32_t* occ = brickPageWords(page);
+  for (int i = 0; i < kMicroCount; ++i) {
+    const uint32_t word = static_cast<uint32_t>(i) / 32u;
+    const uint32_t mask = 1u << (static_cast<uint32_t>(i) % 32u);
+    bytes[i] = (occ[word] & mask) ? 0xFFu : 0x00u;
+  }
+  dirtyFineTables_.insert(table);
+  ++allocatedFineCount_;
+  return table;
+}
+
+void VoxelScene::freeFineTable(uint32_t table) {
+  if (table == kInvalidFineTable) {
+    return;
+  }
+  const uint32_t si = table / kFineTablesPerSlab;
+  if (si >= fineSlabs_.size()) {
+    return;
+  }
+  uint32_t* w = fineTableWords(table);
+  for (int i = 0; i < kFineWordsPerTable; ++i) {
+    w[i] = 0u;
+  }
+  freeFineTables_.push_back(table);
+  dirtyFineTables_.insert(table);
+  if (allocatedFineCount_ > 0) {
+    --allocatedFineCount_;
+  }
+}
+
+uint32_t VoxelScene::ensureFineTable(uint32_t page) {
+  uint32_t* w = brickPageWords(page);
+  if (w[kMicroWords] != kInvalidFineTable) {
+    return w[kMicroWords];
+  }
+  const uint32_t tid = allocFineTable(page);
+  w[kMicroWords] = tid;
+  dirtyPages_.insert(page);
+  return tid;
 }
 
 uint32_t VoxelScene::ensureBrickPage(VoxelObject& o, uint32_t coarseIndex, bool fillSolid) {
@@ -290,6 +431,24 @@ bool VoxelScene::getMicro(const VoxelObject& o, const glm::ivec3& coarse,
   }
   const uint32_t* w = brickPageWords(c.brickPage);
   return (w[word] & mask) != 0u;
+}
+
+bool VoxelScene::getFine(const VoxelObject& o, const glm::ivec3& coarse, const glm::ivec3& micro,
+                         const glm::ivec3& fine) const {
+  if (!fineInBounds(fine) || !getMicro(o, coarse, micro)) {
+    return false;
+  }
+  const CoarseCell& c = cellAt(o, indexOf(o, coarse));
+  if (c.brickPage == kInvalidBrickPage) {
+    return true;
+  }
+  const uint32_t* w = brickPageWords(c.brickPage);
+  const uint32_t tid = w[kMicroWords];
+  if (tid == kInvalidFineTable) {
+    return true;
+  }
+  const uint8_t byte = fineTableBytes(tid)[microBitIndex(micro)];
+  return (byte & (1u << fineBitIndex(fine))) != 0u;
 }
 
 bool VoxelScene::setVoxelCpu(VoxelObject& o, const glm::ivec3& p, uint32_t material) {
@@ -370,6 +529,62 @@ bool VoxelScene::setMicroCpu(VoxelObject& o, const glm::ivec3& coarse, const glm
   return true;
 }
 
+bool VoxelScene::setFineCpu(VoxelObject& o, const glm::ivec3& coarse, const glm::ivec3& micro,
+                            const glm::ivec3& fine, bool solid) {
+  if (!inBounds(o, coarse) || !microInBounds(micro) || !fineInBounds(fine) || o.cells.empty()) {
+    return false;
+  }
+  const uint32_t idx = indexOf(o, coarse);
+  CoarseCell& c = o.cells[idx];
+  if (c.material == 0u && !solid) {
+    return false;
+  }
+
+  const bool wasUniformSolid = (c.material != 0u && c.brickPage == kInvalidBrickPage);
+  if (wasUniformSolid && solid) {
+    return false;
+  }
+  if (wasUniformSolid && !solid) {
+    ensureBrickPage(o, idx, true);
+  }
+  if (c.brickPage == kInvalidBrickPage) {
+    return false;
+  }
+
+  const uint32_t page = c.brickPage;
+  const bool microWas = getMicro(o, coarse, micro);
+  if (!microWas && !solid) {
+    return false;
+  }
+
+  const uint32_t* hdr = brickPageWords(page);
+  if (microWas && solid && hdr[kMicroWords] == kInvalidFineTable) {
+    return false;
+  }
+
+  // Snapshot occupancy into a table before flipping this micro's bit.
+  const uint32_t tid = ensureFineTable(page);
+  uint8_t& byte = fineTableBytes(tid)[microBitIndex(micro)];
+  const uint8_t fmask = static_cast<uint8_t>(1u << fineBitIndex(fine));
+  const bool was = (byte & fmask) != 0u;
+  if (was == solid) {
+    return false;
+  }
+  if (solid) {
+    byte |= fmask;
+    if (!microWas) {
+      setMicroCpu(o, coarse, micro, true);
+    }
+  } else {
+    byte = static_cast<uint8_t>(byte & ~fmask);
+    if (byte == 0u) {
+      setMicroCpu(o, coarse, micro, false);
+    }
+  }
+  dirtyFineTables_.insert(tid);
+  return true;
+}
+
 void VoxelScene::ensureCoarseBrick(VoxelObject& o, const glm::ivec3& coarse, uint32_t material) {
   if (!inBounds(o, coarse)) {
     return;
@@ -396,6 +611,7 @@ void VoxelScene::packObjectPool() {
     }
   }
   recountOccupiedMicro();
+  recountOccupiedFine();
 }
 
 void VoxelScene::fillGpuObjectRecords() {
@@ -426,6 +642,7 @@ void VoxelScene::fillGpuObjectRecords() {
 void VoxelScene::ensureGpuBuffers(GfxDevice& gfx) {
   const VkDeviceSize voxelBytes = sizeof(CoarseCell) * std::max<size_t>(voxelsCpu_.size(), 1);
   const VkDeviceSize slabBytes = sizeof(uint32_t) * kWordsPerSlab;
+  const VkDeviceSize fineSlabBytes = sizeof(uint32_t) * kFineWordsPerSlab;
   const VkDeviceSize objectBytes = sizeof(GpuVoxelObject) * std::max<size_t>(objectsGpu_.size(), 1);
 
   if (voxelBuffer_.buffer == VK_NULL_HANDLE || voxelBuffer_.size < voxelBytes) {
@@ -441,12 +658,27 @@ void VoxelScene::ensureGpuBuffers(GfxDevice& gfx) {
     std::vector<uint32_t> zeros(kWordsPerSlab, 0u);
     gfx.uploadToBuffer(dummyBrickSlabBuffer_, zeros.data(), slabBytes);
   }
+  if (dummyFineSlabBuffer_.buffer == VK_NULL_HANDLE) {
+    dummyFineSlabBuffer_ = gfx.createBuffer(fineSlabBytes,
+                                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                            VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+    std::vector<uint32_t> zeros(kFineWordsPerSlab, 0u);
+    gfx.uploadToBuffer(dummyFineSlabBuffer_, zeros.data(), fineSlabBytes);
+  }
   for (BrickSlab& s : slabs_) {
     if (s.gpu.buffer == VK_NULL_HANDLE) {
       s.gpu = gfx.createBuffer(slabBytes,
                                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                                VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
       gfx.uploadToBuffer(s.gpu, s.words.data(), slabBytes);
+    }
+  }
+  for (FineSlab& s : fineSlabs_) {
+    if (s.gpu.buffer == VK_NULL_HANDLE) {
+      s.gpu = gfx.createBuffer(fineSlabBytes,
+                               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                               VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+      gfx.uploadToBuffer(s.gpu, s.words.data(), fineSlabBytes);
     }
   }
   if (objectBuffer_.buffer == VK_NULL_HANDLE || objectBuffer_.size < objectBytes) {
@@ -465,11 +697,27 @@ void VoxelScene::flushDirtyPages(GfxDevice& gfx) {
       continue;
     }
     const uint32_t* src = brickPageWords(page);
-    gfx.uploadToBuffer(slabs_[si].gpu, src, sizeof(uint32_t) * static_cast<size_t>(kMicroWords),
+    gfx.uploadToBuffer(slabs_[si].gpu, src, sizeof(uint32_t) * static_cast<size_t>(kBrickPageWords),
                        sizeof(uint32_t) * static_cast<VkDeviceSize>(li) *
-                           static_cast<VkDeviceSize>(kMicroWords));
+                           static_cast<VkDeviceSize>(kBrickPageWords));
   }
   dirtyPages_.clear();
+}
+
+void VoxelScene::flushDirtyFineTables(GfxDevice& gfx) {
+  for (uint32_t table : dirtyFineTables_) {
+    const uint32_t si = table / kFineTablesPerSlab;
+    const uint32_t li = table % kFineTablesPerSlab;
+    if (si >= fineSlabs_.size() || fineSlabs_[si].gpu.buffer == VK_NULL_HANDLE) {
+      continue;
+    }
+    const uint32_t* src = fineTableWords(table);
+    gfx.uploadToBuffer(fineSlabs_[si].gpu, src,
+                       sizeof(uint32_t) * static_cast<size_t>(kFineWordsPerTable),
+                       sizeof(uint32_t) * static_cast<VkDeviceSize>(li) *
+                           static_cast<VkDeviceSize>(kFineWordsPerTable));
+  }
+  dirtyFineTables_.clear();
 }
 
 void VoxelScene::flushObject(GfxDevice& gfx, int objectIndex) {
@@ -486,6 +734,7 @@ void VoxelScene::flushObject(GfxDevice& gfx, int objectIndex) {
   }
   ensureGpuBuffers(gfx);
   flushDirtyPages(gfx);
+  flushDirtyFineTables(gfx);
 }
 
 void VoxelScene::uploadObjectTransforms(GfxDevice& gfx) {
@@ -570,11 +819,19 @@ void VoxelScene::rebuildVoxels(GfxDevice& gfx) {
   for (BrickSlab& s : slabs_) {
     gfx.destroyBuffer(s.gpu);
   }
+  for (FineSlab& s : fineSlabs_) {
+    gfx.destroyBuffer(s.gpu);
+  }
   slabs_.clear();
+  fineSlabs_.clear();
   freePages_.clear();
+  freeFineTables_.clear();
   dirtyPages_.clear();
+  dirtyFineTables_.clear();
   nextPage_ = 0;
+  nextFineTable_ = 0;
   allocatedPageCount_ = 0;
+  allocatedFineCount_ = 0;
 
   objects_.clear();
   objects_.resize(2);
@@ -682,6 +939,68 @@ int VoxelScene::applyMicroSphereBrush(VoxelObject& o, const glm::ivec3& coarse,
   return changed;
 }
 
+int VoxelScene::applyFineSphereBrush(VoxelObject& o, const glm::ivec3& coarse,
+                                     const glm::ivec3& micro, const glm::ivec3& fine, float radius,
+                                     bool solid, uint32_t placeMaterial) {
+  const float r = std::max(0.0f, radius);
+  const int extent = static_cast<int>(std::ceil(r));
+  const float r2 = r * r;
+  int changed = 0;
+  const glm::ivec3 absCenter =
+      coarse * (kMicroRes * kFineRes) + micro * kFineRes + fine;
+
+  auto divFloor = [](int a, int b) {
+    int q = a / b;
+    int rem = a % b;
+    if (rem != 0 && ((rem < 0) != (b < 0))) {
+      --q;
+    }
+    return q;
+  };
+
+  for (int dz = -extent; dz <= extent; ++dz) {
+    for (int dy = -extent; dy <= extent; ++dy) {
+      for (int dx = -extent; dx <= extent; ++dx) {
+        const float dist2 = static_cast<float>(dx * dx + dy * dy + dz * dz);
+        if (r <= 0.0f) {
+          if (dx || dy || dz) {
+            continue;
+          }
+        } else if (dist2 > r2) {
+          continue;
+        }
+
+        const glm::ivec3 absFine = absCenter + glm::ivec3(dx, dy, dz);
+        const int cellStride = kMicroRes * kFineRes;
+        glm::ivec3 c(divFloor(absFine.x, cellStride), divFloor(absFine.y, cellStride),
+                     divFloor(absFine.z, cellStride));
+        glm::ivec3 rem = absFine - c * cellStride;
+        glm::ivec3 m(divFloor(rem.x, kFineRes), divFloor(rem.y, kFineRes),
+                     divFloor(rem.z, kFineRes));
+        glm::ivec3 f = rem - m * kFineRes;
+        if (!inBounds(o, c) || !microInBounds(m) || !fineInBounds(f)) {
+          continue;
+        }
+
+        if (solid) {
+          ensureCoarseBrick(o, c, placeMaterial);
+          if (setFineCpu(o, c, m, f, true)) {
+            ++changed;
+          }
+        } else {
+          if (getVoxel(o, c) == 0) {
+            continue;
+          }
+          if (setFineCpu(o, c, m, f, false)) {
+            ++changed;
+          }
+        }
+      }
+    }
+  }
+  return changed;
+}
+
 std::optional<VoxelScene::PickResult> VoxelScene::pickObject(const VoxelObject& o, int objectIndex,
                                                             const glm::vec3& Ow,
                                                             const glm::vec3& Dw) const {
@@ -733,8 +1052,9 @@ std::optional<VoxelScene::PickResult> VoxelScene::pickObject(const VoxelObject& 
 
   const bool useNested = o.nestedMicro && nestedMicroVoxels_;
 
-  auto makeHit = [&](const glm::ivec3& cell, const glm::ivec3& micro, uint32_t mat, glm::bvec3 msk,
-                     bool hasMicro, float tLocal) -> PickResult {
+  auto makeHit = [&](const glm::ivec3& cell, const glm::ivec3& micro, const glm::ivec3& fine,
+                     uint32_t mat, glm::bvec3 msk, bool hasMicro, bool hasFine,
+                     float tLocal) -> PickResult {
     const glm::vec3 hitLocalMeters = (ro + rd * tLocal) * o.voxelSize;
     const glm::vec3 hitWorld = glm::vec3(o.objectToWorld() * glm::vec4(hitLocalMeters, 1.0f));
     const float tWorld = glm::dot(hitWorld - Ow, Dw);
@@ -742,9 +1062,11 @@ std::optional<VoxelScene::PickResult> VoxelScene::pickObject(const VoxelObject& 
     VoxelHit hit{};
     hit.cell = cell;
     hit.micro = micro;
+    hit.fine = fine;
     hit.material = mat;
     hit.normal = glm::ivec3(-glm::vec3(msk) * sgn);
     hit.hasMicro = hasMicro;
+    hit.hasFine = hasFine;
     hit.objectIndex = objectIndex;
     return PickResult{hit, tWorld};
   };
@@ -762,7 +1084,7 @@ std::optional<VoxelScene::PickResult> VoxelScene::pickObject(const VoxelObject& 
         if (mapPos != startPos) {
           tHit = glm::dot(sideDist - deltaDist, glm::vec3(mask));
         }
-        return makeHit(mapPos, glm::ivec3(0), mat, mask, false, tHit);
+        return makeHit(mapPos, glm::ivec3(0), glm::ivec3(0), mat, mask, false, false, tHit);
       }
 
       glm::vec3 local01;
@@ -791,9 +1113,42 @@ std::optional<VoxelScene::PickResult> VoxelScene::pickObject(const VoxelObject& 
         return tCoarse + tMicroLocal / 8.0f;
       };
 
+      auto tryFine = [&](const glm::ivec3& mpos, glm::bvec3 enterMask, const glm::vec3& mLocal,
+                         float tMicroEnter) -> std::optional<PickResult> {
+        glm::vec3 fineLocal = glm::clamp((mLocal - glm::vec3(mpos)) * 2.0f, glm::vec3(0.0001f),
+                                         glm::vec3(1.9999f));
+        glm::ivec3 finePos = glm::ivec3(glm::floor(fineLocal));
+        glm::vec3 fineSide =
+            (sgn * (glm::vec3(finePos) - fineLocal) + (sgn * 0.5f + 0.5f)) * deltaDist;
+        glm::bvec3 fineMask = enterMask;
+        auto fineT = [&](const glm::bvec3& msk, const glm::vec3& side) -> float {
+          const float tFineLocal = glm::dot(side - deltaDist, glm::vec3(msk));
+          return tMicroEnter + tFineLocal / 16.0f;
+        };
+        if (getFine(o, mapPos, mpos, finePos)) {
+          return makeHit(mapPos, mpos, finePos, mat, fineMask, true, true,
+                         fineT(fineMask, fineSide + deltaDist));
+        }
+        for (int s = 0; s < 8; ++s) {
+          fineMask = stepMaskCpu(fineSide);
+          fineSide += glm::vec3(fineMask) * deltaDist;
+          finePos += glm::ivec3(glm::vec3(fineMask)) * rayStep;
+          if (!fineInBounds(finePos)) {
+            break;
+          }
+          if (getFine(o, mapPos, mpos, finePos)) {
+            return makeHit(mapPos, mpos, finePos, mat, fineMask, true, true,
+                           fineT(fineMask, fineSide));
+          }
+        }
+        return std::nullopt;
+      };
+
       if (getMicro(o, mapPos, microPos)) {
-        return makeHit(mapPos, microPos, mat, microMask, true,
-                       microT(microMask, microSide + deltaDist));
+        const float tMicroEnter = microT(microMask, microSide + deltaDist);
+        if (auto h = tryFine(microPos, microMask, localPos, tMicroEnter)) {
+          return h;
+        }
       }
 
       for (int s = 0; s < 32; ++s) {
@@ -804,7 +1159,11 @@ std::optional<VoxelScene::PickResult> VoxelScene::pickObject(const VoxelObject& 
           break;
         }
         if (getMicro(o, mapPos, microPos)) {
-          return makeHit(mapPos, microPos, mat, microMask, true, microT(microMask, microSide));
+          const float tMicroEnter = microT(microMask, microSide);
+          glm::vec3 hitPos = localPos + rd * glm::dot(microSide - deltaDist, glm::vec3(microMask));
+          if (auto h = tryFine(microPos, microMask, hitPos, tMicroEnter)) {
+            return h;
+          }
         }
       }
     }
@@ -879,7 +1238,37 @@ void VoxelScene::handleEditInput(GLFWwindow* window, GfxDevice& gfx) {
   const uint32_t mat = static_cast<uint32_t>(std::clamp(brushMaterial_, 1, 255));
 
   int changed = 0;
-  if (nestedMicroVoxels_ && hit->hasMicro) {
+  if (nestedMicroVoxels_ && hit->hasFine) {
+    glm::ivec3 fine = hit->fine;
+    glm::ivec3 micro = hit->micro;
+    glm::ivec3 coarse = hit->cell;
+    if (removeEdge) {
+      changed = applyFineSphereBrush(o, coarse, micro, fine, radius, false, mat);
+    } else if (placeEdge) {
+      glm::ivec3 placeFine = fine + hit->normal;
+      glm::ivec3 placeMicro = micro;
+      glm::ivec3 placeCoarse = coarse;
+      for (int a = 0; a < 3; ++a) {
+        if (placeFine[a] < 0) {
+          placeFine[a] = kFineRes - 1;
+          placeMicro[a] -= 1;
+        } else if (placeFine[a] >= kFineRes) {
+          placeFine[a] = 0;
+          placeMicro[a] += 1;
+        }
+        if (placeMicro[a] < 0) {
+          placeMicro[a] = kMicroRes - 1;
+          placeCoarse[a] -= 1;
+        } else if (placeMicro[a] >= kMicroRes) {
+          placeMicro[a] = 0;
+          placeCoarse[a] += 1;
+        }
+      }
+      if (inBounds(o, placeCoarse) && microInBounds(placeMicro) && fineInBounds(placeFine)) {
+        changed = applyFineSphereBrush(o, placeCoarse, placeMicro, placeFine, radius, true, mat);
+      }
+    }
+  } else if (nestedMicroVoxels_ && hit->hasMicro) {
     glm::ivec3 micro = hit->micro;
     glm::ivec3 coarse = hit->cell;
     if (removeEdge) {
@@ -910,6 +1299,7 @@ void VoxelScene::handleEditInput(GLFWwindow* window, GfxDevice& gfx) {
 
   if (changed > 0) {
     recountOccupiedMicro();
+    recountOccupiedFine();
     flushObject(gfx, objIndex);
   }
   lastHit_ = pickCenterRay();

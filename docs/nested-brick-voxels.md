@@ -2,7 +2,7 @@
 
 Living design note for making voxel detail finer **without** a dense `N³ × 8³` blow-up.
 
-Status: **Phase A implemented** — global BrickPool, `B = 8`, occupancy-only pages, ground unallocated until carved, no solid collapse, no 16 / third level.
+Status: **Phase A + 2×2×2** — sparse 8³ brick slabs plus optional 512-byte 2×2×2 tables per brick. Unallocated brick/table = virtual full occupancy.
 
 Related shipped code:
 
@@ -76,17 +76,15 @@ Cell kinds:
 
 **Empty bricks are never allocated.** Fully solid cells need not allocate a brick either (collapse).
 
-### 3.2 Three-level (later)
+### 3.2 Three-level (shipped: 8³ then 2×2×2)
 
 ```
 coarse  (e.g. 0.35 m)
-  └─ brick page  B³   (e.g. 8, ~4 cm)
-        └─ micro page  M³  only if that brick cell still needs sub-detail
+  └─ brick page  8³ occupancy + fineTableId
+        └─ fine table  512×uint8  (one 2×2×2 per micro) only if mixed
 ```
 
-Linear fineness vs coarse-only ≈ `B × M` (e.g. 8×8 = 64).
-
-Prefer **another sparse 8³ layer** over globally switching every brick to 16³: the middle layer can stay unallocated.
+Linear fineness vs coarse = 16. Fine table is 512 bytes vs another 8³ (64 bytes occupancy but 512 cells — we store 8 bits/micro). `INVALID` fineTableId = virtual `0xFF` for every occupied micro.
 
 ### 3.3 Variable brick size (optional)
 
