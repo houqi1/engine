@@ -22,24 +22,22 @@ private:
     float invView[16];
     float invProj[16];
     float cameraPos[3];
-    float voxelSize;
+    float pad0;
     float lightDir[3];
     float ambient;
-    float gridOrigin[3];
     float projX;
-    uint32_t gridSize[3];
-    uint32_t maxSteps;
-    float skyColor[3];
-    uint32_t renderMode;
     float projY;
-    uint32_t nestedMicro;
-    uint32_t skipTrace;  // 1 = fill sky only (baseline bandwidth/dispatch cost)
+    uint32_t maxSteps;
+    uint32_t renderMode;
+    float skyColor[3];
+    uint32_t skipTrace;
     float aoStrength;
     float aoPower;
     float skyYaw;
     float skyIntensity;
-    uint32_t useSky;  // 1 = sample HDR equirect skybox
-    float padSky[3];
+    uint32_t useSky;
+    uint32_t objectCount;
+    float pad1[2];
   };
 
   struct FrameResources {
@@ -84,6 +82,7 @@ private:
   std::array<FrameResources, GfxDevice::kFramesInFlight> frames_{};
   VkBuffer boundVoxelBuffer_ = VK_NULL_HANDLE;
   VkBuffer boundMicroBuffer_ = VK_NULL_HANDLE;
+  VkBuffer boundObjectBuffer_ = VK_NULL_HANDLE;
   VkImageView boundSkyView_ = VK_NULL_HANDLE;
   bool imguiReady_ = false;
   float displayFps_ = 0.0f;
