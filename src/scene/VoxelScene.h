@@ -38,8 +38,9 @@ struct GpuVoxelObject {
   uint32_t gridSize[3];
   uint32_t flags;  // bit0 = nestedMicro, bit1 = enabled
   uint32_t voxelOffset;
-  uint32_t _unusedMicroOffset;
-  uint32_t _pad1[2];
+  uint32_t occMipOffset;  // occupancy mip, in uints
+  uint32_t occMipWords;
+  uint32_t _pad1;
 };
 static_assert(sizeof(GpuVoxelObject) == 176, "GpuVoxelObject std430 size mismatch");
 
@@ -66,6 +67,8 @@ struct VoxelObject {
 
   std::vector<CoarseCell> cells;
   uint32_t voxelOffset = 0;
+  uint32_t occMipOffset = 0;
+  uint32_t occMipWords = 0;
 
   glm::mat4 objectToWorld() const;
   glm::mat4 worldToObject() const;
@@ -86,6 +89,8 @@ public:
   static constexpr uint32_t kMaxBrickSlabs = 8u;
   static constexpr uint32_t kWordsPerSlab =
       kPagesPerSlab * static_cast<uint32_t>(kBrickPageWords);
+  static constexpr int kOccMipRes = 4;
+  static constexpr int kOccMipShift = 2;
 
   void init(GfxDevice& gfx);
   void cleanup(GfxDevice& gfx);
@@ -101,6 +106,10 @@ public:
   int& importPadding() { return importPadding_; }
   bool& importSampleColor() { return importSampleColor_; }
   const AllocatedBuffer& paletteBuffer() const { return paletteBuffer_; }
+  const AllocatedBuffer& occMipBuffer() const { return occMipBuffer_; }
+  uint32_t occMipBytes() const {
+    return static_cast<uint32_t>(occMipCpu_.size() * sizeof(uint32_t));
+  }
 
   Camera& camera() { return camera_; }
   const Camera& camera() const { return camera_; }
@@ -110,7 +119,7 @@ public:
   const AllocatedBuffer& objectBuffer() const { return objectBuffer_; }
   uint32_t brickSlabCount() const { return static_cast<uint32_t>(slabs_.size()); }
   const AllocatedBuffer& brickSlabBuffer(uint32_t i) const { return slabs_[i].gpu; }
-  uint32_t objectCount() const { return static_cast<uint32_t>(objects_.size()); }
+  uint32_t objectCount() const { return static_cast<uint32_t>(objectsGpu_.size()); }
 
   uint32_t voxelCount() const { return static_cast<uint32_t>(voxelsCpu_.size()); }
   uint32_t occupiedCount() const { return occupiedCount_; }
@@ -175,9 +184,12 @@ private:
 
   void buildGroundObject(VoxelObject& o);
   void buildSpinnerObject(VoxelObject& o);
-  void applyImportedObject(GfxDevice& gfx, VoxelObject&& imported);
+  uint32_t stampMeshIntoWorld(const MeshVoxelizeResult& r, bool sampleColor);
+  void uploadWorldAndObjects(GfxDevice& gfx);
   void packObjectPool();
   void fillGpuObjectRecords();
+  void fillOccMip(const VoxelObject& o, uint32_t* words, uint32_t wordCount) const;
+  void uploadOccMip(GfxDevice& gfx);
   void uploadPalette(GfxDevice& gfx);
   uint32_t* brickPageWords(uint32_t page);
   const uint32_t* brickPageWords(uint32_t page) const;
@@ -212,6 +224,7 @@ private:
   AllocatedBuffer dummyBrickSlabBuffer_{};
   AllocatedBuffer objectBuffer_{};
   AllocatedBuffer paletteBuffer_{};
+  AllocatedBuffer occMipBuffer_{};
   MeshVoxelizerGpu voxelizeGpu_{};
   std::array<glm::vec4, 256> importPalette_{};
   std::string importPath_;
@@ -225,6 +238,7 @@ private:
   std::vector<VoxelObject> objects_;
   std::vector<GpuVoxelObject> objectsGpu_;
   std::vector<CoarseCell> voxelsCpu_;
+  std::vector<uint32_t> occMipCpu_;
   std::vector<BrickSlab> slabs_;
   std::vector<uint32_t> freePages_;
   std::unordered_set<uint32_t> dirtyPages_;

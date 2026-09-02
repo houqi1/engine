@@ -147,11 +147,12 @@ void VoxelRenderer::resize() {
   boundBrickSlabCount_ = 0;
   boundObjectBuffer_ = VK_NULL_HANDLE;
   boundPaletteBuffer_ = VK_NULL_HANDLE;
+  boundOccMipBuffer_ = VK_NULL_HANDLE;
   boundSkyView_ = VK_NULL_HANDLE;
 }
 
 void VoxelRenderer::createDescriptors() {
-  VkDescriptorSetLayoutBinding bindings[7]{};
+  VkDescriptorSetLayoutBinding bindings[8]{};
   bindings[0].binding = 0;
   bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
   bindings[0].descriptorCount = 1;
@@ -187,9 +188,14 @@ void VoxelRenderer::createDescriptors() {
   bindings[6].descriptorCount = 1;
   bindings[6].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
+  bindings[7].binding = 7;
+  bindings[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  bindings[7].descriptorCount = 1;
+  bindings[7].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
   VkDescriptorSetLayoutCreateInfo layoutInfo{};
   layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-  layoutInfo.bindingCount = 7;
+  layoutInfo.bindingCount = 8;
   layoutInfo.pBindings = bindings;
   if (vkCreateDescriptorSetLayout(gfx_.device(), &layoutInfo, nullptr, &frameLayout_) !=
       VK_SUCCESS) {
@@ -199,7 +205,7 @@ void VoxelRenderer::createDescriptors() {
   VkDescriptorPoolSize poolSizes[] = {
       {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, GfxDevice::kFramesInFlight},
       {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-       GfxDevice::kFramesInFlight * (3u + VoxelScene::kMaxBrickSlabs)},
+       GfxDevice::kFramesInFlight * (4u + VoxelScene::kMaxBrickSlabs)},
       {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, GfxDevice::kFramesInFlight},
       {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, GfxDevice::kFramesInFlight},
   };
@@ -263,7 +269,8 @@ void VoxelRenderer::updateDescriptors(VoxelScene& scene) {
   if (outImage_.view == VK_NULL_HANDLE || scene.voxelBuffer().buffer == VK_NULL_HANDLE ||
       scene.dummyBrickSlabBuffer().buffer == VK_NULL_HANDLE ||
       scene.objectBuffer().buffer == VK_NULL_HANDLE ||
-      scene.paletteBuffer().buffer == VK_NULL_HANDLE || !scene.hasSky()) {
+      scene.paletteBuffer().buffer == VK_NULL_HANDLE ||
+      scene.occMipBuffer().buffer == VK_NULL_HANDLE || !scene.hasSky()) {
     return;
   }
 
@@ -304,7 +311,11 @@ void VoxelRenderer::updateDescriptors(VoxelScene& scene) {
     paletteInfo.buffer = scene.paletteBuffer().buffer;
     paletteInfo.range = scene.paletteBuffer().size;
 
-    VkWriteDescriptorSet writes[7]{};
+    VkDescriptorBufferInfo occMipInfo{};
+    occMipInfo.buffer = scene.occMipBuffer().buffer;
+    occMipInfo.range = scene.occMipBuffer().size;
+
+    VkWriteDescriptorSet writes[8]{};
     writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[0].dstSet = frame.frameSet;
     writes[0].dstBinding = 0;
@@ -354,7 +365,14 @@ void VoxelRenderer::updateDescriptors(VoxelScene& scene) {
     writes[6].descriptorCount = 1;
     writes[6].pBufferInfo = &paletteInfo;
 
-    vkUpdateDescriptorSets(gfx_.device(), 7, writes, 0, nullptr);
+    writes[7].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[7].dstSet = frame.frameSet;
+    writes[7].dstBinding = 7;
+    writes[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[7].descriptorCount = 1;
+    writes[7].pBufferInfo = &occMipInfo;
+
+    vkUpdateDescriptorSets(gfx_.device(), 8, writes, 0, nullptr);
   }
 
   boundVoxelBuffer_ = scene.voxelBuffer().buffer;
@@ -365,6 +383,7 @@ void VoxelRenderer::updateDescriptors(VoxelScene& scene) {
   }
   boundObjectBuffer_ = scene.objectBuffer().buffer;
   boundPaletteBuffer_ = scene.paletteBuffer().buffer;
+  boundOccMipBuffer_ = scene.occMipBuffer().buffer;
   boundSkyView_ = scene.sky().image.view;
 }
 
@@ -418,6 +437,7 @@ void VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
   if (scene.voxelBuffer().buffer != boundVoxelBuffer_ || brickSlabsChanged ||
       scene.objectBuffer().buffer != boundObjectBuffer_ ||
       scene.paletteBuffer().buffer != boundPaletteBuffer_ ||
+      scene.occMipBuffer().buffer != boundOccMipBuffer_ ||
       scene.sky().image.view != boundSkyView_ || outImage_.view == VK_NULL_HANDLE) {
     updateDescriptors(scene);
   }
@@ -625,6 +645,7 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
   ImGui::Text("Occupied coarse: %u / %u", scene.occupiedCount(), scene.voxelCount());
   ImGui::Text("Brick pages: %u  slabs: %u  pool: %.1f KB", scene.allocatedBrickPages(),
               scene.brickSlabCount(), static_cast<float>(scene.brickPoolBytes()) / 1024.0f);
+  ImGui::Text("Occupancy mip (4^3): %.2f KB", static_cast<float>(scene.occMipBytes()) / 1024.0f);
   ImGui::Text("Occupied 8^3 micros: %u   2^3 fines: %u", scene.occupiedMicroCount(),
               scene.occupiedFineCount());
   ImGui::Separator();
@@ -657,7 +678,7 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
     ImGui::TextUnformatted("Hit: none");
   }
   ImGui::Separator();
-  ImGui::TextUnformatted("Import Mesh (GPU surface voxelize)");
+  ImGui::TextUnformatted("Import Mesh (stamp into world grid, one DDA)");
   char pathBuf[512]{};
   const std::string defaultObj = std::string(VE_ASSETS_DIR) + "/meshes/cube.obj";
   const std::string& srcPath = scene.importPath().empty() ? defaultObj : scene.importPath();
