@@ -1,7 +1,5 @@
 #include "render/VoxelRenderer.h"
 
-#include "gfx/PipelineBuilder.h"
-
 #include <imgui.h>
 #include <imgui_impl_glfw.h>
 #include <imgui_impl_vulkan.h>
@@ -38,22 +36,11 @@ VoxelRenderer::~VoxelRenderer() {
   destroyOutputImage();
   destroyTimestampPool();
 
-  destroyIntervalImages();
-  if (intervalSampler_) {
-    gfx_.destroySampler(intervalSampler_);
-    intervalSampler_ = VK_NULL_HANDLE;
-  }
   if (computePipeline_) {
     vkDestroyPipeline(gfx_.device(), computePipeline_, nullptr);
   }
   if (pipelineLayout_) {
     vkDestroyPipelineLayout(gfx_.device(), pipelineLayout_, nullptr);
-  }
-  if (hullPipeline_) {
-    vkDestroyPipeline(gfx_.device(), hullPipeline_, nullptr);
-  }
-  if (hullPipelineLayout_) {
-    vkDestroyPipelineLayout(gfx_.device(), hullPipelineLayout_, nullptr);
   }
   for (auto& frame : frames_) {
     gfx_.destroyBuffer(frame.frameUBO);
@@ -164,13 +151,10 @@ void VoxelRenderer::resize() {
   boundPaletteBuffer_ = VK_NULL_HANDLE;
   boundOccMipBuffer_ = VK_NULL_HANDLE;
   boundSkyView_ = VK_NULL_HANDLE;
-  boundTminView_ = VK_NULL_HANDLE;
-  boundTmaxView_ = VK_NULL_HANDLE;
-  boundTbackView_ = VK_NULL_HANDLE;
 }
 
 void VoxelRenderer::createDescriptors() {
-  VkDescriptorSetLayoutBinding bindings[11]{};
+  VkDescriptorSetLayoutBinding bindings[8]{};
   bindings[0].binding = 0;
   bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
   bindings[0].descriptorCount = 1;
@@ -211,24 +195,9 @@ void VoxelRenderer::createDescriptors() {
   bindings[7].descriptorCount = 1;
   bindings[7].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
-  bindings[8].binding = 8;
-  bindings[8].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-  bindings[8].descriptorCount = 1;
-  bindings[8].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-  bindings[9].binding = 9;
-  bindings[9].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-  bindings[9].descriptorCount = 1;
-  bindings[9].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-  bindings[10].binding = 10;
-  bindings[10].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-  bindings[10].descriptorCount = 1;
-  bindings[10].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
   VkDescriptorSetLayoutCreateInfo layoutInfo{};
   layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-  layoutInfo.bindingCount = 11;
+  layoutInfo.bindingCount = 8;
   layoutInfo.pBindings = bindings;
   if (vkCreateDescriptorSetLayout(gfx_.device(), &layoutInfo, nullptr, &frameLayout_) !=
       VK_SUCCESS) {
@@ -241,7 +210,7 @@ void VoxelRenderer::createDescriptors() {
        GfxDevice::kFramesInFlight * (3u + VoxelScene::kMaxBrickSlabs)},
       {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, GfxDevice::kFramesInFlight},
       {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-       GfxDevice::kFramesInFlight * (1u + VoxelScene::kGridTexCount + 3u)},
+       GfxDevice::kFramesInFlight * (1u + VoxelScene::kGridTexCount)},
   };
   VkDescriptorPoolCreateInfo poolInfo{};
   poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -253,42 +222,6 @@ void VoxelRenderer::createDescriptors() {
   }
 }
 
-void VoxelRenderer::createIntervalImages() {
-  const VkExtent2D ext = gfx_.swapchainExtent();
-  if (ext.width == 0 || ext.height == 0) {
-    return;
-  }
-  VkFormatProperties props{};
-  vkGetPhysicalDeviceFormatProperties(gfx_.physicalDevice(), VK_FORMAT_R32_SFLOAT, &props);
-  const VkFormatFeatureFlags need =
-      VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT |
-      VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
-  intervalFormat_ = ((props.optimalTilingFeatures & need) == need) ? VK_FORMAT_R32_SFLOAT
-                                                                   : VK_FORMAT_R16_SFLOAT;
-  const VkImageUsageFlags usage =
-      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-  for (auto& frame : frames_) {
-    frame.tMin = gfx_.createImage({ext.width, ext.height, 1}, intervalFormat_, usage,
-                                  VK_IMAGE_ASPECT_COLOR_BIT, true);
-    frame.tMax = gfx_.createImage({ext.width, ext.height, 1}, intervalFormat_, usage,
-                                  VK_IMAGE_ASPECT_COLOR_BIT, true);
-    frame.tBack = gfx_.createImage({ext.width, ext.height, 1}, intervalFormat_, usage,
-                                   VK_IMAGE_ASPECT_COLOR_BIT, true);
-  }
-  if (intervalSampler_ == VK_NULL_HANDLE) {
-    intervalSampler_ = gfx_.createSampler(VK_FILTER_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-                                          false, 1, 0.0f, VK_SAMPLER_MIPMAP_MODE_NEAREST);
-  }
-}
-
-void VoxelRenderer::destroyIntervalImages() {
-  for (auto& frame : frames_) {
-    gfx_.destroyImage(frame.tMin);
-    gfx_.destroyImage(frame.tMax);
-    gfx_.destroyImage(frame.tBack);
-  }
-}
-
 void VoxelRenderer::createOutputImage() {
   const VkExtent2D ext = gfx_.swapchainExtent();
   if (ext.width == 0 || ext.height == 0) {
@@ -297,23 +230,13 @@ void VoxelRenderer::createOutputImage() {
   outImage_ = gfx_.createImage({ext.width, ext.height, 1}, kOutFormat,
                                VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
                                VK_IMAGE_ASPECT_COLOR_BIT, true);
-  createIntervalImages();
 }
 
 void VoxelRenderer::destroyOutputImage() {
   gfx_.destroyImage(outImage_);
-  destroyIntervalImages();
 }
 
 void VoxelRenderer::createPipelines() {
-  VkFormatProperties props{};
-  vkGetPhysicalDeviceFormatProperties(gfx_.physicalDevice(), VK_FORMAT_R32_SFLOAT, &props);
-  const VkFormatFeatureFlags need =
-      VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT |
-      VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
-  intervalFormat_ = ((props.optimalTilingFeatures & need) == need) ? VK_FORMAT_R32_SFLOAT
-                                                                   : VK_FORMAT_R16_SFLOAT;
-
   const std::string shaderDir = VE_SHADER_DIR;
   VkShaderModule comp = gfx_.loadShaderModule(shaderDir + "/voxel_dda.comp.spv");
 
@@ -343,43 +266,6 @@ void VoxelRenderer::createPipelines() {
   }
 
   vkDestroyShaderModule(gfx_.device(), comp, nullptr);
-
-  VkShaderModule hullVert = gfx_.loadShaderModule(shaderDir + "/hull.vert.spv");
-  VkShaderModule hullFrag = gfx_.loadShaderModule(shaderDir + "/hull.frag.spv");
-  VkPushConstantRange hullPc{};
-  hullPc.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
-  hullPc.offset = 0;
-  hullPc.size = sizeof(HullPC);
-  VkPipelineLayoutCreateInfo hullLayoutInfo{};
-  hullLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-  hullLayoutInfo.pushConstantRangeCount = 1;
-  hullLayoutInfo.pPushConstantRanges = &hullPc;
-  if (vkCreatePipelineLayout(gfx_.device(), &hullLayoutInfo, nullptr, &hullPipelineLayout_) !=
-      VK_SUCCESS) {
-    vkDestroyShaderModule(gfx_.device(), hullVert, nullptr);
-    vkDestroyShaderModule(gfx_.device(), hullFrag, nullptr);
-    throw std::runtime_error("Failed to create hull pipeline layout");
-  }
-  VkVertexInputBindingDescription hullBind{};
-  hullBind.stride = sizeof(float) * 3;
-  hullBind.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
-  VkVertexInputAttributeDescription hullAttr{};
-  hullAttr.format = VK_FORMAT_R32G32B32_SFLOAT;
-  hullAttr.offset = 0;
-  hullPipeline_ =
-      PipelineBuilder()
-          .setShaders(hullVert, hullFrag)
-          .setVertexInput(hullBind, {hullAttr})
-          .setTopology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
-          .setCullMode(VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE)
-          .setDepthTest(false, false, VK_COMPARE_OP_ALWAYS)
-          .setDepthClamp(true)
-          .setColorFormats({intervalFormat_, intervalFormat_, intervalFormat_})
-          .setMinMaxBlend(3)
-          .setLayout(hullPipelineLayout_)
-          .build(gfx_.device());
-  vkDestroyShaderModule(gfx_.device(), hullVert, nullptr);
-  vkDestroyShaderModule(gfx_.device(), hullFrag, nullptr);
 }
 
 void VoxelRenderer::updateDescriptors(VoxelScene& scene) {
@@ -388,8 +274,7 @@ void VoxelRenderer::updateDescriptors(VoxelScene& scene) {
       scene.dummyBrickSlabBuffer().buffer == VK_NULL_HANDLE ||
       scene.objectBuffer().buffer == VK_NULL_HANDLE ||
       scene.paletteBuffer().buffer == VK_NULL_HANDLE ||
-      scene.occMipBuffer().buffer == VK_NULL_HANDLE || !scene.hasSky() ||
-      frames_[0].tMin.view == VK_NULL_HANDLE || intervalSampler_ == VK_NULL_HANDLE) {
+      scene.occMipBuffer().buffer == VK_NULL_HANDLE || !scene.hasSky()) {
     return;
   }
 
@@ -439,20 +324,7 @@ void VoxelRenderer::updateDescriptors(VoxelScene& scene) {
     occMipInfo.buffer = scene.occMipBuffer().buffer;
     occMipInfo.range = scene.occMipBuffer().size;
 
-    VkDescriptorImageInfo tMinInfo{};
-    tMinInfo.sampler = intervalSampler_;
-    tMinInfo.imageView = frame.tMin.view;
-    tMinInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    VkDescriptorImageInfo tMaxInfo{};
-    tMaxInfo.sampler = intervalSampler_;
-    tMaxInfo.imageView = frame.tMax.view;
-    tMaxInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    VkDescriptorImageInfo tBackInfo{};
-    tBackInfo.sampler = intervalSampler_;
-    tBackInfo.imageView = frame.tBack.view;
-    tBackInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-
-    VkWriteDescriptorSet writes[11]{};
+    VkWriteDescriptorSet writes[8]{};
     writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[0].dstSet = frame.frameSet;
     writes[0].dstBinding = 0;
@@ -509,28 +381,7 @@ void VoxelRenderer::updateDescriptors(VoxelScene& scene) {
     writes[7].descriptorCount = 1;
     writes[7].pBufferInfo = &occMipInfo;
 
-    writes[8].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[8].dstSet = frame.frameSet;
-    writes[8].dstBinding = 8;
-    writes[8].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    writes[8].descriptorCount = 1;
-    writes[8].pImageInfo = &tMinInfo;
-
-    writes[9].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[9].dstSet = frame.frameSet;
-    writes[9].dstBinding = 9;
-    writes[9].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    writes[9].descriptorCount = 1;
-    writes[9].pImageInfo = &tMaxInfo;
-
-    writes[10].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[10].dstSet = frame.frameSet;
-    writes[10].dstBinding = 10;
-    writes[10].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    writes[10].descriptorCount = 1;
-    writes[10].pImageInfo = &tBackInfo;
-
-    vkUpdateDescriptorSets(gfx_.device(), 11, writes, 0, nullptr);
+    vkUpdateDescriptorSets(gfx_.device(), 8, writes, 0, nullptr);
   }
 
   boundGridSampler_ = scene.gridSampler();
@@ -548,9 +399,6 @@ void VoxelRenderer::updateDescriptors(VoxelScene& scene) {
   boundPaletteBuffer_ = scene.paletteBuffer().buffer;
   boundOccMipBuffer_ = scene.occMipBuffer().buffer;
   boundSkyView_ = scene.sky().image.view;
-  boundTminView_ = frames_[0].tMin.view;
-  boundTmaxView_ = frames_[0].tMax.view;
-  boundTbackView_ = frames_[0].tBack.view;
 }
 
 void VoxelRenderer::updateFrameUBO(VoxelScene& scene, uint32_t frameIndex) {
@@ -569,122 +417,24 @@ void VoxelRenderer::updateFrameUBO(VoxelScene& scene, uint32_t frameIndex) {
   ubo.maxSteps = scene.maxSteps();
   ubo.renderMode = static_cast<uint32_t>(std::max(0, scene.renderMode()));
   writeVec3(ubo.skyColor, scene.skyColor());
-  ubo.skipTrace = skipTrace_ ? 1u : 0u;
+  ubo.traceStage = static_cast<uint32_t>(std::clamp(traceStage_, 0, 5));
   ubo.aoStrength = scene.aoStrength();
   ubo.aoPower = scene.aoPower();
   ubo.skyYaw = scene.skyYaw();
   ubo.skyIntensity = scene.skyIntensity();
   ubo.useSky = (scene.showSky() && scene.hasSky()) ? 1u : 0u;
   ubo.objectCount = scene.objectCount();
-  ubo.debugHullTmin = showHullTmin_ ? 1u : 0u;
-  ubo.cameraInside = scene.cameraInsideWorldAabb() ? 1u : 0u;
+  ubo.solidColor = scene.solidColorOutput() ? 1u : 0u;
+  ubo.padBefore = 0;
+  ubo.padVec4[0] = ubo.padVec4[1] = ubo.padVec4[2] = ubo.padVec4[3] = 0;
+  writeVec3(ubo.solidRgb, scene.solidColor());
+  ubo.padSolidEnd = 0.0f;
 
   void* mapped = frames_[frameIndex].frameUBO.info.pMappedData;
   if (!mapped) {
     throw std::runtime_error("Voxel DDA UBO is not host-mapped");
   }
   std::memcpy(mapped, &ubo, sizeof(ubo));
-}
-
-void VoxelRenderer::recordHullPass(VkCommandBuffer cmd, VoxelScene& scene, VkExtent2D extent,
-                                   uint32_t frameIndex) {
-  FrameResources& fr = frames_[frameIndex];
-  auto barrierToColor = [&](AllocatedImage& img) {
-    const bool undef = img.layout == VK_IMAGE_LAYOUT_UNDEFINED;
-    gfx_.transitionImage(cmd, img.image, img.layout, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                         undef ? VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT
-                               : VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                         undef ? 0 : VK_ACCESS_2_SHADER_READ_BIT,
-                         VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-                         VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
-  };
-  barrierToColor(fr.tMin);
-  barrierToColor(fr.tMax);
-  barrierToColor(fr.tBack);
-
-  VkClearValue clearMin{};
-  clearMin.color.float32[0] = 1.0e10f;
-  clearMin.color.float32[1] = 0.0f;
-  clearMin.color.float32[2] = 0.0f;
-  clearMin.color.float32[3] = 0.0f;
-  VkClearValue clearMax{};
-  VkClearValue clearBack = clearMin;
-
-  VkRenderingAttachmentInfo atts[3]{};
-  atts[0].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-  atts[0].imageView = fr.tMin.view;
-  atts[0].imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-  atts[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-  atts[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-  atts[0].clearValue = clearMin;
-  atts[1] = atts[0];
-  atts[1].imageView = fr.tMax.view;
-  atts[1].clearValue = clearMax;
-  atts[2] = atts[0];
-  atts[2].imageView = fr.tBack.view;
-  atts[2].clearValue = clearBack;
-
-  VkRenderingInfo ri{};
-  ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
-  ri.renderArea.extent = extent;
-  ri.layerCount = 1;
-  ri.colorAttachmentCount = 3;
-  ri.pColorAttachments = atts;
-  vkCmdBeginRendering(cmd, &ri);
-
-  VkViewport vp{};
-  vp.width = static_cast<float>(extent.width);
-  vp.height = static_cast<float>(extent.height);
-  vp.minDepth = 0.0f;
-  vp.maxDepth = 1.0f;
-  vkCmdSetViewport(cmd, 0, 1, &vp);
-  VkRect2D scissor{};
-  scissor.extent = extent;
-  vkCmdSetScissor(cmd, 0, 1, &scissor);
-
-  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, hullPipeline_);
-
-  HullPC pc{};
-  writeMat4(pc.viewProj, scene.camera().proj() * scene.camera().view());
-  writeMat4(pc.model, glm::mat4(1.0f));
-  writeVec3(pc.cameraPos, scene.camera().position());
-  pc.nearZ = scene.camera().nearZ();
-  writeVec3(pc.cameraFwd, scene.camera().forward());
-  vkCmdPushConstants(cmd, hullPipelineLayout_,
-                     VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
-
-  auto drawMesh = [&](const AllocatedBuffer& vb, const AllocatedBuffer& ib, uint32_t indexCount) {
-    if (indexCount == 0 || vb.buffer == VK_NULL_HANDLE || ib.buffer == VK_NULL_HANDLE) {
-      return;
-    }
-    VkDeviceSize off = 0;
-    vkCmdBindVertexBuffers(cmd, 0, 1, &vb.buffer, &off);
-    vkCmdBindIndexBuffer(cmd, ib.buffer, 0, VK_INDEX_TYPE_UINT32);
-    vkCmdDrawIndexed(cmd, indexCount, 1, 0, 0, 0);
-  };
-  drawMesh(scene.hullVertexBuffer(), scene.hullIndexBuffer(), scene.hullIndexCount());
-  if (scene.spinnerDrawEnabled()) {
-    writeMat4(pc.model, scene.spinnerObjectToWorld());
-    vkCmdPushConstants(cmd, hullPipelineLayout_,
-                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc),
-                       &pc);
-    drawMesh(scene.spinnerObbVertexBuffer(), scene.spinnerObbIndexBuffer(),
-             scene.spinnerObbIndexCount());
-  }
-
-  vkCmdEndRendering(cmd);
-
-  auto barrierToSample = [&](AllocatedImage& img) {
-    gfx_.transitionImage(cmd, img.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                         VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-                         VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT);
-    img.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-  };
-  barrierToSample(fr.tMin);
-  barrierToSample(fr.tMax);
-  barrierToSample(fr.tBack);
 }
 
 void VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
@@ -712,9 +462,7 @@ void VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
       scene.objectBuffer().buffer != boundObjectBuffer_ ||
       scene.paletteBuffer().buffer != boundPaletteBuffer_ ||
       scene.occMipBuffer().buffer != boundOccMipBuffer_ ||
-      scene.sky().image.view != boundSkyView_ || outImage_.view == VK_NULL_HANDLE ||
-      frames_[0].tMin.view != boundTminView_ || frames_[0].tMax.view != boundTmaxView_ ||
-      frames_[0].tBack.view != boundTbackView_) {
+      scene.sky().image.view != boundSkyView_ || outImage_.view == VK_NULL_HANDLE) {
     updateDescriptors(scene);
   }
 
@@ -725,8 +473,7 @@ void VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
 
   if (outImage_.image == VK_NULL_HANDLE || scene.gridSampler() == VK_NULL_HANDLE ||
       scene.gridImage(0).view == VK_NULL_HANDLE ||
-      scene.objectBuffer().buffer == VK_NULL_HANDLE || frames_[0].tMin.view == VK_NULL_HANDLE ||
-      hullPipeline_ == VK_NULL_HANDLE) {
+      scene.objectBuffer().buffer == VK_NULL_HANDLE) {
     gfx_.endFrame(frame);
     return;
   }
@@ -741,8 +488,6 @@ void VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
     vkCmdResetQueryPool(frame.cmd, timestampPool_, tsBase, kTsPerFrame);
     writeTimestamp(frame.cmd, tsBase + kTsFrameBegin, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT);
   }
-
-  recordHullPass(frame.cmd, scene, frame.extent, frame.frameIndex);
 
   // Compute writes the raycast result.
   gfx_.transitionImage(frame.cmd, outImage_.image, VK_IMAGE_LAYOUT_UNDEFINED,
@@ -914,14 +659,19 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
   ImGui::Text("  compute:   %.2f ms", gpuComputeMs_);
   ImGui::Text("  blit:      %.2f ms", gpuBlitMs_);
   ImGui::Text("  ui/other:  %.2f ms", gpuUiMs_);
-  ImGui::Checkbox("Skip Trace (baseline)", &skipTrace_);
-  ImGui::Checkbox("Show hull tMin", &showHullTmin_);
-  ImGui::TextDisabled("Object-order occupancy hull (not the world AABB).");
-  ImGui::TextDisabled("Baseline keeps dispatch+imageStore but skips DDA.");
+  const char* stages[] = {
+      "Full (DDA + nest + AO + light)",
+      "No shade (DDA + nest, skip AO/light)",
+      "No 2x2x2 (coarse + 8^3)",
+      "Coarse DDA only",
+      "Ray gen only",
+      "Skip DDA (sky store)",
+  };
+  ImGui::Combo("Cost Ladder", &traceStage_, stages, IM_ARRAYSIZE(stages));
+  ImGui::TextDisabled("Compare GPU compute ms at the same camera. Display FPS can lie.");
+  ImGui::TextDisabled("Walk the ladder: the step that jumps compute ms is the bottleneck.");
   if (gfx_.vsyncEnabled()) {
     ImGui::TextDisabled("VSync present mode; Display FPS is refresh-capped.");
-  } else {
-    ImGui::TextDisabled("Compare nested on/off and Skip Trace to locate the bottleneck.");
   }
   ImGui::Text("Objects: %u", scene.objectCount());
   ImGui::Text("Occupied coarse: %u / %u", scene.occupiedCount(), scene.voxelCount());
@@ -933,9 +683,6 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
   ImGui::Separator();
   ImGui::TextWrapped("LMB: remove hit object  |  F: place on hit face  |  RMB drag: look");
   ImGui::SliderInt("Brush Material", &scene.brushMaterial(), 1, 2);
-  if (ImGui::Checkbox("Hull conservative dilate", &scene.hullConservativeDilate())) {
-    scene.rebuildOccupancyHull(gfx_);
-  }
   ImGui::Checkbox("Edit/Render Nested 8^3 + 2^3", &scene.nestedMicroVoxels());
   if (scene.nestedMicroVoxels()) {
     ImGui::SliderFloat("Brush Radius", &scene.brushRadius(), 0.0f, 8.0f, "%.1f fine voxels");
@@ -998,6 +745,22 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
 
   const char* modes[] = {"Shaded", "Albedo", "Normal", "Steps", "Coord", "AO"};
   ImGui::Combo("Render Mode", &scene.renderMode(), modes, IM_ARRAYSIZE(modes));
+  ImGui::Checkbox("Solid Color", &scene.solidColorOutput());
+  if (scene.solidColorOutput()) {
+    ImGui::ColorEdit3("Voxel Color", &scene.solidColor().x);
+    ImGui::TextDisabled("Hits write this color; lighting and AO are skipped.");
+  }
+  ImGui::Checkbox("Skybox", &scene.showSky());
+  if (scene.showSky()) {
+    ImGui::DragFloat("Sky Intensity", &scene.skyIntensity(), 0.01f, 0.0f, 8.0f);
+    ImGui::DragFloat("Sky Yaw", &scene.skyYaw(), 0.01f, -3.14159f, 3.14159f);
+    if (!scene.hasSky()) {
+      ImGui::TextDisabled("HDR sky missing; using flat sky color.");
+    }
+  } else {
+    ImGui::TextDisabled("Skybox off: miss pixels use Sky Color, no HDR sample.");
+  }
+  ImGui::ColorEdit3("Sky Color", &scene.skyColor().x);
 
   bool rebuild = false;
   rebuild |= ImGui::SliderInt("Grid Size", &scene.gridSize(), 8, 64);
@@ -1007,13 +770,6 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
   ImGui::SliderFloat("AO Strength", &scene.aoStrength(), 0.0f, 1.0f);
   ImGui::SliderFloat("AO Power", &scene.aoPower(), 0.05f, 2.0f);
   ImGui::TextDisabled("Neighbor voxel AO (Minecraft-style). Strength 0 disables.");
-  ImGui::Checkbox("Skybox", &scene.showSky());
-  ImGui::DragFloat("Sky Intensity", &scene.skyIntensity(), 0.01f, 0.0f, 8.0f);
-  ImGui::DragFloat("Sky Yaw", &scene.skyYaw(), 0.01f, -3.14159f, 3.14159f);
-  ImGui::ColorEdit3("Sky Color (fallback)", &scene.skyColor().x);
-  if (!scene.hasSky()) {
-    ImGui::TextDisabled("HDR sky missing; using flat sky color.");
-  }
   int maxSteps = static_cast<int>(scene.maxSteps());
   if (ImGui::SliderInt("Max Steps", &maxSteps, 16, 512)) {
     scene.maxSteps() = static_cast<uint32_t>(maxSteps);

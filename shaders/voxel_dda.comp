@@ -14,15 +14,18 @@ layout(set = 0, binding = 0, std140) uniform VoxelDdaUBO {
     uint maxSteps;
     uint renderMode;
     vec3 skyColor;
-    uint skipTrace;
+    uint traceStage;
     float aoStrength;
     float aoPower;
     float skyYaw;
     float skyIntensity;
     uint useSky;
     uint objectCount;
-    uint debugHullTmin;
-    uint cameraInside;
+    uint solidColor;
+    uint _padBefore;
+    uvec4 _padVec4;
+    vec3 solidRgb;
+    float _padSolidEnd;
 } ubo;
 
 struct CoarseCell {
@@ -68,16 +71,18 @@ layout(set = 0, binding = 7, std430) readonly buffer OccupancyMip {
     uint occMip[];
 };
 
-layout(set = 0, binding = 8) uniform sampler2D tMinMap;
-layout(set = 0, binding = 9) uniform sampler2D tMaxMap;
-layout(set = 0, binding = 10) uniform sampler2D tBackMap;
-
 const uint MODE_SHADED = 0u;
 const uint MODE_ALBEDO = 1u;
 const uint MODE_NORMAL = 2u;
 const uint MODE_STEPS = 3u;
 const uint MODE_COORD = 4u;
 const uint MODE_AO = 5u;
+const uint STAGE_FULL = 0u;
+const uint STAGE_NO_SHADE = 1u;
+const uint STAGE_NO_FINE = 2u;
+const uint STAGE_COARSE = 3u;
+const uint STAGE_INTERVAL = 4u;
+const uint STAGE_SKIP_DDA = 5u;
 const uint MICRO_WORDS = 16u;
 const uint FINE_WORDS = 128u;
 const uint BRICK_PAGE_WORDS = MICRO_WORDS + FINE_WORDS;
@@ -335,7 +340,7 @@ bool traceFine(uint page, ivec3 micro, vec3 localPos, vec3 rd, vec3 sgn, bvec3 e
     return false;
 }
 
-bool traceMicro(uint page, vec3 localPos, vec3 rd, vec3 sgn, bvec3 enterMask,
+bool traceMicro(uint page, vec3 localPos, vec3 rd, vec3 sgn, bvec3 enterMask, bool useFine,
                 out ivec3 outMicro, out ivec3 outFine, out bvec3 outMask, out vec3 outUvw,
                 out float outTMicro, out float outTFine, inout uint outSteps) {
     localPos = clamp(localPos, vec3(0.0001), vec3(7.9999));
@@ -346,9 +351,16 @@ bool traceMicro(uint page, vec3 localPos, vec3 rd, vec3 sgn, bvec3 enterMask,
     ivec3 rayStep = ivec3(sgn);
     outTMicro = 0.0;
     outTFine = 0.0;
+    outFine = ivec3(0);
 
     if (getMicroVoxel(page, mapPos)) {
         vec3 local01 = clamp(localPos - vec3(mapPos), vec3(0.0), vec3(0.9999));
+        if (!useFine) {
+            outMicro = mapPos;
+            outMask = mask;
+            outUvw = local01;
+            return true;
+        }
         if (traceFine(page, mapPos, local01 * 2.0, rd, sgn, mask, outFine, outMask, outUvw, outTFine,
                       outSteps)) {
             outMicro = mapPos;
@@ -368,6 +380,13 @@ bool traceMicro(uint page, vec3 localPos, vec3 rd, vec3 sgn, bvec3 enterMask,
             float tHit = dot(sideDist - deltaDist, vec3(mask));
             vec3 hitPos = localPos + rd * tHit;
             vec3 local01 = clamp(hitPos - vec3(mapPos), vec3(0.0), vec3(0.9999));
+            if (!useFine) {
+                outMicro = mapPos;
+                outMask = mask;
+                outUvw = local01;
+                outTMicro = tHit;
+                return true;
+            }
             if (traceFine(page, mapPos, local01 * 2.0, rd, sgn, mask, outFine, outMask, outUvw,
                           outTFine, outSteps)) {
                 outMicro = mapPos;
@@ -419,7 +438,6 @@ ObjectHit traverseObject(GpuVoxelObject o, vec3 Ow, vec3 Dw, float tWorldMin, fl
     vec3 tLarger = max(t0, t1);
     float tEnter = max(max(tSmaller.x, tSmaller.y), max(tSmaller.z, 0.0));
     float tExit = min(min(tLarger.x, tLarger.y), tLarger.z);
-    // Hull t is world meters along the camera ray; DDA t is meters / voxelSize.
     tEnter = max(tEnter, tWorldMin / max(o.voxelSize, 1e-6));
     tExit = min(tExit, tWorldMax / max(o.voxelSize, 1e-6));
     if (tEnter > tExit) {
@@ -453,6 +471,8 @@ ObjectHit traverseObject(GpuVoxelObject o, vec3 Ow, vec3 Dw, float tWorldMin, fl
     float tHitLocal = tEnter;
     uint steps = 0u;
     bool nested = (o.flags & FLAG_NESTED) != 0u;
+    bool allowBrick = nested && ubo.traceStage < STAGE_COARSE;
+    bool allowFine = allowBrick && ubo.traceStage < STAGE_NO_FINE;
 
     for (uint i = 0u; i < ubo.maxSteps; ++i) {
         steps = i + 1u;
@@ -475,19 +495,23 @@ ObjectHit traverseObject(GpuVoxelObject o, vec3 Ow, vec3 Dw, float tWorldMin, fl
             }
 
             bool hasBrick = cell.brickPage != INVALID_BRICK_PAGE;
-            if (!nested || !hasBrick) {
+            if (!allowBrick || !hasBrick) {
                 tHitLocal = tCoarse;
                 hit = true;
                 // Uniform solid (no brick): skip nested occupancy DDA, but keep 16^3
                 // AO so a 1-fine placement does not occlude a whole coarse face.
-                if (nested && !hasBrick) {
+                if (allowBrick && !hasBrick) {
                     vec3 microF = clamp(local01 * 8.0, vec3(0.0), vec3(7.9999));
                     microPos = ivec3(floor(microF));
-                    vec3 fineF = clamp((microF - vec3(microPos)) * 2.0, vec3(0.0), vec3(1.9999));
-                    finePos = ivec3(floor(fineF));
-                    hitUvw = clamp(fineF - vec3(finePos), vec3(0.0), vec3(1.0));
                     usedMicro = true;
-                    usedFine = true;
+                    if (allowFine) {
+                        vec3 fineF = clamp((microF - vec3(microPos)) * 2.0, vec3(0.0), vec3(1.9999));
+                        finePos = ivec3(floor(fineF));
+                        hitUvw = clamp(fineF - vec3(finePos), vec3(0.0), vec3(1.0));
+                        usedFine = true;
+                    } else {
+                        hitUvw = clamp(microF - vec3(microPos), vec3(0.0), vec3(1.0));
+                    }
                 } else {
                     hitUvw = local01;
                 }
@@ -500,11 +524,11 @@ ObjectHit traverseObject(GpuVoxelObject o, vec3 Ow, vec3 Dw, float tWorldMin, fl
             vec3 microUvw;
             float tMicro = 0.0;
             float tFine = 0.0;
-            if (traceMicro(cell.brickPage, local01 * 8.0, rd, sgn, mask, hitMicro, hitFine, microMask,
-                           microUvw, tMicro, tFine, steps)) {
+            if (traceMicro(cell.brickPage, local01 * 8.0, rd, sgn, mask, allowFine, hitMicro,
+                           hitFine, microMask, microUvw, tMicro, tFine, steps)) {
                 hit = true;
                 usedMicro = true;
-                usedFine = true;
+                usedFine = allowFine;
                 microPos = hitMicro;
                 finePos = hitFine;
                 mask = microMask;
@@ -563,6 +587,17 @@ ObjectHit traverseObject(GpuVoxelObject o, vec3 Ow, vec3 Dw, float tWorldMin, fl
         return result;
     }
 
+    vec3 hitLocalMeters = (ro + rd * tHitLocal) * o.voxelSize;
+    vec3 hitWorld = (o.objectToWorld * vec4(hitLocalMeters, 1.0)).xyz;
+    result.tWorld = dot(hitWorld - Ow, Dw);
+    result.hit = true;
+
+    if ((ubo.solidColor != 0u || ubo.traceStage >= STAGE_NO_SHADE) &&
+        (ubo.renderMode == MODE_SHADED || ubo.renderMode == MODE_ALBEDO)) {
+        result.color = ubo.solidColor != 0u ? ubo.solidRgb : albedoForVoxel(o, matId);
+        return result;
+    }
+
     vec3 normalLocal = -vec3(mask) * sgn;
     vec3 normalWorld = normalize(mat3(o.objectToWorld) * normalLocal);
     vec3 albedo = albedoForVoxel(o, matId);
@@ -571,11 +606,6 @@ ObjectHit traverseObject(GpuVoxelObject o, vec3 Ow, vec3 Dw, float tWorldMin, fl
                               : (usedMicro ? (mapPos * 8 + microPos) : mapPos);
     uint aoSpace = usedFine ? 2u : (usedMicro ? 1u : 0u);
     float ao = evalVoxelAo(o, solidPos, mask, sgn, hitUvw, aoSpace);
-
-    vec3 hitLocalMeters = (ro + rd * tHitLocal) * o.voxelSize;
-    vec3 hitWorld = (o.objectToWorld * vec4(hitLocalMeters, 1.0)).xyz;
-    result.tWorld = dot(hitWorld - Ow, Dw);
-    result.hit = true;
 
     if (ubo.renderMode == MODE_ALBEDO) {
         result.color = albedo;
@@ -607,36 +637,17 @@ void main() {
     vec3 dirView = normalize(vec3(ndc.x / ubo.projX, ndc.y / ubo.projY, -1.0));
     vec3 dir = normalize((ubo.invView * vec4(dirView, 0.0)).xyz);
 
-    if (ubo.skipTrace != 0u) {
+    if (ubo.traceStage >= STAGE_SKIP_DDA) {
         imageStore(outImage, pixel, vec4(sampleSky(dir), 1.0));
         return;
     }
 
-    float t0 = texelFetch(tMinMap, pixel, 0).r;
-    float t1 = texelFetch(tMaxMap, pixel, 0).r;
-    float tBack = texelFetch(tBackMap, pixel, 0).r;
-    const float kHullInf = 1.0e9;
-    if (ubo.debugHullTmin != 0u) {
-        vec3 vis = (t0 >= kHullInf) ? vec3(0.02, 0.03, 0.08) : vec3(clamp(t0 / 40.0, 0.0, 1.0));
-        imageStore(outImage, pixel, vec4(vis, 1.0));
+    if (ubo.traceStage >= STAGE_INTERVAL) {
+        imageStore(outImage, pixel, vec4(sampleSky(dir), 1.0));
         return;
     }
-    // Hadwiger / Scharsach: if the near plane intersects the proxy, leftover
-    // front/back faces are the WRONG start (often the far wall). Always start
-    // at the camera / near plane when inside the volume AABB.
-    if (ubo.cameraInside != 0u) {
-        t0 = 0.0;
-        if (t1 < 1.0e-3 || t1 >= kHullInf) {
-            t1 = 1.0e4;
-        }
-    } else if (tBack <= t0 + 1.0e-4) {
-        t0 = 0.0;
-    }
-    if (!(t0 < t1) || t0 >= kHullInf) {
-        vec3 missColor = (ubo.renderMode == MODE_STEPS) ? stepsToColor(0u) : sampleSky(dir);
-        imageStore(outImage, pixel, vec4(missColor, 1.0));
-        return;
-    }
+    const float t0 = 0.0;
+    const float t1 = 1.0e4;
 
     vec3 color = sampleSky(dir);
     float bestT = FLT_MAX;

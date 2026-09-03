@@ -30,32 +30,24 @@ private:
     uint32_t maxSteps;
     uint32_t renderMode;
     float skyColor[3];
-    uint32_t skipTrace;
+    uint32_t traceStage;
     float aoStrength;
     float aoPower;
     float skyYaw;
     float skyIntensity;
     uint32_t useSky;
     uint32_t objectCount;
-    uint32_t debugHullTmin;
-    uint32_t cameraInside;
+    uint32_t solidColor;
+    uint32_t padBefore;
+    uint32_t padVec4[4];
+    float solidRgb[3];
+    float padSolidEnd;
   };
-
-  struct HullPC {
-    float viewProj[16];
-    float model[16];
-    float cameraPos[3];
-    float nearZ;
-    float cameraFwd[3];
-    float pad;
-  };
+  static_assert(sizeof(VoxelDdaUBO) == 256, "VoxelDdaUBO std140 size mismatch");
 
   struct FrameResources {
     AllocatedBuffer frameUBO{};
     VkDescriptorSet frameSet = VK_NULL_HANDLE;
-    AllocatedImage tMin{};
-    AllocatedImage tMax{};
-    AllocatedImage tBack{};
   };
 
   enum TimestampSlot : uint32_t {
@@ -66,14 +58,19 @@ private:
     kTsPerFrame = 4,
   };
 
+  enum TraceStage : uint32_t {
+    kStageFull = 0,
+    kStageNoShade = 1,
+    kStageNoFine = 2,
+    kStageCoarse = 3,
+    kStageInterval = 4,
+    kStageSkipDda = 5,
+  };
+
   void createDescriptors();
   void createPipelines();
   void createOutputImage();
   void destroyOutputImage();
-  void createIntervalImages();
-  void destroyIntervalImages();
-  void recordHullPass(VkCommandBuffer cmd, VoxelScene& scene, VkExtent2D extent,
-                      uint32_t frameIndex);
   void updateDescriptors(VoxelScene& scene);
   void updateFrameUBO(VoxelScene& scene, uint32_t frameIndex);
   void createTimestampPool();
@@ -92,12 +89,8 @@ private:
 
   VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
   VkPipeline computePipeline_ = VK_NULL_HANDLE;
-  VkPipelineLayout hullPipelineLayout_ = VK_NULL_HANDLE;
-  VkPipeline hullPipeline_ = VK_NULL_HANDLE;
 
   AllocatedImage outImage_{};
-  VkSampler intervalSampler_ = VK_NULL_HANDLE;
-  VkFormat intervalFormat_ = VK_FORMAT_R32_SFLOAT;
   static constexpr VkFormat kOutFormat = VK_FORMAT_R8G8B8A8_UNORM;
 
   std::array<FrameResources, GfxDevice::kFramesInFlight> frames_{};
@@ -109,13 +102,9 @@ private:
   VkBuffer boundPaletteBuffer_ = VK_NULL_HANDLE;
   VkBuffer boundOccMipBuffer_ = VK_NULL_HANDLE;
   VkImageView boundSkyView_ = VK_NULL_HANDLE;
-  VkImageView boundTminView_ = VK_NULL_HANDLE;
-  VkImageView boundTmaxView_ = VK_NULL_HANDLE;
-  VkImageView boundTbackView_ = VK_NULL_HANDLE;
   bool imguiReady_ = false;
   float displayFps_ = 0.0f;
-  bool skipTrace_ = false;
-  bool showHullTmin_ = false;
+  int traceStage_ = 0;
 
   VkQueryPool timestampPool_ = VK_NULL_HANDLE;
   float timestampPeriodNs_ = 1.0f;

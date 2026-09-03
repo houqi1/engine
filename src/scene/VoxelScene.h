@@ -99,7 +99,6 @@ public:
   void update(float dt);
   void handleEditInput(GLFWwindow* window, GfxDevice& gfx);
   void rebuildVoxels(GfxDevice& gfx);
-  void rebuildOccupancyHull(GfxDevice& gfx);
   void uploadObjectTransforms(GfxDevice& gfx);
   bool importSurfaceMesh(GfxDevice& gfx, const std::string& path, const MeshVoxelizeConfig& cfg);
   void removeImportedMesh(GfxDevice& gfx);
@@ -123,13 +122,6 @@ public:
   const AllocatedImage& dummyGridImage() const { return dummyGrid3D_; }
   VkSampler gridSampler() const { return gridSampler_; }
   const AllocatedBuffer& dummyBrickSlabBuffer() const { return dummyBrickSlabBuffer_; }
-  const AllocatedBuffer& hullVertexBuffer() const { return hullVertexBuffer_; }
-  const AllocatedBuffer& hullIndexBuffer() const { return hullIndexBuffer_; }
-  uint32_t hullIndexCount() const { return hullIndexCount_; }
-  const AllocatedBuffer& spinnerObbVertexBuffer() const { return spinnerObbVertexBuffer_; }
-  const AllocatedBuffer& spinnerObbIndexBuffer() const { return spinnerObbIndexBuffer_; }
-  uint32_t spinnerObbIndexCount() const { return spinnerObbIndexCount_; }
-  bool& hullConservativeDilate() { return hullDilate_; }
   const AllocatedBuffer& objectBuffer() const { return objectBuffer_; }
   uint32_t brickSlabCount() const { return static_cast<uint32_t>(slabs_.size()); }
   const AllocatedBuffer& brickSlabBuffer(uint32_t i) const { return slabs_[i].gpu; }
@@ -161,18 +153,13 @@ public:
   bool hasSky() const { return sky_.image.image != VK_NULL_HANDLE; }
   uint32_t& maxSteps() { return maxSteps_; }
   int& renderMode() { return renderMode_; }
+  bool& solidColorOutput() { return solidColorOutput_; }
+  glm::vec3& solidColor() { return solidColor_; }
   int& brushMaterial() { return brushMaterial_; }
   float& brushRadius() { return brushRadius_; }
   bool& nestedMicroVoxels() { return nestedMicroVoxels_; }
   float& spinSpeed() { return spinSpeed_; }
   bool& spinnerEnabled() { return spinnerEnabled_; }
-  bool spinnerDrawEnabled() const {
-    return spinnerEnabled_ && objects_.size() >= 2 && objects_[1].enabled;
-  }
-  glm::mat4 spinnerObjectToWorld() const {
-    return objects_.size() >= 2 ? objects_[1].objectToWorld() : glm::mat4(1.0f);
-  }
-  bool cameraInsideWorldAabb() const;
 
   std::optional<VoxelHit> lastHit() const { return lastHit_; }
 
@@ -224,7 +211,6 @@ private:
   void destroyGridImages(GfxDevice& gfx);
   void flushObject(GfxDevice& gfx, int objectIndex);
   void flushDirtyPages(GfxDevice& gfx);
-  void destroyOccupancyHull(GfxDevice& gfx);
 
   int applyCoarseSphereBrush(VoxelObject& o, const glm::ivec3& center, float radius,
                              uint32_t material, bool placeOnlyEmpty);
@@ -254,13 +240,6 @@ private:
   AllocatedBuffer objectBuffer_{};
   AllocatedBuffer paletteBuffer_{};
   AllocatedBuffer occMipBuffer_{};
-  AllocatedBuffer hullVertexBuffer_{};
-  AllocatedBuffer hullIndexBuffer_{};
-  uint32_t hullIndexCount_ = 0;
-  AllocatedBuffer spinnerObbVertexBuffer_{};
-  AllocatedBuffer spinnerObbIndexBuffer_{};
-  uint32_t spinnerObbIndexCount_ = 0;
-  bool hullDilate_ = true;
   MeshVoxelizerGpu voxelizeGpu_{};
   std::array<glm::vec4, 256> importPalette_{};
   std::string importPath_;
@@ -296,6 +275,8 @@ private:
   uint32_t occupiedMicroCount_ = 0;
   uint32_t occupiedFineCount_ = 0;
   int renderMode_ = 0;
+  bool solidColorOutput_ = false;
+  glm::vec3 solidColor_{0.62f, 0.64f, 0.68f};
   int brushMaterial_ = 1;
   float brushRadius_ = 0.0f;
   bool nestedMicroVoxels_ = true;
