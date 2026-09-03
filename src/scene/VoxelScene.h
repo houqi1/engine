@@ -37,7 +37,7 @@ struct GpuVoxelObject {
   float _pad0[3];
   uint32_t gridSize[3];
   uint32_t flags;  // bit0 = nestedMicro, bit1 = enabled
-  uint32_t voxelOffset;
+  uint32_t voxelOffset;  // grids[] texture index (0 = world, 1 = spinner)
   uint32_t occMipOffset;  // occupancy mip, in uints
   uint32_t occMipWords;
   uint32_t _pad1;
@@ -66,7 +66,7 @@ struct VoxelObject {
   bool useImportPalette = false;
 
   std::vector<CoarseCell> cells;
-  uint32_t voxelOffset = 0;
+  uint32_t voxelOffset = 0;  // grids[] texture index (0 = world, 1 = spinner)
   uint32_t occMipOffset = 0;
   uint32_t occMipWords = 0;
 
@@ -91,12 +91,15 @@ public:
       kPagesPerSlab * static_cast<uint32_t>(kBrickPageWords);
   static constexpr int kOccMipRes = 4;
   static constexpr int kOccMipShift = 2;
+  static constexpr uint32_t kGridTexCount = 2;
+  static constexpr VkFormat kGridFormat = VK_FORMAT_R32G32_UINT;
 
   void init(GfxDevice& gfx);
   void cleanup(GfxDevice& gfx);
   void update(float dt);
   void handleEditInput(GLFWwindow* window, GfxDevice& gfx);
   void rebuildVoxels(GfxDevice& gfx);
+  void rebuildOccupancyHull(GfxDevice& gfx);
   void uploadObjectTransforms(GfxDevice& gfx);
   bool importSurfaceMesh(GfxDevice& gfx, const std::string& path, const MeshVoxelizeConfig& cfg);
   void removeImportedMesh(GfxDevice& gfx);
@@ -114,14 +117,25 @@ public:
   Camera& camera() { return camera_; }
   const Camera& camera() const { return camera_; }
 
-  const AllocatedBuffer& voxelBuffer() const { return voxelBuffer_; }
+  const AllocatedImage& gridImage(uint32_t i) const {
+    return i < kGridTexCount ? grid3D_[i] : dummyGrid3D_;
+  }
+  const AllocatedImage& dummyGridImage() const { return dummyGrid3D_; }
+  VkSampler gridSampler() const { return gridSampler_; }
   const AllocatedBuffer& dummyBrickSlabBuffer() const { return dummyBrickSlabBuffer_; }
+  const AllocatedBuffer& hullVertexBuffer() const { return hullVertexBuffer_; }
+  const AllocatedBuffer& hullIndexBuffer() const { return hullIndexBuffer_; }
+  uint32_t hullIndexCount() const { return hullIndexCount_; }
+  const AllocatedBuffer& spinnerObbVertexBuffer() const { return spinnerObbVertexBuffer_; }
+  const AllocatedBuffer& spinnerObbIndexBuffer() const { return spinnerObbIndexBuffer_; }
+  uint32_t spinnerObbIndexCount() const { return spinnerObbIndexCount_; }
+  bool& hullConservativeDilate() { return hullDilate_; }
   const AllocatedBuffer& objectBuffer() const { return objectBuffer_; }
   uint32_t brickSlabCount() const { return static_cast<uint32_t>(slabs_.size()); }
   const AllocatedBuffer& brickSlabBuffer(uint32_t i) const { return slabs_[i].gpu; }
   uint32_t objectCount() const { return static_cast<uint32_t>(objectsGpu_.size()); }
 
-  uint32_t voxelCount() const { return static_cast<uint32_t>(voxelsCpu_.size()); }
+  uint32_t voxelCount() const;
   uint32_t occupiedCount() const { return occupiedCount_; }
   uint32_t occupiedMicroCount() const { return occupiedMicroCount_; }
   uint32_t occupiedFineCount() const { return occupiedFineCount_; }
@@ -152,6 +166,13 @@ public:
   bool& nestedMicroVoxels() { return nestedMicroVoxels_; }
   float& spinSpeed() { return spinSpeed_; }
   bool& spinnerEnabled() { return spinnerEnabled_; }
+  bool spinnerDrawEnabled() const {
+    return spinnerEnabled_ && objects_.size() >= 2 && objects_[1].enabled;
+  }
+  glm::mat4 spinnerObjectToWorld() const {
+    return objects_.size() >= 2 ? objects_[1].objectToWorld() : glm::mat4(1.0f);
+  }
+  bool cameraInsideWorldAabb() const;
 
   std::optional<VoxelHit> lastHit() const { return lastHit_; }
 
@@ -197,8 +218,13 @@ private:
   void writeFineByte(uint32_t page, uint32_t microBit, uint8_t value);
   void ensureSlabCpu(uint32_t slabIndex);
   void ensureGpuBuffers(GfxDevice& gfx);
+  void ensureCoarseGridFormat(GfxDevice& gfx);
+  void ensureGridImages(GfxDevice& gfx);
+  void uploadGridImage(GfxDevice& gfx, uint32_t objectIndex);
+  void destroyGridImages(GfxDevice& gfx);
   void flushObject(GfxDevice& gfx, int objectIndex);
   void flushDirtyPages(GfxDevice& gfx);
+  void destroyOccupancyHull(GfxDevice& gfx);
 
   int applyCoarseSphereBrush(VoxelObject& o, const glm::ivec3& center, float radius,
                              uint32_t material, bool placeOnlyEmpty);
@@ -220,11 +246,21 @@ private:
     AllocatedBuffer gpu{};
   };
   Camera camera_;
-  AllocatedBuffer voxelBuffer_{};
+  std::array<AllocatedImage, kGridTexCount> grid3D_{};
+  AllocatedImage dummyGrid3D_{};
+  VkSampler gridSampler_ = VK_NULL_HANDLE;
+  bool gridFormatChecked_ = false;
   AllocatedBuffer dummyBrickSlabBuffer_{};
   AllocatedBuffer objectBuffer_{};
   AllocatedBuffer paletteBuffer_{};
   AllocatedBuffer occMipBuffer_{};
+  AllocatedBuffer hullVertexBuffer_{};
+  AllocatedBuffer hullIndexBuffer_{};
+  uint32_t hullIndexCount_ = 0;
+  AllocatedBuffer spinnerObbVertexBuffer_{};
+  AllocatedBuffer spinnerObbIndexBuffer_{};
+  uint32_t spinnerObbIndexCount_ = 0;
+  bool hullDilate_ = true;
   MeshVoxelizerGpu voxelizeGpu_{};
   std::array<glm::vec4, 256> importPalette_{};
   std::string importPath_;
@@ -237,7 +273,6 @@ private:
 
   std::vector<VoxelObject> objects_;
   std::vector<GpuVoxelObject> objectsGpu_;
-  std::vector<CoarseCell> voxelsCpu_;
   std::vector<uint32_t> occMipCpu_;
   std::vector<BrickSlab> slabs_;
   std::vector<uint32_t> freePages_;

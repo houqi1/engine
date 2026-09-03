@@ -151,6 +151,8 @@ set(VE_SHADER_SOURCES
   voxel.frag
   voxel_dda.comp
   voxelize_surface.comp
+  hull.vert
+  hull.frag
 )
 
 set(VE_SPV_FILES "")

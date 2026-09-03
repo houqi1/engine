@@ -49,11 +49,16 @@ public:
                              VkImageAspectFlags aspect, bool dedicated = false,
                              uint32_t mipLevels = 1,
                              VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT);
+  AllocatedImage createImage3D(VkExtent3D extent, VkFormat format, VkImageUsageFlags usage,
+                               VkImageAspectFlags aspect, bool dedicated = false);
   AllocatedImage createCubemap(uint32_t size, VkFormat format, VkImageUsageFlags usage,
                                uint32_t mipLevels = 1);
   void destroyImage(AllocatedImage& image);
   void uploadToImage(AllocatedImage& image, const void* data, VkDeviceSize size, VkExtent3D extent,
                      bool generateMips = false);
+  // Tightly packed 8-byte texels (R32G32_UINT). Whole image, mip 0, no blit.
+  void uploadToImage3D(AllocatedImage& image, const void* data, VkDeviceSize size,
+                       VkExtent3D extent);
   // RGBA32F tightly packed: for each mip, 6 faces in +X,-X,+Y,-Y,+Z,-Z order.
   void uploadCubemapRGBA32F(AllocatedImage& image, const float* data);
   void downloadCubemapRGBA32F(AllocatedImage& image, std::vector<float>& out);
@@ -65,7 +70,8 @@ public:
   void destroyImageView(VkImageView view) const;
 
   VkSampler createSampler(VkFilter filter, VkSamplerAddressMode addressMode, bool anisotropy,
-                          uint32_t mipLevels = 1, float mipLodBias = 0.0f);
+                          uint32_t mipLevels = 1, float mipLodBias = 0.0f,
+                          VkSamplerMipmapMode mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR);
   void destroySampler(VkSampler sampler);
 
   VkShaderModule loadShaderModule(const std::string& path) const;

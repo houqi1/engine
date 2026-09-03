@@ -1,5 +1,6 @@
 #include "gfx/PipelineBuilder.h"
 
+#include <algorithm>
 #include <stdexcept>
 
 PipelineBuilder& PipelineBuilder::setShaders(VkShaderModule vert, VkShaderModule frag) {
@@ -67,6 +68,11 @@ PipelineBuilder& PipelineBuilder::setDepthTest(bool enable, bool write, VkCompar
   return *this;
 }
 
+PipelineBuilder& PipelineBuilder::setDepthClamp(bool enable) {
+  depthClamp_ = enable;
+  return *this;
+}
+
 PipelineBuilder& PipelineBuilder::setColorBlend(bool enableAlphaBlend) {
   blend_ = enableAlphaBlend;
   return *this;
@@ -74,6 +80,19 @@ PipelineBuilder& PipelineBuilder::setColorBlend(bool enableAlphaBlend) {
 
 PipelineBuilder& PipelineBuilder::setColorFormat(VkFormat format) {
   colorFormat_ = format;
+  colorFormats_ = {format};
+  return *this;
+}
+
+PipelineBuilder& PipelineBuilder::setColorFormats(const std::vector<VkFormat>& formats) {
+  colorFormats_ = formats;
+  colorFormat_ = formats.empty() ? VK_FORMAT_UNDEFINED : formats[0];
+  return *this;
+}
+
+PipelineBuilder& PipelineBuilder::setMinMaxBlend(uint32_t attachmentCount) {
+  minMaxBlendCount_ = std::max(2u, std::min(attachmentCount, 3u));
+  blend_ = false;
   return *this;
 }
 
@@ -117,7 +136,7 @@ VkPipeline PipelineBuilder::build(VkDevice device) const {
   raster.cullMode = cullMode_;
   raster.frontFace = frontFace_;
   raster.lineWidth = 1.0f;
-  raster.depthClampEnable = VK_FALSE;
+  raster.depthClampEnable = depthClamp_ ? VK_TRUE : VK_FALSE;
   raster.depthBiasEnable = VK_FALSE;
 
   VkPipelineMultisampleStateCreateInfo ms{};
@@ -131,25 +150,39 @@ VkPipeline PipelineBuilder::build(VkDevice device) const {
   depth.depthCompareOp = depthCompare_;
   depth.maxDepthBounds = 1.0f;
 
-  VkPipelineColorBlendAttachmentState colorAttach{};
-  colorAttach.colorWriteMask = colorWrite_
-                                   ? (VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                                      VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT)
-                                   : 0;
-  if (blend_) {
-    colorAttach.blendEnable = VK_TRUE;
-    colorAttach.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
-    colorAttach.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-    colorAttach.colorBlendOp = VK_BLEND_OP_ADD;
-    colorAttach.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
-    colorAttach.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
-    colorAttach.alphaBlendOp = VK_BLEND_OP_ADD;
+  std::vector<VkPipelineColorBlendAttachmentState> colorAttaches;
+  const uint32_t colorCount = !colorFormats_.empty()
+                                  ? static_cast<uint32_t>(colorFormats_.size())
+                                  : (colorFormat_ != VK_FORMAT_UNDEFINED ? 1u : 0u);
+  colorAttaches.resize(std::max(colorCount, minMaxBlendCount_));
+  for (uint32_t i = 0; i < colorAttaches.size(); ++i) {
+    VkPipelineColorBlendAttachmentState& att = colorAttaches[i];
+    att.colorWriteMask = colorWrite_ ? (VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                        VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT)
+                                     : 0;
+    if (minMaxBlendCount_ > 0 && i < minMaxBlendCount_) {
+      att.blendEnable = VK_TRUE;
+      att.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+      att.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+      att.colorBlendOp = (i == 1u) ? VK_BLEND_OP_MAX : VK_BLEND_OP_MIN;
+      att.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+      att.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+      att.alphaBlendOp = att.colorBlendOp;
+    } else if (blend_) {
+      att.blendEnable = VK_TRUE;
+      att.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+      att.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+      att.colorBlendOp = VK_BLEND_OP_ADD;
+      att.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+      att.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+      att.alphaBlendOp = VK_BLEND_OP_ADD;
+    }
   }
 
   VkPipelineColorBlendStateCreateInfo blend{};
   blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-  blend.attachmentCount = colorWrite_ || colorFormat_ != VK_FORMAT_UNDEFINED ? 1 : 0;
-  blend.pAttachments = &colorAttach;
+  blend.attachmentCount = static_cast<uint32_t>(colorAttaches.size());
+  blend.pAttachments = colorAttaches.empty() ? nullptr : colorAttaches.data();
 
   std::vector<VkDynamicState> dynamics = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
   VkPipelineDynamicStateCreateInfo dynamicState{};
@@ -159,9 +192,13 @@ VkPipeline PipelineBuilder::build(VkDevice device) const {
 
   VkPipelineRenderingCreateInfo rendering{};
   rendering.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
-  if (colorFormat_ != VK_FORMAT_UNDEFINED) {
-    rendering.colorAttachmentCount = 1;
-    rendering.pColorAttachmentFormats = &colorFormat_;
+  std::vector<VkFormat> formats = colorFormats_;
+  if (formats.empty() && colorFormat_ != VK_FORMAT_UNDEFINED) {
+    formats = {colorFormat_};
+  }
+  if (!formats.empty()) {
+    rendering.colorAttachmentCount = static_cast<uint32_t>(formats.size());
+    rendering.pColorAttachmentFormats = formats.data();
   }
   rendering.depthAttachmentFormat = depthFormat_;
 

@@ -21,8 +21,8 @@ layout(set = 0, binding = 0, std140) uniform VoxelDdaUBO {
     float skyIntensity;
     uint useSky;
     uint objectCount;
-    float _pad1;
-    float _pad2;
+    uint debugHullTmin;
+    uint cameraInside;
 } ubo;
 
 struct CoarseCell {
@@ -30,9 +30,7 @@ struct CoarseCell {
     uint brickPage;  // 0xFFFFFFFFu = none
 };
 
-layout(set = 0, binding = 1, std430) readonly buffer VoxelGrid {
-    CoarseCell cells[];
-};
+layout(set = 0, binding = 1) uniform usampler3D grids[2];
 
 layout(set = 0, binding = 2, rgba8) writeonly uniform image2D outImage;
 
@@ -52,7 +50,7 @@ struct GpuVoxelObject {
     float _pad2;
     uvec3 gridSize;
     uint flags;  // bit0 nestedMicro, bit1 enabled, bit2 importPalette
-    uint voxelOffset;
+    uint voxelOffset;  // grids[] texture index (0 = world, 1 = spinner)
     uint occMipOffset;
     uint occMipWords;
     uint _pad4;
@@ -69,6 +67,10 @@ layout(set = 0, binding = 6, std430) readonly buffer ImportPalette {
 layout(set = 0, binding = 7, std430) readonly buffer OccupancyMip {
     uint occMip[];
 };
+
+layout(set = 0, binding = 8) uniform sampler2D tMinMap;
+layout(set = 0, binding = 9) uniform sampler2D tMaxMap;
+layout(set = 0, binding = 10) uniform sampler2D tBackMap;
 
 const uint MODE_SHADED = 0u;
 const uint MODE_ALBEDO = 1u;
@@ -116,20 +118,23 @@ vec3 sampleSky(vec3 dir) {
     return pow(ldr, vec3(1.0 / 2.2));
 }
 
-uint voxelIndexLocal(GpuVoxelObject o, ivec3 p) {
-    return uint(p.x) + uint(p.y) * o.gridSize.x + uint(p.z) * o.gridSize.x * o.gridSize.y;
-}
-
-uint voxelIndex(GpuVoxelObject o, ivec3 p) {
-    return o.voxelOffset + voxelIndexLocal(o, p);
-}
-
 bool insideGrid(GpuVoxelObject o, ivec3 p) {
     return all(greaterThanEqual(p, ivec3(0))) && all(lessThan(p, ivec3(o.gridSize)));
 }
 
 CoarseCell readCell(GpuVoxelObject o, ivec3 p) {
-    return cells[voxelIndex(o, p)];
+    uvec2 packed;
+    // Unroll: MoltenVK has been unreliable with nonuniform array indexing
+    // (same reason brick slabs are unrolled).
+    if (o.voxelOffset == 0u) {
+        packed = texelFetch(grids[0], p, 0).xy;
+    } else {
+        packed = texelFetch(grids[1], p, 0).xy;
+    }
+    CoarseCell c;
+    c.material = packed.x;
+    c.brickPage = packed.y;
+    return c;
 }
 
 uint loadBrickWord(uint page, uint wordIndex) {
@@ -381,7 +386,7 @@ struct ObjectHit {
     uint steps;
 };
 
-ObjectHit traverseObject(GpuVoxelObject o, vec3 Ow, vec3 Dw) {
+ObjectHit traverseObject(GpuVoxelObject o, vec3 Ow, vec3 Dw, float tWorldMin, float tWorldMax) {
     ObjectHit result;
     result.hit = false;
     result.tWorld = FLT_MAX;
@@ -414,6 +419,9 @@ ObjectHit traverseObject(GpuVoxelObject o, vec3 Ow, vec3 Dw) {
     vec3 tLarger = max(t0, t1);
     float tEnter = max(max(tSmaller.x, tSmaller.y), max(tSmaller.z, 0.0));
     float tExit = min(min(tLarger.x, tLarger.y), tLarger.z);
+    // Hull t is world meters along the camera ray; DDA t is meters / voxelSize.
+    tEnter = max(tEnter, tWorldMin / max(o.voxelSize, 1e-6));
+    tExit = min(tExit, tWorldMax / max(o.voxelSize, 1e-6));
     if (tEnter > tExit) {
         return result;
     }
@@ -604,13 +612,39 @@ void main() {
         return;
     }
 
+    float t0 = texelFetch(tMinMap, pixel, 0).r;
+    float t1 = texelFetch(tMaxMap, pixel, 0).r;
+    float tBack = texelFetch(tBackMap, pixel, 0).r;
+    const float kHullInf = 1.0e9;
+    if (ubo.debugHullTmin != 0u) {
+        vec3 vis = (t0 >= kHullInf) ? vec3(0.02, 0.03, 0.08) : vec3(clamp(t0 / 40.0, 0.0, 1.0));
+        imageStore(outImage, pixel, vec4(vis, 1.0));
+        return;
+    }
+    // Hadwiger / Scharsach: if the near plane intersects the proxy, leftover
+    // front/back faces are the WRONG start (often the far wall). Always start
+    // at the camera / near plane when inside the volume AABB.
+    if (ubo.cameraInside != 0u) {
+        t0 = 0.0;
+        if (t1 < 1.0e-3 || t1 >= kHullInf) {
+            t1 = 1.0e4;
+        }
+    } else if (tBack <= t0 + 1.0e-4) {
+        t0 = 0.0;
+    }
+    if (!(t0 < t1) || t0 >= kHullInf) {
+        vec3 missColor = (ubo.renderMode == MODE_STEPS) ? stepsToColor(0u) : sampleSky(dir);
+        imageStore(outImage, pixel, vec4(missColor, 1.0));
+        return;
+    }
+
     vec3 color = sampleSky(dir);
     float bestT = FLT_MAX;
     uint bestSteps = 0u;
     bool anyHit = false;
 
     for (uint i = 0u; i < ubo.objectCount; ++i) {
-        ObjectHit h = traverseObject(objects[i], ubo.cameraPos, dir);
+        ObjectHit h = traverseObject(objects[i], ubo.cameraPos, dir, t0, t1);
         bestSteps = max(bestSteps, h.steps);
         if (ubo.renderMode == MODE_STEPS) {
             // Keep max steps visualization across objects.

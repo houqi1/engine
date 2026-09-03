@@ -37,12 +37,25 @@ private:
     float skyIntensity;
     uint32_t useSky;
     uint32_t objectCount;
-    float pad1[2];
+    uint32_t debugHullTmin;
+    uint32_t cameraInside;
+  };
+
+  struct HullPC {
+    float viewProj[16];
+    float model[16];
+    float cameraPos[3];
+    float nearZ;
+    float cameraFwd[3];
+    float pad;
   };
 
   struct FrameResources {
     AllocatedBuffer frameUBO{};
     VkDescriptorSet frameSet = VK_NULL_HANDLE;
+    AllocatedImage tMin{};
+    AllocatedImage tMax{};
+    AllocatedImage tBack{};
   };
 
   enum TimestampSlot : uint32_t {
@@ -57,6 +70,10 @@ private:
   void createPipelines();
   void createOutputImage();
   void destroyOutputImage();
+  void createIntervalImages();
+  void destroyIntervalImages();
+  void recordHullPass(VkCommandBuffer cmd, VoxelScene& scene, VkExtent2D extent,
+                      uint32_t frameIndex);
   void updateDescriptors(VoxelScene& scene);
   void updateFrameUBO(VoxelScene& scene, uint32_t frameIndex);
   void createTimestampPool();
@@ -75,21 +92,30 @@ private:
 
   VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
   VkPipeline computePipeline_ = VK_NULL_HANDLE;
+  VkPipelineLayout hullPipelineLayout_ = VK_NULL_HANDLE;
+  VkPipeline hullPipeline_ = VK_NULL_HANDLE;
 
   AllocatedImage outImage_{};
+  VkSampler intervalSampler_ = VK_NULL_HANDLE;
+  VkFormat intervalFormat_ = VK_FORMAT_R32_SFLOAT;
   static constexpr VkFormat kOutFormat = VK_FORMAT_R8G8B8A8_UNORM;
 
   std::array<FrameResources, GfxDevice::kFramesInFlight> frames_{};
-  VkBuffer boundVoxelBuffer_ = VK_NULL_HANDLE;
+  std::array<VkImageView, VoxelScene::kGridTexCount> boundGridViews_{};
+  VkSampler boundGridSampler_ = VK_NULL_HANDLE;
   std::array<VkBuffer, VoxelScene::kMaxBrickSlabs> boundBrickSlabs_{};
   uint32_t boundBrickSlabCount_ = 0;
   VkBuffer boundObjectBuffer_ = VK_NULL_HANDLE;
   VkBuffer boundPaletteBuffer_ = VK_NULL_HANDLE;
   VkBuffer boundOccMipBuffer_ = VK_NULL_HANDLE;
   VkImageView boundSkyView_ = VK_NULL_HANDLE;
+  VkImageView boundTminView_ = VK_NULL_HANDLE;
+  VkImageView boundTmaxView_ = VK_NULL_HANDLE;
+  VkImageView boundTbackView_ = VK_NULL_HANDLE;
   bool imguiReady_ = false;
   float displayFps_ = 0.0f;
   bool skipTrace_ = false;
+  bool showHullTmin_ = false;
 
   VkQueryPool timestampPool_ = VK_NULL_HANDLE;
   float timestampPeriodNs_ = 1.0f;

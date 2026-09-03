@@ -141,6 +141,7 @@ void GfxDevice::selectDevice() {
   VkPhysicalDeviceFeatures features{};
   features.samplerAnisotropy = VK_TRUE;
   features.fillModeNonSolid = VK_TRUE;
+  features.depthClamp = VK_TRUE;
 
   vkb::PhysicalDeviceSelector selector{instance_};
   auto devicesRet = selector.set_surface(surface_)
@@ -622,6 +623,7 @@ AllocatedImage GfxDevice::createImage(VkExtent3D extent, VkFormat format, VkImag
   out.mipLevels = mipLevels;
   out.layerCount = 1;
   out.samples = samples;
+  out.imageType = VK_IMAGE_TYPE_2D;
   if (vmaCreateImage(allocator_, &imageInfo, &allocInfo, &out.image, &out.allocation, nullptr) !=
       VK_SUCCESS) {
     fail("Failed to create image");
@@ -637,6 +639,56 @@ AllocatedImage GfxDevice::createImage(VkExtent3D extent, VkFormat format, VkImag
   viewInfo.subresourceRange.layerCount = 1;
   if (vkCreateImageView(device_.device, &viewInfo, nullptr, &out.view) != VK_SUCCESS) {
     fail("Failed to create image view");
+  }
+  return out;
+}
+
+AllocatedImage GfxDevice::createImage3D(VkExtent3D extent, VkFormat format, VkImageUsageFlags usage,
+                                        VkImageAspectFlags aspect, bool dedicated) {
+  if (extent.width == 0 || extent.height == 0 || extent.depth == 0) {
+    fail("createImage3D: extent must be non-zero in all dimensions");
+  }
+
+  VkImageCreateInfo imageInfo{};
+  imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+  imageInfo.imageType = VK_IMAGE_TYPE_3D;
+  imageInfo.format = format;
+  imageInfo.extent = extent;
+  imageInfo.mipLevels = 1;
+  imageInfo.arrayLayers = 1;
+  imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+  imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+  imageInfo.usage = usage;
+  imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+  VmaAllocationCreateInfo allocInfo{};
+  allocInfo.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+  if (dedicated) {
+    allocInfo.flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+  }
+
+  AllocatedImage out{};
+  out.extent = extent;
+  out.format = format;
+  out.mipLevels = 1;
+  out.layerCount = 1;
+  out.samples = VK_SAMPLE_COUNT_1_BIT;
+  out.imageType = VK_IMAGE_TYPE_3D;
+  if (vmaCreateImage(allocator_, &imageInfo, &allocInfo, &out.image, &out.allocation, nullptr) !=
+      VK_SUCCESS) {
+    fail("Failed to create 3D image");
+  }
+
+  VkImageViewCreateInfo viewInfo{};
+  viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+  viewInfo.image = out.image;
+  viewInfo.viewType = VK_IMAGE_VIEW_TYPE_3D;
+  viewInfo.format = format;
+  viewInfo.subresourceRange.aspectMask = aspect;
+  viewInfo.subresourceRange.levelCount = 1;
+  viewInfo.subresourceRange.layerCount = 1;
+  if (vkCreateImageView(device_.device, &viewInfo, nullptr, &out.view) != VK_SUCCESS) {
+    fail("Failed to create 3D image view");
   }
   return out;
 }
@@ -667,6 +719,7 @@ AllocatedImage GfxDevice::createCubemap(uint32_t size, VkFormat format, VkImageU
   out.format = format;
   out.mipLevels = mipLevels;
   out.layerCount = 6;
+  out.imageType = VK_IMAGE_TYPE_2D;
   if (vmaCreateImage(allocator_, &imageInfo, &allocInfo, &out.image, &out.allocation, nullptr) !=
       VK_SUCCESS) {
     fail("Failed to create cubemap image");
@@ -770,13 +823,65 @@ void GfxDevice::uploadToImage(AllocatedImage& image, const void* data, VkDeviceS
   destroyBuffer(staging);
 }
 
+void GfxDevice::uploadToImage3D(AllocatedImage& image, const void* data, VkDeviceSize size,
+                                VkExtent3D extent) {
+  if (!data || image.image == VK_NULL_HANDLE) {
+    fail("uploadToImage3D: invalid image or data");
+  }
+  if (extent.width == 0 || extent.height == 0 || extent.depth == 0) {
+    fail("uploadToImage3D: extent must be non-zero in all dimensions");
+  }
+  if (image.mipLevels != 1) {
+    fail("uploadToImage3D: mipmaps are not supported");
+  }
+  const VkDeviceSize expected = static_cast<VkDeviceSize>(extent.width) *
+                                static_cast<VkDeviceSize>(extent.height) *
+                                static_cast<VkDeviceSize>(extent.depth) * 8u;
+  if (size != expected) {
+    fail("uploadToImage3D: size must be tightly packed 8-byte texels");
+  }
+
+  AllocatedBuffer staging =
+      createBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
+  std::memcpy(staging.info.pMappedData, data, static_cast<size_t>(size));
+
+  const VkImageLayout oldLayout = image.layout;
+  const bool fromUndefined = oldLayout == VK_IMAGE_LAYOUT_UNDEFINED;
+  const VkPipelineStageFlags2 srcStage =
+      fromUndefined ? VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT
+                    : (VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                       VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT);
+  const VkAccessFlags2 srcAccess = fromUndefined ? 0 : VK_ACCESS_2_SHADER_READ_BIT;
+
+  immediateSubmit([&](VkCommandBuffer cmd) {
+    transitionImage(cmd, image.image, oldLayout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, srcStage,
+                    srcAccess, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    VkBufferImageCopy region{};
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.mipLevel = 0;
+    region.imageSubresource.layerCount = 1;
+    region.imageExtent = extent;
+    vkCmdCopyBufferToImage(cmd, staging.buffer, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                           &region);
+    transitionImage(cmd, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                    VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                    VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                    VK_ACCESS_2_SHADER_READ_BIT);
+  });
+
+  image.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  destroyBuffer(staging);
+}
+
 VkSampler GfxDevice::createSampler(VkFilter filter, VkSamplerAddressMode addressMode,
-                                   bool anisotropy, uint32_t mipLevels, float mipLodBias) {
+                                   bool anisotropy, uint32_t mipLevels, float mipLodBias,
+                                   VkSamplerMipmapMode mipmapMode) {
   VkSamplerCreateInfo info{};
   info.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
   info.magFilter = filter;
   info.minFilter = filter;
-  info.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+  info.mipmapMode = mipmapMode;
   info.addressModeU = addressMode;
   info.addressModeV = addressMode;
   info.addressModeW = addressMode;

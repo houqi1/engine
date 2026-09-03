@@ -18,6 +18,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -108,7 +109,8 @@ void VoxelScene::init(GfxDevice& gfx) {
 
 void VoxelScene::cleanup(GfxDevice& gfx) {
   voxelizeGpu_.destroy(gfx);
-  gfx.destroyBuffer(voxelBuffer_);
+  destroyOccupancyHull(gfx);
+  destroyGridImages(gfx);
   gfx.destroyBuffer(dummyBrickSlabBuffer_);
   gfx.destroyBuffer(objectBuffer_);
   gfx.destroyBuffer(paletteBuffer_);
@@ -119,7 +121,6 @@ void VoxelScene::cleanup(GfxDevice& gfx) {
   TextureFactory::destroy(gfx, sky_);
   objects_.clear();
   objectsGpu_.clear();
-  voxelsCpu_.clear();
   occMipCpu_.clear();
   slabs_.clear();
   freePages_.clear();
@@ -542,13 +543,38 @@ void VoxelScene::ensureCoarseBrick(VoxelObject& o, const glm::ivec3& coarse, uin
   }
 }
 
+bool VoxelScene::cameraInsideWorldAabb() const {
+  if (objects_.empty()) {
+    return false;
+  }
+  const VoxelObject& world = objects_[0];
+  if (world.gridSize <= 0 || world.voxelSize <= 0.0f) {
+    return false;
+  }
+  const glm::vec3 local =
+      glm::vec3(world.worldToObject() * glm::vec4(camera_.position(), 1.0f)) / world.voxelSize;
+  // One dilated macro past the grid: near-plane holes appear before the camera
+  // is strictly inside [0, N).
+  const float margin = static_cast<float>(kOccMipRes + 1);
+  const float n = static_cast<float>(world.gridSize);
+  return local.x >= -margin && local.y >= -margin && local.z >= -margin && local.x < n + margin &&
+         local.y < n + margin && local.z < n + margin;
+}
+
+uint32_t VoxelScene::voxelCount() const {
+  uint32_t n = 0;
+  for (const VoxelObject& o : objects_) {
+    n += static_cast<uint32_t>(o.cells.size());
+  }
+  return n;
+}
+
 void VoxelScene::packObjectPool() {
-  voxelsCpu_.clear();
   occMipCpu_.clear();
   occupiedCount_ = 0;
-  for (VoxelObject& o : objects_) {
-    o.voxelOffset = static_cast<uint32_t>(voxelsCpu_.size());
-    voxelsCpu_.insert(voxelsCpu_.end(), o.cells.begin(), o.cells.end());
+  for (size_t i = 0; i < objects_.size(); ++i) {
+    VoxelObject& o = objects_[i];
+    o.voxelOffset = static_cast<uint32_t>(i);
     for (const CoarseCell& c : o.cells) {
       if (c.material != 0u) {
         ++occupiedCount_;
@@ -599,6 +625,194 @@ void VoxelScene::fillOccMip(const VoxelObject& o, uint32_t* words, uint32_t word
   }
 }
 
+void VoxelScene::destroyOccupancyHull(GfxDevice& gfx) {
+  gfx.destroyBuffer(hullVertexBuffer_);
+  gfx.destroyBuffer(hullIndexBuffer_);
+  hullIndexCount_ = 0;
+  gfx.destroyBuffer(spinnerObbVertexBuffer_);
+  gfx.destroyBuffer(spinnerObbIndexBuffer_);
+  spinnerObbIndexCount_ = 0;
+}
+
+void VoxelScene::rebuildOccupancyHull(GfxDevice& gfx) {
+  std::vector<glm::vec3> verts;
+  std::vector<uint32_t> indices;
+
+  auto uploadMesh = [&](AllocatedBuffer& vb, AllocatedBuffer& ib, uint32_t& indexCount,
+                        const std::vector<glm::vec3>& v, const std::vector<uint32_t>& ix) {
+    indexCount = static_cast<uint32_t>(ix.size());
+    gfx.destroyBuffer(vb);
+    gfx.destroyBuffer(ib);
+    if (v.empty() || ix.empty()) {
+      indexCount = 0;
+      return;
+    }
+    const VkDeviceSize vBytes = sizeof(glm::vec3) * v.size();
+    const VkDeviceSize iBytes = sizeof(uint32_t) * ix.size();
+    vb = gfx.createBuffer(vBytes,
+                          VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                          VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+    ib = gfx.createBuffer(iBytes,
+                          VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                          VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+    gfx.uploadToBuffer(vb, v.data(), vBytes);
+    gfx.uploadToBuffer(ib, ix.data(), iBytes);
+  };
+
+  auto emitBox = [&](const glm::vec3& bmin, const glm::vec3& bmax, const glm::mat4& xform,
+                     std::vector<glm::vec3>& outV, std::vector<uint32_t>& outI) {
+    const glm::vec3 c[8] = {
+        {bmin.x, bmin.y, bmin.z}, {bmax.x, bmin.y, bmin.z}, {bmax.x, bmax.y, bmin.z},
+        {bmin.x, bmax.y, bmin.z}, {bmin.x, bmin.y, bmax.z}, {bmax.x, bmin.y, bmax.z},
+        {bmax.x, bmax.y, bmax.z}, {bmin.x, bmax.y, bmax.z},
+    };
+    const uint32_t faces[6][4] = {
+        {0, 1, 2, 3}, {5, 4, 7, 6}, {4, 0, 3, 7}, {1, 5, 6, 2}, {3, 2, 6, 7}, {4, 5, 1, 0},
+    };
+    for (const auto& f : faces) {
+      const uint32_t base = static_cast<uint32_t>(outV.size());
+      for (int i = 0; i < 4; ++i) {
+        const glm::vec4 w = xform * glm::vec4(c[f[i]], 1.0f);
+        outV.emplace_back(w.x, w.y, w.z);
+      }
+      outI.push_back(base + 0);
+      outI.push_back(base + 1);
+      outI.push_back(base + 2);
+      outI.push_back(base + 0);
+      outI.push_back(base + 2);
+      outI.push_back(base + 3);
+    }
+  };
+
+  auto emitQuad = [&](const glm::vec3& a, const glm::vec3& b, const glm::vec3& c, const glm::vec3& d,
+                      const glm::mat4& xform) {
+    const uint32_t base = static_cast<uint32_t>(verts.size());
+    const glm::vec3 corners[4] = {a, b, c, d};
+    for (const glm::vec3& p : corners) {
+      const glm::vec4 w = xform * glm::vec4(p, 1.0f);
+      verts.emplace_back(w.x, w.y, w.z);
+    }
+    indices.push_back(base + 0);
+    indices.push_back(base + 1);
+    indices.push_back(base + 2);
+    indices.push_back(base + 0);
+    indices.push_back(base + 2);
+    indices.push_back(base + 3);
+  };
+
+  if (!objects_.empty()) {
+    const VoxelObject& world = objects_[0];
+    const int n = std::max(world.gridSize, 1);
+    const uint32_t macroN = occMipAxis(static_cast<uint32_t>(n));
+    const uint32_t wordCount = world.occMipWords;
+    const uint32_t* words =
+        (world.occMipOffset + wordCount <= occMipCpu_.size()) ? occMipCpu_.data() + world.occMipOffset
+                                                              : nullptr;
+    const uint32_t macroCount = macroN * macroN * macroN;
+    std::vector<uint8_t> active(macroCount, 0);
+    auto at = [&](int x, int y, int z) -> uint8_t& {
+      return active[static_cast<uint32_t>(x) + static_cast<uint32_t>(y) * macroN +
+                    static_cast<uint32_t>(z) * macroN * macroN];
+    };
+    if (words) {
+      for (uint32_t mz = 0; mz < macroN; ++mz) {
+        for (uint32_t my = 0; my < macroN; ++my) {
+          for (uint32_t mx = 0; mx < macroN; ++mx) {
+            const uint32_t bit = mx + my * macroN + mz * macroN * macroN;
+            const uint32_t wi = bit >> 5;
+            if (wi < wordCount && ((words[wi] >> (bit & 31u)) & 1u) != 0u) {
+              at(static_cast<int>(mx), static_cast<int>(my), static_cast<int>(mz)) = 1;
+            }
+          }
+        }
+      }
+    }
+    if (hullDilate_) {
+      std::vector<uint8_t> dilated = active;
+      const int mn = static_cast<int>(macroN);
+      for (int z = 0; z < mn; ++z) {
+        for (int y = 0; y < mn; ++y) {
+          for (int x = 0; x < mn; ++x) {
+            if (!active[static_cast<uint32_t>(x) + static_cast<uint32_t>(y) * macroN +
+                        static_cast<uint32_t>(z) * macroN * macroN]) {
+              continue;
+            }
+            for (int dz = -1; dz <= 1; ++dz) {
+              for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                  const int nx = x + dx;
+                  const int ny = y + dy;
+                  const int nz = z + dz;
+                  if (nx < 0 || ny < 0 || nz < 0 || nx >= mn || ny >= mn || nz >= mn) {
+                    continue;
+                  }
+                  dilated[static_cast<uint32_t>(nx) + static_cast<uint32_t>(ny) * macroN +
+                          static_cast<uint32_t>(nz) * macroN * macroN] = 1;
+                }
+              }
+            }
+          }
+        }
+      }
+      active.swap(dilated);
+    }
+
+    const float cell = static_cast<float>(kOccMipRes) * world.voxelSize;
+    const glm::mat4 xform = world.objectToWorld();
+    const int mn = static_cast<int>(macroN);
+    auto occupied = [&](int x, int y, int z) {
+      if (x < 0 || y < 0 || z < 0 || x >= mn || y >= mn || z >= mn) {
+        return false;
+      }
+      return active[static_cast<uint32_t>(x) + static_cast<uint32_t>(y) * macroN +
+                    static_cast<uint32_t>(z) * macroN * macroN] != 0;
+    };
+    for (int z = 0; z < mn; ++z) {
+      for (int y = 0; y < mn; ++y) {
+        for (int x = 0; x < mn; ++x) {
+          if (!occupied(x, y, z)) {
+            continue;
+          }
+          const float x0 = static_cast<float>(x) * cell;
+          const float y0 = static_cast<float>(y) * cell;
+          const float z0 = static_cast<float>(z) * cell;
+          const float x1 = x0 + cell;
+          const float y1 = y0 + cell;
+          const float z1 = z0 + cell;
+          if (!occupied(x + 1, y, z)) {
+            emitQuad({x1, y0, z0}, {x1, y0, z1}, {x1, y1, z1}, {x1, y1, z0}, xform);
+          }
+          if (!occupied(x - 1, y, z)) {
+            emitQuad({x0, y0, z1}, {x0, y0, z0}, {x0, y1, z0}, {x0, y1, z1}, xform);
+          }
+          if (!occupied(x, y + 1, z)) {
+            emitQuad({x0, y1, z0}, {x1, y1, z0}, {x1, y1, z1}, {x0, y1, z1}, xform);
+          }
+          if (!occupied(x, y - 1, z)) {
+            emitQuad({x0, y0, z1}, {x1, y0, z1}, {x1, y0, z0}, {x0, y0, z0}, xform);
+          }
+          if (!occupied(x, y, z + 1)) {
+            emitQuad({x0, y0, z1}, {x0, y1, z1}, {x1, y1, z1}, {x1, y0, z1}, xform);
+          }
+          if (!occupied(x, y, z - 1)) {
+            emitQuad({x1, y0, z0}, {x1, y1, z0}, {x0, y1, z0}, {x0, y0, z0}, xform);
+          }
+        }
+      }
+    }
+  }
+  uploadMesh(hullVertexBuffer_, hullIndexBuffer_, hullIndexCount_, verts, indices);
+
+  std::vector<glm::vec3> sverts;
+  std::vector<uint32_t> sidx;
+  if (objects_.size() >= 2) {
+    const VoxelObject& spinner = objects_[1];
+    const float extent = static_cast<float>(std::max(spinner.gridSize, 1)) * spinner.voxelSize;
+    emitBox(glm::vec3(0.0f), glm::vec3(extent), glm::mat4(1.0f), sverts, sidx);
+  }
+  uploadMesh(spinnerObbVertexBuffer_, spinnerObbIndexBuffer_, spinnerObbIndexCount_, sverts, sidx);
+}
+
 void VoxelScene::uploadOccMip(GfxDevice& gfx) {
   if (occMipBuffer_.buffer == VK_NULL_HANDLE) {
     return;
@@ -641,18 +855,84 @@ void VoxelScene::fillGpuObjectRecords() {
   }
 }
 
+void VoxelScene::ensureCoarseGridFormat(GfxDevice& gfx) {
+  if (gridFormatChecked_) {
+    return;
+  }
+  VkFormatProperties props{};
+  vkGetPhysicalDeviceFormatProperties(gfx.physicalDevice(), kGridFormat, &props);
+  const VkFormatFeatureFlags need =
+      VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+  if ((props.optimalTilingFeatures & need) != need) {
+    throw std::runtime_error("VK_FORMAT_R32G32_UINT sampled+transferDst is not supported");
+  }
+  gridFormatChecked_ = true;
+}
+
+void VoxelScene::destroyGridImages(GfxDevice& gfx) {
+  for (AllocatedImage& img : grid3D_) {
+    gfx.destroyImage(img);
+  }
+  gfx.destroyImage(dummyGrid3D_);
+  if (gridSampler_) {
+    gfx.destroySampler(gridSampler_);
+    gridSampler_ = VK_NULL_HANDLE;
+  }
+}
+
+void VoxelScene::ensureGridImages(GfxDevice& gfx) {
+  ensureCoarseGridFormat(gfx);
+  if (gridSampler_ == VK_NULL_HANDLE) {
+    gridSampler_ = gfx.createSampler(VK_FILTER_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, false,
+                                     1, 0.0f, VK_SAMPLER_MIPMAP_MODE_NEAREST);
+  }
+  if (dummyGrid3D_.image == VK_NULL_HANDLE) {
+    dummyGrid3D_ = gfx.createImage3D({1, 1, 1}, kGridFormat,
+                                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                     VK_IMAGE_ASPECT_COLOR_BIT);
+    const CoarseCell air{};
+    gfx.uploadToImage3D(dummyGrid3D_, &air, sizeof(air), {1, 1, 1});
+  }
+  for (uint32_t i = 0; i < kGridTexCount; ++i) {
+    uint32_t n = 1;
+    if (i < objects_.size() && objects_[i].gridSize > 0) {
+      n = static_cast<uint32_t>(objects_[i].gridSize);
+    }
+    AllocatedImage& img = grid3D_[i];
+    if (img.image != VK_NULL_HANDLE && img.extent.width == n && img.extent.height == n &&
+        img.extent.depth == n && img.mipLevels == 1) {
+      continue;
+    }
+    gfx.destroyImage(img);
+    img = gfx.createImage3D({n, n, n}, kGridFormat,
+                            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                            VK_IMAGE_ASPECT_COLOR_BIT);
+  }
+}
+
+void VoxelScene::uploadGridImage(GfxDevice& gfx, uint32_t objectIndex) {
+  if (objectIndex >= kGridTexCount || objectIndex >= objects_.size()) {
+    return;
+  }
+  const VoxelObject& o = objects_[objectIndex];
+  AllocatedImage& img = grid3D_[objectIndex];
+  if (img.image == VK_NULL_HANDLE || o.cells.empty() || o.gridSize <= 0) {
+    return;
+  }
+  const uint32_t n = static_cast<uint32_t>(o.gridSize);
+  const size_t expected = static_cast<size_t>(n) * static_cast<size_t>(n) * static_cast<size_t>(n);
+  if (o.cells.size() != expected) {
+    return;
+  }
+  gfx.uploadToImage3D(img, o.cells.data(), sizeof(CoarseCell) * o.cells.size(), {n, n, n});
+}
+
 void VoxelScene::ensureGpuBuffers(GfxDevice& gfx) {
-  const VkDeviceSize voxelBytes = sizeof(CoarseCell) * std::max<size_t>(voxelsCpu_.size(), 1);
+  ensureGridImages(gfx);
   const VkDeviceSize slabBytes = sizeof(uint32_t) * kWordsPerSlab;
   const VkDeviceSize objectBytes =
       sizeof(GpuVoxelObject) * std::max<size_t>(std::max(objectsGpu_.size(), objects_.size()), 1);
 
-  if (voxelBuffer_.buffer == VK_NULL_HANDLE || voxelBuffer_.size < voxelBytes) {
-    gfx.destroyBuffer(voxelBuffer_);
-    voxelBuffer_ = gfx.createBuffer(voxelBytes,
-                                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                                    VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
-  }
   if (dummyBrickSlabBuffer_.buffer == VK_NULL_HANDLE || dummyBrickSlabBuffer_.size < slabBytes) {
     gfx.destroyBuffer(dummyBrickSlabBuffer_);
     dummyBrickSlabBuffer_ = gfx.createBuffer(slabBytes,
@@ -719,17 +999,12 @@ void VoxelScene::flushObject(GfxDevice& gfx, int objectIndex) {
     return;
   }
   VoxelObject& o = objects_[static_cast<size_t>(objectIndex)];
-  if (!o.cells.empty() && o.voxelOffset + o.cells.size() <= voxelsCpu_.size()) {
-    std::copy(o.cells.begin(), o.cells.end(), voxelsCpu_.begin() + o.voxelOffset);
-  }
   if (o.occMipWords > 0 && o.occMipOffset + o.occMipWords <= occMipCpu_.size()) {
     fillOccMip(o, occMipCpu_.data() + o.occMipOffset, o.occMipWords);
   }
   ensureGpuBuffers(gfx);
-  if (!o.cells.empty() && voxelBuffer_.buffer != VK_NULL_HANDLE) {
-    gfx.uploadToBuffer(voxelBuffer_, o.cells.data(), sizeof(CoarseCell) * o.cells.size(),
-                       sizeof(CoarseCell) * static_cast<VkDeviceSize>(o.voxelOffset));
-  }
+  uploadGridImage(gfx, static_cast<uint32_t>(objectIndex));
+  rebuildOccupancyHull(gfx);
   if (o.occMipWords > 0 && occMipBuffer_.buffer != VK_NULL_HANDLE) {
     gfx.uploadToBuffer(occMipBuffer_, occMipCpu_.data() + o.occMipOffset,
                        sizeof(uint32_t) * o.occMipWords,
@@ -852,10 +1127,12 @@ void VoxelScene::rebuildVoxels(GfxDevice& gfx) {
 }
 
 void VoxelScene::uploadWorldAndObjects(GfxDevice& gfx) {
-  if (!voxelsCpu_.empty() && voxelBuffer_.buffer != VK_NULL_HANDLE) {
-    gfx.uploadToBuffer(voxelBuffer_, voxelsCpu_.data(), sizeof(CoarseCell) * voxelsCpu_.size());
+  ensureGridImages(gfx);
+  for (uint32_t i = 0; i < kGridTexCount; ++i) {
+    uploadGridImage(gfx, i);
   }
   uploadOccMip(gfx);
+  rebuildOccupancyHull(gfx);
   if (!objectsGpu_.empty() && objectBuffer_.buffer != VK_NULL_HANDLE) {
     gfx.uploadToBuffer(objectBuffer_, objectsGpu_.data(),
                        sizeof(GpuVoxelObject) * objectsGpu_.size());

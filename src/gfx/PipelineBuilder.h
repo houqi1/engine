@@ -17,8 +17,12 @@ public:
   PipelineBuilder& setCullMode(VkCullModeFlags cull, VkFrontFace front);
   PipelineBuilder& setMultisampling(VkSampleCountFlagBits samples);
   PipelineBuilder& setDepthTest(bool enable, bool write, VkCompareOp compare);
+  PipelineBuilder& setDepthClamp(bool enable);
   PipelineBuilder& setColorBlend(bool enableAlphaBlend);
   PipelineBuilder& setColorFormat(VkFormat format);
+  PipelineBuilder& setColorFormats(const std::vector<VkFormat>& formats);
+  // Dual/triple attachments: [0]=MIN, [1]=MAX, optional [2]=MIN (no depth, factors ignored).
+  PipelineBuilder& setMinMaxBlend(uint32_t attachmentCount);
   PipelineBuilder& setDepthFormat(VkFormat format);
   PipelineBuilder& setLayout(VkPipelineLayout layout);
   PipelineBuilder& disableColorWrite();
@@ -39,12 +43,15 @@ private:
 
   bool depthTest_ = true;
   bool depthWrite_ = true;
+  bool depthClamp_ = false;
   VkCompareOp depthCompare_ = VK_COMPARE_OP_GREATER_OR_EQUAL;  // reverse-Z
 
   bool blend_ = false;
   bool colorWrite_ = true;
+  uint32_t minMaxBlendCount_ = 0;
 
   VkFormat colorFormat_ = VK_FORMAT_UNDEFINED;
+  std::vector<VkFormat> colorFormats_{};
   VkFormat depthFormat_ = VK_FORMAT_UNDEFINED;
   VkPipelineLayout layout_ = VK_NULL_HANDLE;
 };
