@@ -425,7 +425,7 @@ void VoxelRenderer::updateFrameUBO(VoxelScene& scene, uint32_t frameIndex) {
   ubo.useSky = (scene.showSky() && scene.hasSky()) ? 1u : 0u;
   ubo.objectCount = scene.objectCount();
   ubo.solidColor = scene.solidColorOutput() ? 1u : 0u;
-  ubo.padBefore = 0;
+  ubo.occMipPyramid = occMipPyramid_ ? 1u : 0u;
   ubo.padVec4[0] = ubo.padVec4[1] = ubo.padVec4[2] = ubo.padVec4[3] = 0;
   writeVec3(ubo.solidRgb, scene.solidColor());
   ubo.padSolidEnd = 0.0f;
@@ -677,7 +677,10 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
   ImGui::Text("Occupied coarse: %u / %u", scene.occupiedCount(), scene.voxelCount());
   ImGui::Text("Brick pages: %u  slabs: %u  pool: %.1f KB", scene.allocatedBrickPages(),
               scene.brickSlabCount(), static_cast<float>(scene.brickPoolBytes()) / 1024.0f);
-  ImGui::Text("Occupancy mip (4^3): %.2f KB", static_cast<float>(scene.occMipBytes()) / 1024.0f);
+  ImGui::Text("Occupancy mip (4^3+8^3+16^3): %.2f KB",
+              static_cast<float>(scene.occMipBytes()) / 1024.0f);
+  ImGui::Checkbox("Occupancy pyramid skip (8^3 / 16^3)", &occMipPyramid_);
+  ImGui::TextDisabled("Off = 4^3 occMip only (old skip). On = also jump empty 8^3 and 16^3.");
   ImGui::Text("Occupied 8^3 micros: %u   2^3 fines: %u", scene.occupiedMicroCount(),
               scene.occupiedFineCount());
   ImGui::Separator();

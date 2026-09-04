@@ -38,7 +38,7 @@ private:
     uint32_t useSky;
     uint32_t objectCount;
     uint32_t solidColor;
-    uint32_t padBefore;
+    uint32_t occMipPyramid;
     uint32_t padVec4[4];
     float solidRgb[3];
     float padSolidEnd;
@@ -105,6 +105,7 @@ private:
   bool imguiReady_ = false;
   float displayFps_ = 0.0f;
   int traceStage_ = 0;
+  bool occMipPyramid_ = true;
 
   VkQueryPool timestampPool_ = VK_NULL_HANDLE;
   float timestampPeriodNs_ = 1.0f;

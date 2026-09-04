@@ -22,7 +22,7 @@ layout(set = 0, binding = 0, std140) uniform VoxelDdaUBO {
     uint useSky;
     uint objectCount;
     uint solidColor;
-    uint _padBefore;
+    uint occMipPyramid;  // 0 = 4^3 skip only, 1 = also 8^3 / 16^3
     uvec4 _padVec4;
     vec3 solidRgb;
     float _padSolidEnd;
@@ -54,8 +54,8 @@ struct GpuVoxelObject {
     uvec3 gridSize;
     uint flags;  // bit0 nestedMicro, bit1 enabled, bit2 importPalette
     uint voxelOffset;  // grids[] texture index (0 = world, 1 = spinner)
-    uint occMipOffset;
-    uint occMipWords;
+    uint occMipOffset;  // L0 4^3, then L1 8^3, then L2 16^3
+    uint occMipWords;   // total words of the three levels
     uint _pad4;
 };
 
@@ -91,8 +91,6 @@ const uint INVALID_BRICK_PAGE = 0xFFFFFFFFu;
 const uint FLAG_NESTED = 1u;
 const uint FLAG_ENABLED = 2u;
 const uint FLAG_IMPORT_PALETTE = 4u;
-const int OCC_MIP_SHIFT = 2;
-const int OCC_MIP_RES = 4;
 const float FLT_MAX = 3.4028235e+38;
 const float kPi = 3.14159265359;
 
@@ -191,21 +189,56 @@ bool solidCoarse(GpuVoxelObject o, ivec3 p) {
     return insideGrid(o, p) && readCell(o, p).material != 0u;
 }
 
-bool occMipOccupied(GpuVoxelObject o, ivec3 mapPos) {
+uint occLevelWordCount(uint n, uint shift) {
+    uint axis = (n + ((1u << shift) - 1u)) >> shift;
+    uint bits = axis * axis * axis;
+    return max(1u, (bits + 31u) / 32u);
+}
+
+uint occLevelBase(GpuVoxelObject o, uint shift) {
+    uint n = o.gridSize.x;
+    uint base = o.occMipOffset;
+    if (shift >= 3u) {
+        base += occLevelWordCount(n, 2u);
+    }
+    if (shift >= 4u) {
+        base += occLevelWordCount(n, 3u);
+    }
+    return base;
+}
+
+bool occLevelOccupied(GpuVoxelObject o, ivec3 mapPos, uint shift) {
     if (o.occMipWords == 0u) {
         return true;
     }
-    uvec3 macroN = (o.gridSize + 3u) >> uint(OCC_MIP_SHIFT);
-    ivec3 m = mapPos >> OCC_MIP_SHIFT;
-    if (any(lessThan(m, ivec3(0))) || any(greaterThanEqual(uvec3(m), macroN))) {
+    uint n = o.gridSize.x;
+    uint axis = (n + ((1u << shift) - 1u)) >> shift;
+    ivec3 m = mapPos >> int(shift);
+    if (any(lessThan(m, ivec3(0))) || any(greaterThanEqual(uvec3(m), uvec3(axis)))) {
         return false;
     }
-    uint idx = uint(m.x) + uint(m.y) * macroN.x + uint(m.z) * macroN.x * macroN.y;
+    uint idx = uint(m.x) + uint(m.y) * axis + uint(m.z) * axis * axis;
     uint wi = idx >> 5;
-    if (wi >= o.occMipWords) {
+    uint base = occLevelBase(o, shift);
+    if (base + wi >= o.occMipOffset + o.occMipWords) {
         return true;
     }
-    return ((occMip[o.occMipOffset + wi] >> (idx & 31u)) & 1u) != 0u;
+    return ((occMip[base + wi] >> (idx & 31u)) & 1u) != 0u;
+}
+
+int occSkipShift(GpuVoxelObject o, ivec3 mapPos) {
+    if (ubo.occMipPyramid != 0u) {
+        if (!occLevelOccupied(o, mapPos, 4u)) {
+            return 4;
+        }
+        if (!occLevelOccupied(o, mapPos, 3u)) {
+            return 3;
+        }
+    }
+    if (!occLevelOccupied(o, mapPos, 2u)) {
+        return 2;
+    }
+    return -1;
 }
 
 bool solidMicroGlobal(GpuVoxelObject o, ivec3 g) {
@@ -538,10 +571,11 @@ ObjectHit traverseObject(GpuVoxelObject o, vec3 Ow, vec3 Dw, float tWorldMin, fl
             }
         }
 
-        if (!occMipOccupied(o, mapPos)) {
-            ivec3 macro = mapPos >> OCC_MIP_SHIFT;
-            vec3 boxMin = vec3(macro << OCC_MIP_SHIFT);
-            vec3 boxMax = min(boxMin + vec3(float(OCC_MIP_RES)), boundsMax);
+        int skipShift = occSkipShift(o, mapPos);
+        if (skipShift >= 0) {
+            ivec3 macro = mapPos >> skipShift;
+            vec3 boxMin = vec3(macro << skipShift);
+            vec3 boxMax = min(boxMin + vec3(float(1 << skipShift)), boundsMax);
             vec3 t0m = (boxMin - ro) * invDir;
             vec3 t1m = (boxMax - ro) * invDir;
             vec3 tLargerM = max(t0m, t1m);
@@ -559,7 +593,7 @@ ObjectHit traverseObject(GpuVoxelObject o, vec3 Ow, vec3 Dw, float tWorldMin, fl
             }
             vec3 newPos = ro + rd * (tExitM + 1e-4);
             ivec3 newMap = ivec3(clamp(floor(newPos), vec3(0.0), boundsMax - vec3(1.0)));
-            if (newMap == mapPos || (newMap >> OCC_MIP_SHIFT) == macro) {
+            if (newMap == mapPos || (newMap >> skipShift) == macro) {
                 mask = stepMask(sideDist);
                 sideDist += vec3(mask) * deltaDist;
                 mapPos += ivec3(vec3(mask)) * rayStep;

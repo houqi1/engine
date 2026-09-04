@@ -38,8 +38,8 @@ struct GpuVoxelObject {
   uint32_t gridSize[3];
   uint32_t flags;  // bit0 = nestedMicro, bit1 = enabled
   uint32_t voxelOffset;  // grids[] texture index (0 = world, 1 = spinner)
-  uint32_t occMipOffset;  // occupancy mip, in uints
-  uint32_t occMipWords;
+  uint32_t occMipOffset;  // occupancy pyramid in uints: 4^3, then 8^3, then 16^3
+  uint32_t occMipWords;   // total words of the three levels
   uint32_t _pad1;
 };
 static_assert(sizeof(GpuVoxelObject) == 176, "GpuVoxelObject std430 size mismatch");

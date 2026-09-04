@@ -55,15 +55,28 @@ constexpr uint32_t kSolidBrickWords[16] = {
 
 constexpr uint32_t kEmptyBrickWords[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 
-uint32_t occMipAxis(uint32_t n) {
-  return (n + static_cast<uint32_t>(VoxelScene::kOccMipRes) - 1u) /
-         static_cast<uint32_t>(VoxelScene::kOccMipRes);
+uint32_t occLevelAxis(uint32_t n, uint32_t shift) {
+  return (n + (1u << shift) - 1u) >> shift;
 }
 
-uint32_t occMipWordCount(uint32_t n) {
-  const uint32_t axis = occMipAxis(n);
+uint32_t occLevelWords(uint32_t n, uint32_t shift) {
+  const uint32_t axis = occLevelAxis(n, shift);
   const uint32_t bits = axis * axis * axis;
   return std::max(1u, (bits + 31u) / 32u);
+}
+
+// L0 4^3 + L1 8^3 + L2 16^3 packed after each other.
+uint32_t occPyramidWords(uint32_t n) {
+  return occLevelWords(n, 2) + occLevelWords(n, 3) + occLevelWords(n, 4);
+}
+
+void setOccBit(uint32_t* words, uint32_t wordCount, uint32_t axis, uint32_t mx, uint32_t my,
+               uint32_t mz) {
+  const uint32_t bit = mx + my * axis + mz * axis * axis;
+  const uint32_t wi = bit >> 5;
+  if (wi < wordCount) {
+    words[wi] |= 1u << (bit & 31u);
+  }
 }
 
 }  // namespace
@@ -562,7 +575,7 @@ void VoxelScene::packObjectPool() {
       }
     }
     o.occMipOffset = static_cast<uint32_t>(occMipCpu_.size());
-    o.occMipWords = occMipWordCount(static_cast<uint32_t>(std::max(o.gridSize, 1)));
+    o.occMipWords = occPyramidWords(static_cast<uint32_t>(std::max(o.gridSize, 1)));
     occMipCpu_.resize(o.occMipOffset + o.occMipWords, 0u);
     fillOccMip(o, occMipCpu_.data() + o.occMipOffset, o.occMipWords);
   }
@@ -579,12 +592,24 @@ void VoxelScene::fillOccMip(const VoxelObject& o, uint32_t* words, uint32_t word
   if (n <= 0) {
     return;
   }
-  const uint32_t macroN = occMipAxis(static_cast<uint32_t>(n));
+  const uint32_t nu = static_cast<uint32_t>(n);
+  const uint32_t l0w = occLevelWords(nu, 2);
+  const uint32_t l1w = occLevelWords(nu, 3);
+  const uint32_t l2w = occLevelWords(nu, 4);
+  if (wordCount < l0w) {
+    return;
+  }
   const size_t expected =
       static_cast<size_t>(n) * static_cast<size_t>(n) * static_cast<size_t>(n);
   if (o.cells.size() != expected) {
     return;
   }
+  uint32_t* l0 = words;
+  uint32_t* l1 = (wordCount >= l0w + l1w) ? words + l0w : nullptr;
+  uint32_t* l2 = (l1 && wordCount >= l0w + l1w + l2w) ? words + l0w + l1w : nullptr;
+  const uint32_t a0 = occLevelAxis(nu, 2);
+  const uint32_t a1 = occLevelAxis(nu, 3);
+  const uint32_t a2 = occLevelAxis(nu, 4);
   for (int z = 0; z < n; ++z) {
     for (int y = 0; y < n; ++y) {
       for (int x = 0; x < n; ++x) {
@@ -593,13 +618,15 @@ void VoxelScene::fillOccMip(const VoxelObject& o, uint32_t* words, uint32_t word
         if (o.cells[idx].material == 0u) {
           continue;
         }
-        const uint32_t mx = static_cast<uint32_t>(x) >> kOccMipShift;
-        const uint32_t my = static_cast<uint32_t>(y) >> kOccMipShift;
-        const uint32_t mz = static_cast<uint32_t>(z) >> kOccMipShift;
-        const uint32_t bit = mx + my * macroN + mz * macroN * macroN;
-        const uint32_t wi = bit >> 5;
-        if (wi < wordCount) {
-          words[wi] |= 1u << (bit & 31u);
+        const uint32_t ux = static_cast<uint32_t>(x);
+        const uint32_t uy = static_cast<uint32_t>(y);
+        const uint32_t uz = static_cast<uint32_t>(z);
+        setOccBit(l0, l0w, a0, ux >> 2, uy >> 2, uz >> 2);
+        if (l1) {
+          setOccBit(l1, l1w, a1, ux >> 3, uy >> 3, uz >> 3);
+        }
+        if (l2) {
+          setOccBit(l2, l2w, a2, ux >> 4, uy >> 4, uz >> 4);
         }
       }
     }
