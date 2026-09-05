@@ -2,6 +2,13 @@
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
+// 0 = full DDA + shade, 1 = 8x8 occupancy beam (writes world-space first-hit t).
+layout(constant_id = 0) const uint kBeamPass = 0;
+// Compile-time strip of brick/fine DDA (GitHub engines ship a slim traversal kernel).
+layout(constant_id = 1) const uint kEnableNested = 1;
+// Compile-time strip of AO / lighting.
+layout(constant_id = 2) const uint kEnableShade = 1;
+
 layout(set = 0, binding = 0, std140) uniform VoxelDdaUBO {
     mat4 invView;
     mat4 invProj;
@@ -22,8 +29,11 @@ layout(set = 0, binding = 0, std140) uniform VoxelDdaUBO {
     uint useSky;
     uint objectCount;
     uint solidColor;
-    uint occMipPyramid;  // 0 = 4^3 skip only, 1 = also 8^3 / 16^3
-    uvec4 _padVec4;
+    uint _padOccMip;     // was occMipPyramid (removed: negative win on dense floors)
+    uint brickBitSkip;   // 0 = 1-cell DDA in 8^3 (GDVoxelPlayground), 1 = 4^3/2^3 bit skip
+    uint beamSkip;       // 0 = off, 1 = full rays start at beam t - margin
+    float beamMargin;    // world meters; voxelG subtracts one coarse tile
+    uint _padOccSkip;
     vec3 solidRgb;
     float _padSolidEnd;
 } ubo;
@@ -52,7 +62,7 @@ struct GpuVoxelObject {
     float _pad1;
     float _pad2;
     uvec3 gridSize;
-    uint flags;  // bit0 nestedMicro, bit1 enabled, bit2 importPalette
+    uint flags;  // bit0 nestedMicro, bit1 enabled, bit2 importPalette, bit3 nestedFine
     uint voxelOffset;  // grids[] texture index (0 = world, 1 = spinner)
     uint occMipOffset;  // L0 4^3, then L1 8^3, then L2 16^3
     uint occMipWords;   // total words of the three levels
@@ -67,9 +77,7 @@ layout(set = 0, binding = 6, std430) readonly buffer ImportPalette {
     vec4 importPalette[256];
 };
 
-layout(set = 0, binding = 7, std430) readonly buffer OccupancyMip {
-    uint occMip[];
-};
+layout(set = 0, binding = 8, r32f) uniform image2D beamDepth;
 
 const uint MODE_SHADED = 0u;
 const uint MODE_ALBEDO = 1u;
@@ -85,12 +93,15 @@ const uint STAGE_INTERVAL = 4u;
 const uint STAGE_SKIP_DDA = 5u;
 const uint MICRO_WORDS = 16u;
 const uint FINE_WORDS = 128u;
-const uint BRICK_PAGE_WORDS = MICRO_WORDS + FINE_WORDS;
-const uint PAGES_PER_SLAB = 1024u;
+const uint FINE_COLOR_OFFSET = MICRO_WORDS + FINE_WORDS;
+const uint FINE_COLOR_WORDS = 4096u;  // one 0xAARRGGBB per fine
+const uint BRICK_PAGE_WORDS = FINE_COLOR_OFFSET + FINE_COLOR_WORDS;
+const uint PAGES_PER_SLAB = 2048u;
 const uint INVALID_BRICK_PAGE = 0xFFFFFFFFu;
 const uint FLAG_NESTED = 1u;
 const uint FLAG_ENABLED = 2u;
 const uint FLAG_IMPORT_PALETTE = 4u;
+const uint FLAG_NESTED_FINE = 8u;
 const float FLT_MAX = 3.4028235e+38;
 const float kPi = 3.14159265359;
 
@@ -155,6 +166,24 @@ uint loadBrickWord(uint page, uint wordIndex) {
     return brickSlabs[7].bricks[idx];
 }
 
+// 8^3 Morton: bits [2:0]=2^3, [5:3]=which 2^3 in 4^3, [8:6]=4^3 octant.
+uint morton3Brick(ivec3 p) {
+    uint x = uint(p.x);
+    uint y = uint(p.y);
+    uint z = uint(p.z);
+    uint m = 0u;
+    m |= (x & 1u) << 0;
+    m |= (y & 1u) << 1;
+    m |= (z & 1u) << 2;
+    m |= ((x >> 1) & 1u) << 3;
+    m |= ((y >> 1) & 1u) << 4;
+    m |= ((z >> 1) & 1u) << 5;
+    m |= ((x >> 2) & 1u) << 6;
+    m |= ((y >> 2) & 1u) << 7;
+    m |= ((z >> 2) & 1u) << 8;
+    return m;
+}
+
 bool getMicroVoxel(uint page, ivec3 c) {
     if (any(lessThan(c, ivec3(0))) || any(greaterThanEqual(c, ivec3(8)))) {
         return false;
@@ -163,7 +192,7 @@ bool getMicroVoxel(uint page, ivec3 c) {
     if (page == INVALID_BRICK_PAGE) {
         return true;
     }
-    uint bit = uint(c.y * 64 + c.z * 8 + c.x);
+    uint bit = morton3Brick(c);
     uint word = loadBrickWord(page, bit >> 5);
     return ((word >> (bit & 31u)) & 1u) != 0u;
 }
@@ -178,67 +207,42 @@ bool getFineVoxel(uint page, ivec3 micro, ivec3 fine) {
     if (page == INVALID_BRICK_PAGE) {
         return true;
     }
-    uint microBit = uint(micro.y * 64 + micro.z * 8 + micro.x);
+    uint microBit = morton3Brick(micro);
     uint packed = loadBrickWord(page, MICRO_WORDS + (microBit >> 2));
     uint byte = (packed >> ((microBit & 3u) * 8u)) & 255u;
     uint fbit = uint(fine.y * 4 + fine.z * 2 + fine.x);
     return ((byte >> fbit) & 1u) != 0u;
 }
 
-bool solidCoarse(GpuVoxelObject o, ivec3 p) {
-    return insideGrid(o, p) && readCell(o, p).material != 0u;
+bool brickOctant4Occupied(uint page, ivec3 mapPos) {
+    uint oct = morton3Brick(mapPos >> 2);  // 0..7
+    uint base = oct * 2u;
+    return (loadBrickWord(page, base) | loadBrickWord(page, base + 1u)) != 0u;
 }
 
-uint occLevelWordCount(uint n, uint shift) {
-    uint axis = (n + ((1u << shift) - 1u)) >> shift;
-    uint bits = axis * axis * axis;
-    return max(1u, (bits + 31u) / 32u);
+bool brickOctant2Occupied(uint page, ivec3 mapPos) {
+    uint m2 = morton3Brick(mapPos >> 1);  // 0..63
+    uint bit = m2 << 3;
+    uint eight = (loadBrickWord(page, bit >> 5) >> (bit & 31u)) & 255u;
+    return eight != 0u;
 }
 
-uint occLevelBase(GpuVoxelObject o, uint shift) {
-    uint n = o.gridSize.x;
-    uint base = o.occMipOffset;
-    if (shift >= 3u) {
-        base += occLevelWordCount(n, 2u);
+// 2 = empty 4^3, 1 = empty 2^3, -1 = DDA one micro (occupied or mixed 2^3).
+int brickSkipShift(uint page, ivec3 mapPos) {
+    if (getMicroVoxel(page, mapPos)) {
+        return -1;
     }
-    if (shift >= 4u) {
-        base += occLevelWordCount(n, 3u);
-    }
-    return base;
-}
-
-bool occLevelOccupied(GpuVoxelObject o, ivec3 mapPos, uint shift) {
-    if (o.occMipWords == 0u) {
-        return true;
-    }
-    uint n = o.gridSize.x;
-    uint axis = (n + ((1u << shift) - 1u)) >> shift;
-    ivec3 m = mapPos >> int(shift);
-    if (any(lessThan(m, ivec3(0))) || any(greaterThanEqual(uvec3(m), uvec3(axis)))) {
-        return false;
-    }
-    uint idx = uint(m.x) + uint(m.y) * axis + uint(m.z) * axis * axis;
-    uint wi = idx >> 5;
-    uint base = occLevelBase(o, shift);
-    if (base + wi >= o.occMipOffset + o.occMipWords) {
-        return true;
-    }
-    return ((occMip[base + wi] >> (idx & 31u)) & 1u) != 0u;
-}
-
-int occSkipShift(GpuVoxelObject o, ivec3 mapPos) {
-    if (ubo.occMipPyramid != 0u) {
-        if (!occLevelOccupied(o, mapPos, 4u)) {
-            return 4;
-        }
-        if (!occLevelOccupied(o, mapPos, 3u)) {
-            return 3;
-        }
-    }
-    if (!occLevelOccupied(o, mapPos, 2u)) {
+    if (!brickOctant4Occupied(page, mapPos)) {
         return 2;
     }
+    if (!brickOctant2Occupied(page, mapPos)) {
+        return 1;
+    }
     return -1;
+}
+
+bool solidCoarse(GpuVoxelObject o, ivec3 p) {
+    return insideGrid(o, p) && readCell(o, p).material != 0u;
 }
 
 bool solidMicroGlobal(GpuVoxelObject o, ivec3 g) {
@@ -279,8 +283,39 @@ bool neighborSolid(GpuVoxelObject o, ivec3 solidPos, ivec3 offset, uint space) {
     return space == 1u ? solidMicroGlobal(o, p) : solidCoarse(o, p);
 }
 
-vec3 albedoForVoxel(GpuVoxelObject o, uint matId) {
-    if ((o.flags & FLAG_IMPORT_PALETTE) != 0u && matId > 0u && matId < 256u) {
+uint readFinePackedRgb(uint page, ivec3 micro, ivec3 fine) {
+    uint microBit = morton3Brick(micro);
+    uint fbit = uint(fine.y * 4 + fine.z * 2 + fine.x);
+    uint fi = microBit * 8u + fbit;
+    return loadBrickWord(page, FINE_COLOR_OFFSET + fi);
+}
+
+vec3 unpackRgb888(uint p) {
+    return vec3(float((p >> 16) & 255u), float((p >> 8) & 255u), float(p & 255u)) / 255.0;
+}
+
+vec3 albedoForVoxel(GpuVoxelObject o, uint matId, uint page, ivec3 micro, ivec3 fine,
+                    bool usedMicro, bool usedFine) {
+    if ((o.flags & FLAG_IMPORT_PALETTE) != 0u && page != INVALID_BRICK_PAGE) {
+        if (usedFine) {
+            uint packed = readFinePackedRgb(page, micro, fine);
+            if ((packed >> 24) != 0u) {
+                return unpackRgb888(packed);
+            }
+        } else if (usedMicro) {
+            for (int i = 0; i < 8; ++i) {
+                ivec3 f = ivec3(i & 1, (i >> 2) & 1, (i >> 1) & 1);
+                if (getFineVoxel(page, micro, f)) {
+                    uint packed = readFinePackedRgb(page, micro, f);
+                    if ((packed >> 24) != 0u) {
+                        return unpackRgb888(packed);
+                    }
+                }
+            }
+        }
+    }
+    // Slot 1 is ground/default gray. Nested-off / missing fine RGB falls back here.
+    if ((o.flags & FLAG_IMPORT_PALETTE) != 0u && matId >= 2u && matId < 256u) {
         return importPalette[matId].rgb;
     }
     return vec3(0.62, 0.64, 0.68);
@@ -378,7 +413,8 @@ bool traceMicro(uint page, vec3 localPos, vec3 rd, vec3 sgn, bvec3 enterMask, bo
                 out float outTMicro, out float outTFine, inout uint outSteps) {
     localPos = clamp(localPos, vec3(0.0001), vec3(7.9999));
     ivec3 mapPos = ivec3(floor(localPos));
-    vec3 deltaDist = abs(1.0 / rd);
+    vec3 invDir = clamp(1.0 / rd, vec3(-FLT_MAX), vec3(FLT_MAX));
+    vec3 deltaDist = abs(invDir);
     vec3 sideDist = (sgn * (vec3(mapPos) - localPos) + (sgn * 0.5 + 0.5)) * deltaDist;
     bvec3 mask = enterMask;
     ivec3 rayStep = ivec3(sgn);
@@ -386,33 +422,26 @@ bool traceMicro(uint page, vec3 localPos, vec3 rd, vec3 sgn, bvec3 enterMask, bo
     outTFine = 0.0;
     outFine = ivec3(0);
 
-    if (getMicroVoxel(page, mapPos)) {
-        vec3 local01 = clamp(localPos - vec3(mapPos), vec3(0.0), vec3(0.9999));
-        if (!useFine) {
-            outMicro = mapPos;
-            outMask = mask;
-            outUvw = local01;
-            return true;
-        }
-        if (traceFine(page, mapPos, local01 * 2.0, rd, sgn, mask, outFine, outMask, outUvw, outTFine,
-                      outSteps)) {
-            outMicro = mapPos;
-            return true;
-        }
-    }
+    vec3 t0b = (vec3(0.0) - localPos) * invDir;
+    vec3 t1b = (vec3(8.0) - localPos) * invDir;
+    float tExitBrick = min(min(max(t0b.x, t1b.x), max(t0b.y, t1b.y)), max(t0b.z, t1b.z));
 
-    for (int i = 0; i < 32; ++i) {
-        outSteps += 1u;
-        mask = stepMask(sideDist);
-        sideDist += vec3(mask) * deltaDist;
-        mapPos += ivec3(vec3(mask)) * rayStep;
+    for (int i = 0; i < 48; ++i) {
         if (any(lessThan(mapPos, ivec3(0))) || any(greaterThanEqual(mapPos, ivec3(8)))) {
             return false;
         }
+
         if (getMicroVoxel(page, mapPos)) {
-            float tHit = dot(sideDist - deltaDist, vec3(mask));
-            vec3 hitPos = localPos + rd * tHit;
-            vec3 local01 = clamp(hitPos - vec3(mapPos), vec3(0.0), vec3(0.9999));
+            vec3 mini = ((vec3(mapPos) - localPos) + 0.5 - 0.5 * sgn) * invDir;
+            float tHit = max(mini.x, max(mini.y, mini.z));
+            vec3 local01;
+            if (tHit <= 0.0) {
+                tHit = 0.0;
+                local01 = clamp(localPos - vec3(mapPos), vec3(0.0), vec3(0.9999));
+            } else {
+                vec3 hitPos = localPos + rd * tHit;
+                local01 = clamp(hitPos - vec3(mapPos), vec3(0.0), vec3(0.9999));
+            }
             if (!useFine) {
                 outMicro = mapPos;
                 outMask = mask;
@@ -427,6 +456,46 @@ bool traceMicro(uint page, vec3 localPos, vec3 rd, vec3 sgn, bvec3 enterMask, bo
                 return true;
             }
         }
+
+        int skipShift = (ubo.brickBitSkip != 0u) ? brickSkipShift(page, mapPos) : -1;
+        if (skipShift >= 0) {
+            ivec3 macro = mapPos >> skipShift;
+            vec3 boxMin = vec3(macro << skipShift);
+            vec3 boxMax = min(boxMin + vec3(float(1 << skipShift)), vec3(8.0));
+            vec3 t0m = (boxMin - localPos) * invDir;
+            vec3 t1m = (boxMax - localPos) * invDir;
+            vec3 tLargerM = max(t0m, t1m);
+            float tExitM = min(min(tLargerM.x, tLargerM.y), tLargerM.z);
+            if (tExitM >= tExitBrick - 1e-5) {
+                return false;
+            }
+            bvec3 skipMask;
+            if (tLargerM.x <= tLargerM.y && tLargerM.x <= tLargerM.z) {
+                skipMask = bvec3(true, false, false);
+            } else if (tLargerM.y <= tLargerM.z) {
+                skipMask = bvec3(false, true, false);
+            } else {
+                skipMask = bvec3(false, false, true);
+            }
+            vec3 newPos = localPos + rd * (tExitM + 1e-4);
+            ivec3 newMap = ivec3(clamp(floor(newPos), vec3(0.0), vec3(7.0)));
+            outSteps += 1u;
+            if (newMap == mapPos || (newMap >> skipShift) == macro) {
+                mask = stepMask(sideDist);
+                sideDist += vec3(mask) * deltaDist;
+                mapPos += ivec3(vec3(mask)) * rayStep;
+                continue;
+            }
+            mapPos = newMap;
+            mask = skipMask;
+            sideDist = (sgn * (vec3(mapPos) - localPos) + (sgn * 0.5 + 0.5)) * deltaDist;
+            continue;
+        }
+
+        outSteps += 1u;
+        mask = stepMask(sideDist);
+        sideDist += vec3(mask) * deltaDist;
+        mapPos += ivec3(vec3(mask)) * rayStep;
     }
     return false;
 }
@@ -496,6 +565,7 @@ ObjectHit traverseObject(GpuVoxelObject o, vec3 Ow, vec3 Dw, float tWorldMin, fl
 
     bool hit = false;
     uint matId = 0u;
+    uint hitPage = INVALID_BRICK_PAGE;
     ivec3 microPos = ivec3(0);
     ivec3 finePos = ivec3(0);
     bool usedMicro = false;
@@ -503,9 +573,14 @@ ObjectHit traverseObject(GpuVoxelObject o, vec3 Ow, vec3 Dw, float tWorldMin, fl
     vec3 hitUvw = vec3(0.5);
     float tHitLocal = tEnter;
     uint steps = 0u;
-    bool nested = (o.flags & FLAG_NESTED) != 0u;
+    bool nested = false;
+    bool nestedFine = false;
+    if (kEnableNested != 0u) {
+        nested = (o.flags & FLAG_NESTED) != 0u;
+        nestedFine = nested && (o.flags & FLAG_NESTED_FINE) != 0u;
+    }
     bool allowBrick = nested && ubo.traceStage < STAGE_COARSE;
-    bool allowFine = allowBrick && ubo.traceStage < STAGE_NO_FINE;
+    bool allowFine = allowBrick && nestedFine && ubo.traceStage < STAGE_NO_FINE;
 
     for (uint i = 0u; i < ubo.maxSteps; ++i) {
         steps = i + 1u;
@@ -516,6 +591,7 @@ ObjectHit traverseObject(GpuVoxelObject o, vec3 Ow, vec3 Dw, float tWorldMin, fl
         CoarseCell cell = readCell(o, mapPos);
         matId = cell.material;
         if (matId != 0u) {
+            hitPage = cell.brickPage;
             vec3 local01;
             float tCoarse = tEnter;
             if (mapPos == startPos) {
@@ -571,40 +647,6 @@ ObjectHit traverseObject(GpuVoxelObject o, vec3 Ow, vec3 Dw, float tWorldMin, fl
             }
         }
 
-        int skipShift = occSkipShift(o, mapPos);
-        if (skipShift >= 0) {
-            ivec3 macro = mapPos >> skipShift;
-            vec3 boxMin = vec3(macro << skipShift);
-            vec3 boxMax = min(boxMin + vec3(float(1 << skipShift)), boundsMax);
-            vec3 t0m = (boxMin - ro) * invDir;
-            vec3 t1m = (boxMax - ro) * invDir;
-            vec3 tLargerM = max(t0m, t1m);
-            float tExitM = min(min(tLargerM.x, tLargerM.y), tLargerM.z);
-            if (tExitM >= tExit - 1e-5) {
-                break;
-            }
-            bvec3 skipMask;
-            if (tLargerM.x <= tLargerM.y && tLargerM.x <= tLargerM.z) {
-                skipMask = bvec3(true, false, false);
-            } else if (tLargerM.y <= tLargerM.z) {
-                skipMask = bvec3(false, true, false);
-            } else {
-                skipMask = bvec3(false, false, true);
-            }
-            vec3 newPos = ro + rd * (tExitM + 1e-4);
-            ivec3 newMap = ivec3(clamp(floor(newPos), vec3(0.0), boundsMax - vec3(1.0)));
-            if (newMap == mapPos || (newMap >> skipShift) == macro) {
-                mask = stepMask(sideDist);
-                sideDist += vec3(mask) * deltaDist;
-                mapPos += ivec3(vec3(mask)) * rayStep;
-                continue;
-            }
-            mapPos = newMap;
-            mask = skipMask;
-            sideDist = (sgn * (vec3(mapPos) - pos) + (sgn * 0.5 + 0.5)) * deltaDist;
-            continue;
-        }
-
         mask = stepMask(sideDist);
         sideDist += vec3(mask) * deltaDist;
         mapPos += ivec3(vec3(mask)) * rayStep;
@@ -626,15 +668,18 @@ ObjectHit traverseObject(GpuVoxelObject o, vec3 Ow, vec3 Dw, float tWorldMin, fl
     result.tWorld = dot(hitWorld - Ow, Dw);
     result.hit = true;
 
-    if ((ubo.solidColor != 0u || ubo.traceStage >= STAGE_NO_SHADE) &&
-        (ubo.renderMode == MODE_SHADED || ubo.renderMode == MODE_ALBEDO)) {
-        result.color = ubo.solidColor != 0u ? ubo.solidRgb : albedoForVoxel(o, matId);
+    if (kEnableShade == 0u ||
+        ((ubo.solidColor != 0u || ubo.traceStage >= STAGE_NO_SHADE) &&
+         (ubo.renderMode == MODE_SHADED || ubo.renderMode == MODE_ALBEDO))) {
+        result.color = ubo.solidColor != 0u ? ubo.solidRgb
+                                            : albedoForVoxel(o, matId, hitPage, microPos, finePos,
+                                                             usedMicro, usedFine);
         return result;
     }
 
     vec3 normalLocal = -vec3(mask) * sgn;
     vec3 normalWorld = normalize(mat3(o.objectToWorld) * normalLocal);
-    vec3 albedo = albedoForVoxel(o, matId);
+    vec3 albedo = albedoForVoxel(o, matId, hitPage, microPos, finePos, usedMicro, usedFine);
 
     ivec3 solidPos = usedFine ? (mapPos * 16 + microPos * 2 + finePos)
                               : (usedMicro ? (mapPos * 8 + microPos) : mapPos);
@@ -659,17 +704,111 @@ ObjectHit traverseObject(GpuVoxelObject o, vec3 Ow, vec3 Dw, float tWorldMin, fl
     return result;
 }
 
+vec3 rayDirFromPixel(ivec2 pixel, ivec2 size) {
+    vec2 uv = (vec2(pixel) + vec2(0.5)) / vec2(size);
+    vec2 ndc = uv * 2.0 - 1.0;
+    vec3 dirView = normalize(vec3(ndc.x / ubo.projX, ndc.y / ubo.projY, -1.0));
+    return normalize((ubo.invView * vec4(dirView, 0.0)).xyz);
+}
+
+// Occupancy-only DDA: first non-empty coarse cell, no brick/fine descent.
+// t is world metres along Dw, matching traverseObject.
+float traceFirstOccupied(GpuVoxelObject o, vec3 Ow, vec3 Dw) {
+    if ((o.flags & FLAG_ENABLED) == 0u || o.voxelSize <= 0.0) {
+        return FLT_MAX;
+    }
+
+    vec3 Ol = (o.worldToObject * vec4(Ow, 1.0)).xyz;
+    vec3 Dl = (o.worldToObject * vec4(Dw, 0.0)).xyz;
+    if (dot(Dl, Dl) < 1e-12) {
+        return FLT_MAX;
+    }
+
+    vec3 ro = Ol / o.voxelSize;
+    vec3 rd = Dl;
+    vec3 invDir = clamp(1.0 / rd, vec3(-FLT_MAX), vec3(FLT_MAX));
+    vec3 sgn = sign(rd);
+    if (sgn.x == 0.0) sgn.x = 1.0;
+    if (sgn.y == 0.0) sgn.y = 1.0;
+    if (sgn.z == 0.0) sgn.z = 1.0;
+
+    vec3 boundsMax = vec3(o.gridSize);
+    vec3 t0b = (vec3(0.0) - ro) * invDir;
+    vec3 t1b = (boundsMax - ro) * invDir;
+    vec3 tSmaller = min(t0b, t1b);
+    vec3 tLarger = max(t0b, t1b);
+    float tEnter = max(max(tSmaller.x, tSmaller.y), max(tSmaller.z, 0.0));
+    float tExit = min(min(tLarger.x, tLarger.y), tLarger.z);
+    if (tEnter > tExit) {
+        return FLT_MAX;
+    }
+
+    vec3 pos = ro + rd * (tEnter + 1e-4);
+    ivec3 mapPos = ivec3(clamp(floor(pos), vec3(0.0), boundsMax - vec3(1.0)));
+    ivec3 startPos = mapPos;
+    ivec3 rayStep = ivec3(sgn);
+    vec3 deltaDist = abs(invDir);
+    vec3 sideDist = (sgn * (vec3(mapPos) - pos) + (sgn * 0.5 + 0.5)) * deltaDist;
+
+    for (uint i = 0u; i < ubo.maxSteps; ++i) {
+        if (!insideGrid(o, mapPos)) {
+            break;
+        }
+
+        if (readCell(o, mapPos).material != 0u) {
+            float tLocal = tEnter;
+            if (mapPos != startPos) {
+                vec3 mini = ((vec3(mapPos) - ro) + 0.5 - 0.5 * sgn) * invDir;
+                tLocal = max(mini.x, max(mini.y, mini.z));
+            }
+            vec3 hitLocalMeters = (ro + rd * tLocal) * o.voxelSize;
+            vec3 hitWorld = (o.objectToWorld * vec4(hitLocalMeters, 1.0)).xyz;
+            return max(dot(hitWorld - Ow, Dw), 0.0);
+        }
+
+        bvec3 mask = stepMask(sideDist);
+        sideDist += vec3(mask) * deltaDist;
+        mapPos += ivec3(vec3(mask)) * rayStep;
+    }
+    return FLT_MAX;
+}
+
+float beamMinT(ivec2 pixel, ivec2 fullSize) {
+    vec3 dir = rayDirFromPixel(pixel, fullSize);
+    float tMin = FLT_MAX;
+    for (uint i = 0u; i < ubo.objectCount; ++i) {
+        tMin = min(tMin, traceFirstOccupied(objects[i], ubo.cameraPos, dir));
+    }
+    return tMin;
+}
+
 void main() {
+    if (kBeamPass != 0u) {
+        ivec2 beamPixel = ivec2(gl_GlobalInvocationID.xy);
+        ivec2 beamSize = imageSize(beamDepth);
+        if (any(greaterThanEqual(beamPixel, beamSize))) {
+            return;
+        }
+        ivec2 fullSize = imageSize(outImage);
+        ivec2 base = beamPixel * 8;
+        // Four corners + centre of the 8x8 (voxelG centre, plus corners so a
+        // thin 2^3 shell that misses the centre still clamps the skip).
+        float tMin = beamMinT(min(base + ivec2(4, 4), fullSize - 1), fullSize);
+        tMin = min(tMin, beamMinT(min(base, fullSize - 1), fullSize));
+        tMin = min(tMin, beamMinT(min(base + ivec2(7, 0), fullSize - 1), fullSize));
+        tMin = min(tMin, beamMinT(min(base + ivec2(0, 7), fullSize - 1), fullSize));
+        tMin = min(tMin, beamMinT(min(base + ivec2(7, 7), fullSize - 1), fullSize));
+        imageStore(beamDepth, beamPixel, vec4(tMin, 0.0, 0.0, 0.0));
+        return;
+    }
+
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
     ivec2 size = imageSize(outImage);
     if (any(greaterThanEqual(pixel, size))) {
         return;
     }
 
-    vec2 uv = (vec2(pixel) + vec2(0.5)) / vec2(size);
-    vec2 ndc = uv * 2.0 - 1.0;
-    vec3 dirView = normalize(vec3(ndc.x / ubo.projX, ndc.y / ubo.projY, -1.0));
-    vec3 dir = normalize((ubo.invView * vec4(dirView, 0.0)).xyz);
+    vec3 dir = rayDirFromPixel(pixel, size);
 
     if (ubo.traceStage >= STAGE_SKIP_DDA) {
         imageStore(outImage, pixel, vec4(sampleSky(dir), 1.0));
@@ -680,10 +819,15 @@ void main() {
         imageStore(outImage, pixel, vec4(sampleSky(dir), 1.0));
         return;
     }
-    const float t0 = 0.0;
-    const float t1 = 1.0e4;
 
-    vec3 color = sampleSky(dir);
+    float t0 = 0.0;
+    const float t1 = 1.0e4;
+    if (ubo.beamSkip != 0u) {
+        float beamT = imageLoad(beamDepth, pixel >> 3).r;
+        t0 = max(0.0, beamT - ubo.beamMargin);
+    }
+
+    vec3 color = vec3(0.0);
     float bestT = FLT_MAX;
     uint bestSteps = 0u;
     bool anyHit = false;

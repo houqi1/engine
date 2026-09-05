@@ -38,8 +38,11 @@ private:
     uint32_t useSky;
     uint32_t objectCount;
     uint32_t solidColor;
-    uint32_t occMipPyramid;
-    uint32_t padVec4[4];
+    uint32_t padOccMip;
+    uint32_t brickBitSkip;
+    uint32_t beamSkip;
+    float beamMargin;
+    uint32_t padOccSkip;
     float solidRgb[3];
     float padSolidEnd;
   };
@@ -52,10 +55,11 @@ private:
 
   enum TimestampSlot : uint32_t {
     kTsFrameBegin = 0,
-    kTsAfterCompute = 1,
-    kTsAfterBlit = 2,
-    kTsFrameEnd = 3,
-    kTsPerFrame = 4,
+    kTsAfterBeam = 1,
+    kTsAfterCompute = 2,
+    kTsAfterBlit = 3,
+    kTsFrameEnd = 4,
+    kTsPerFrame = 5,
   };
 
   enum TraceStage : uint32_t {
@@ -67,8 +71,16 @@ private:
     kStageSkipDda = 5,
   };
 
+  struct DdaSpec {
+    uint32_t beamPass = 0;
+    uint32_t enableNested = 1;
+    uint32_t enableShade = 1;
+  };
+
   void createDescriptors();
   void createPipelines();
+  VkPipeline createComputePipeline(VkShaderModule shader, DdaSpec spec,
+                                  bool useSpec = true) const;
   void createOutputImage();
   void destroyOutputImage();
   void updateDescriptors(VoxelScene& scene);
@@ -89,9 +101,15 @@ private:
 
   VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
   VkPipeline computePipeline_ = VK_NULL_HANDLE;
+  VkPipeline slimPipeline_ = VK_NULL_HANDLE;
+  VkPipeline coarsePipeline_ = VK_NULL_HANDLE;
+  VkPipeline beamPipeline_ = VK_NULL_HANDLE;
 
   AllocatedImage outImage_{};
+  AllocatedImage beamImage_{};
+  AllocatedImage dummyBeamImage_{};
   static constexpr VkFormat kOutFormat = VK_FORMAT_R8G8B8A8_UNORM;
+  static constexpr VkFormat kBeamFormat = VK_FORMAT_R32_SFLOAT;
 
   std::array<FrameResources, GfxDevice::kFramesInFlight> frames_{};
   std::array<VkImageView, VoxelScene::kGridTexCount> boundGridViews_{};
@@ -102,16 +120,21 @@ private:
   VkBuffer boundPaletteBuffer_ = VK_NULL_HANDLE;
   VkBuffer boundOccMipBuffer_ = VK_NULL_HANDLE;
   VkImageView boundSkyView_ = VK_NULL_HANDLE;
+  VkImageView boundBeamView_ = VK_NULL_HANDLE;
   bool imguiReady_ = false;
   float displayFps_ = 0.0f;
   int traceStage_ = 0;
-  bool occMipPyramid_ = true;
+  bool brickBitSkip_ = true;
+  bool beamSkip_ = true;
+  float beamMargin_ = 5.6f;  // 16 coarse cells * 0.35 m, voxelG one-tile pad
 
   VkQueryPool timestampPool_ = VK_NULL_HANDLE;
   float timestampPeriodNs_ = 1.0f;
   std::array<bool, GfxDevice::kFramesInFlight> timestampPending_{};
   float gpuFrameMs_ = 0.0f;
   float gpuComputeMs_ = 0.0f;
+  float gpuBeamMs_ = 0.0f;
+  float gpuMainMs_ = 0.0f;
   float gpuBlitMs_ = 0.0f;
   float gpuUiMs_ = 0.0f;
 };

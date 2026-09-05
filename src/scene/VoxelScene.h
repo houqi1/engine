@@ -36,7 +36,7 @@ struct GpuVoxelObject {
   float voxelSize;
   float _pad0[3];
   uint32_t gridSize[3];
-  uint32_t flags;  // bit0 = nestedMicro, bit1 = enabled
+  uint32_t flags;  // bit0 nestedMicro, bit1 enabled, bit2 importPalette, bit3 nestedFine
   uint32_t voxelOffset;  // grids[] texture index (0 = world, 1 = spinner)
   uint32_t occMipOffset;  // occupancy pyramid in uints: 4^3, then 8^3, then 16^3
   uint32_t occMipWords;   // total words of the three levels
@@ -55,6 +55,7 @@ struct VoxelObject {
   static constexpr uint32_t kFlagNestedMicro = 1u;
   static constexpr uint32_t kFlagEnabled = 2u;
   static constexpr uint32_t kFlagImportPalette = 4u;
+  static constexpr uint32_t kFlagNestedFine = 8u;
 
   glm::vec3 position{0.0f};
   glm::quat rotation{1.0f, 0.0f, 0.0f, 0.0f};
@@ -78,14 +79,18 @@ class VoxelScene {
 public:
   static constexpr int kMicroRes = 8;
   static constexpr int kMicroCount = kMicroRes * kMicroRes * kMicroRes;
-  static constexpr int kMicroWords = kMicroCount / 32;
+  static constexpr int kMicroWords = kMicroCount / 32;  // Morton-ordered occupancy bits
   static constexpr int kFineRes = 2;
   static constexpr int kFineCount = kFineRes * kFineRes * kFineRes;
+  static constexpr int kFinePerCoarse = kMicroRes * kFineRes;  // 16
   static constexpr int kFineTableBytes = kMicroCount;  // one uint8 per 8^3 micro
   static constexpr int kFineWordsPerTable = kFineTableBytes / 4;
-  static constexpr int kBrickPageWords = kMicroWords + kFineWordsPerTable;
+  static constexpr int kFinePerBrick = kFinePerCoarse * kFinePerCoarse * kFinePerCoarse;  // 4096
+  static constexpr int kFineColorWords = kFinePerBrick;  // one uint 0xAARRGGBB per fine
+  static constexpr int kFineColorOffset = kMicroWords + kFineWordsPerTable;
+  static constexpr int kBrickPageWords = kFineColorOffset + kFineColorWords;
   static constexpr uint32_t kInvalidBrickPage = 0xFFFFFFFFu;
-  static constexpr uint32_t kPagesPerSlab = 1024u;
+  static constexpr uint32_t kPagesPerSlab = 2048u;
   static constexpr uint32_t kMaxBrickSlabs = 8u;
   static constexpr uint32_t kWordsPerSlab =
       kPagesPerSlab * static_cast<uint32_t>(kBrickPageWords);
@@ -158,6 +163,8 @@ public:
   int& brushMaterial() { return brushMaterial_; }
   float& brushRadius() { return brushRadius_; }
   bool& nestedMicroVoxels() { return nestedMicroVoxels_; }
+  bool& nestedFineVoxels() { return nestedFineVoxels_; }
+  bool& collapseFullBricks() { return collapseFullBricks_; }
   float& spinSpeed() { return spinSpeed_; }
   bool& spinnerEnabled() { return spinnerEnabled_; }
 
@@ -180,8 +187,11 @@ private:
   bool setVoxelCpu(VoxelObject& o, const glm::ivec3& p, uint32_t material);
   bool setMicroCpu(VoxelObject& o, const glm::ivec3& coarse, const glm::ivec3& micro, bool solid);
   bool setFineCpu(VoxelObject& o, const glm::ivec3& coarse, const glm::ivec3& micro,
-                  const glm::ivec3& fine, bool solid);
+                  const glm::ivec3& fine, bool solid, bool writeRgb = false,
+                  uint32_t rgb888 = 0);
   bool brickPageEmpty(uint32_t page) const;
+  bool brickPageFull(uint32_t page) const;
+  void tryCollapseFullBrick(VoxelObject& o, uint32_t coarseIndex);
   uint32_t allocBrickPage(const uint32_t* words16);
   void freeBrickPage(uint32_t page);
   uint32_t ensureBrickPage(VoxelObject& o, uint32_t coarseIndex, bool fillSolid);
@@ -196,13 +206,14 @@ private:
   void uploadWorldAndObjects(GfxDevice& gfx);
   void packObjectPool();
   void fillGpuObjectRecords();
-  void fillOccMip(const VoxelObject& o, uint32_t* words, uint32_t wordCount) const;
   void uploadOccMip(GfxDevice& gfx);
   void uploadPalette(GfxDevice& gfx);
   uint32_t* brickPageWords(uint32_t page);
   const uint32_t* brickPageWords(uint32_t page) const;
   uint8_t readFineByte(uint32_t page, uint32_t microBit) const;
   void writeFineByte(uint32_t page, uint32_t microBit, uint8_t value);
+  uint32_t fineColorIndex(const glm::ivec3& micro, const glm::ivec3& fine) const;
+  void writeFineRgb(uint32_t page, uint32_t colorIndex, uint32_t rgb888);
   void ensureSlabCpu(uint32_t slabIndex);
   void ensureGpuBuffers(GfxDevice& gfx);
   void ensureCoarseGridFormat(GfxDevice& gfx);
@@ -247,7 +258,7 @@ private:
   std::string importStatus_{"No import"};
   int importGridN_ = 48;
   int importPadding_ = 1;
-  bool importSampleColor_ = false;
+  bool importSampleColor_ = true;
   bool importConservative_ = true;
 
   std::vector<VoxelObject> objects_;
@@ -280,6 +291,8 @@ private:
   int brushMaterial_ = 1;
   float brushRadius_ = 0.0f;
   bool nestedMicroVoxels_ = true;
+  bool nestedFineVoxels_ = true;
+  bool collapseFullBricks_ = true;
   float time_ = 0.0f;
   float spinSpeed_ = 0.8f;
   bool spinnerEnabled_ = false;

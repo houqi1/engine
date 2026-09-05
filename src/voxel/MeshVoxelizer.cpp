@@ -11,11 +11,15 @@
 #include <stb_image.h>
 
 #include <algorithm>
+#include <bit>
+#include <cctype>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <stdexcept>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -37,15 +41,62 @@ struct VoxelizePC {
   int32_t conservative;
   int32_t sampleColor;
   int32_t triCount;
+  int32_t subdiv;
+  int32_t maxSamples = 0;
 };
+static_assert(sizeof(VoxelizePC) == 40, "VoxelizePC push-constant size");
+
+constexpr uint32_t kMaxColorSamples = 8u * 1024u * 1024u;
 
 void fail(const std::string& m) { throw std::runtime_error(m); }
 
-glm::vec3 unpackRgb(uint32_t p) {
-  const float r = static_cast<float>((p >> 16) & 255u) / 255.0f;
-  const float g = static_cast<float>((p >> 8) & 255u) / 255.0f;
-  const float b = static_cast<float>(p & 255u) / 255.0f;
-  return glm::vec3(r, g, b);
+std::string toLower(std::string s) {
+  for (char& c : s) {
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  }
+  return s;
+}
+
+bool loadPngRgba(const std::filesystem::path& texPath, Texture& albedo, GfxDevice& gfx) {
+  int w = 0, h = 0, comp = 0;
+  stbi_uc* pixels = stbi_load(texPath.string().c_str(), &w, &h, &comp, 4);
+  if (!pixels || w <= 0 || h <= 0) {
+    if (pixels) {
+      stbi_image_free(pixels);
+    }
+    return false;
+  }
+  TextureFactory::destroy(gfx, albedo);
+  albedo.image = gfx.createImage(
+      {static_cast<uint32_t>(w), static_cast<uint32_t>(h), 1}, VK_FORMAT_R8G8B8A8_SRGB,
+      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
+  gfx.uploadToImage(albedo.image, pixels, static_cast<VkDeviceSize>(w * h * 4),
+                    {static_cast<uint32_t>(w), static_cast<uint32_t>(h), 1});
+  albedo.sampler = gfx.createSampler(VK_FILTER_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, false);
+  stbi_image_free(pixels);
+  return true;
+}
+
+std::filesystem::path findSiblingAlbedo(const std::filesystem::path& objPath) {
+  const std::filesystem::path dir = objPath.parent_path();
+  std::vector<std::filesystem::path> images;
+  std::error_code ec;
+  for (const auto& ent : std::filesystem::directory_iterator(dir, ec)) {
+    if (!ent.is_regular_file(ec)) {
+      continue;
+    }
+    const std::string ext = toLower(ent.path().extension().string());
+    if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".tga") {
+      images.push_back(ent.path());
+    }
+  }
+  for (const auto& p : images) {
+    const std::string n = toLower(p.filename().string());
+    if (n.find("diffuse") != std::string::npos || n.find("albedo") != std::string::npos) {
+      return p;
+    }
+  }
+  return images.empty() ? std::filesystem::path{} : images.front();
 }
 
 float colorDist2(const glm::vec3& a, const glm::vec3& b) {
@@ -53,7 +104,7 @@ float colorDist2(const glm::vec3& a, const glm::vec3& b) {
   return glm::dot(d, d);
 }
 
-void quantizePalette(const std::vector<uint32_t>& occ, const std::vector<uint32_t>& seeds,
+void quantizePalette(const std::vector<uint32_t>& occ, const std::vector<glm::vec3>& rgb,
                      uint32_t fallback, bool sampleColor, MeshVoxelizeResult& out) {
   const size_t count = occ.size();
   out.material.assign(count, 0u);
@@ -80,24 +131,24 @@ void quantizePalette(const std::vector<uint32_t>& occ, const std::vector<uint32_
   std::unordered_map<uint32_t, uint32_t> exact;
   exact.reserve(256);
 
-  auto addOrNearest = [&](const glm::vec3& rgb) -> uint32_t {
-    const uint32_t key = (static_cast<uint32_t>(rgb.r * 255.0f + 0.5f) << 16) |
-                         (static_cast<uint32_t>(rgb.g * 255.0f + 0.5f) << 8) |
-                         static_cast<uint32_t>(rgb.b * 255.0f + 0.5f);
+  auto addOrNearest = [&](const glm::vec3& sample) -> uint32_t {
+    const uint32_t key = (static_cast<uint32_t>(sample.r * 255.0f + 0.5f) << 16) |
+                         (static_cast<uint32_t>(sample.g * 255.0f + 0.5f) << 8) |
+                         static_cast<uint32_t>(sample.b * 255.0f + 0.5f);
     const auto it = exact.find(key);
     if (it != exact.end()) {
       return it->second;
     }
     if (colors.size() < 256) {
       const uint32_t idx = static_cast<uint32_t>(colors.size());
-      colors.push_back(rgb);
+      colors.push_back(sample);
       exact[key] = idx;
       return idx;
     }
     uint32_t best = 1;
-    float bestD = colorDist2(rgb, colors[1]);
+    float bestD = colorDist2(sample, colors[1]);
     for (uint32_t i = 2; i < colors.size(); ++i) {
-      const float d = colorDist2(rgb, colors[i]);
+      const float d = colorDist2(sample, colors[i]);
       if (d < bestD) {
         bestD = d;
         best = i;
@@ -111,11 +162,11 @@ void quantizePalette(const std::vector<uint32_t>& occ, const std::vector<uint32_
       continue;
     }
     ++out.occupied;
-    glm::vec3 rgb = glm::vec3(0.62f, 0.64f, 0.68f);
-    if ((seeds[i] >> 24) != 0u) {
-      rgb = unpackRgb(seeds[i]);
+    glm::vec3 sample = glm::vec3(0.62f, 0.64f, 0.68f);
+    if (i < rgb.size()) {
+      sample = rgb[i];
     }
-    out.material[i] = addOrNearest(rgb);
+    out.material[i] = addOrNearest(sample);
   }
 
   out.paletteUsed = static_cast<uint32_t>(colors.size());
@@ -235,10 +286,12 @@ MeshVoxelizeResult MeshVoxelizerGpu::voxelizeObjSurface(GfxDevice& gfx, const st
 
   const int n = std::clamp(cfg.gridN, 8, 64);
   const int padding = std::max(0, cfg.padding);
+  const int subdiv = std::clamp(cfg.fineSubdiv, 1, 16);
   if (n - 2 * padding < 1) {
     out.error = "gridN too small for padding";
     return out;
   }
+  const int fineN = n * subdiv;
 
   tinyobj::attrib_t attrib;
   std::vector<tinyobj::shape_t> shapes;
@@ -343,38 +396,45 @@ MeshVoxelizeResult MeshVoxelizerGpu::voxelizeObjSurface(GfxDevice& gfx, const st
 
   Texture albedo = TextureFactory::createSolid(gfx, 1.0f, 1.0f, 1.0f);
   bool hasTex = false;
+  std::string texUsed;
   if (cfg.sampleColor) {
     for (const auto& m : materials) {
       if (m.diffuse_texname.empty()) {
         continue;
       }
-      std::filesystem::path texPath = std::filesystem::path(path).parent_path() / m.diffuse_texname;
+      const std::filesystem::path texPath =
+          std::filesystem::path(path).parent_path() / m.diffuse_texname;
       if (!std::filesystem::exists(texPath)) {
         continue;
       }
-      int w = 0, h = 0, comp = 0;
-      stbi_uc* pixels = stbi_load(texPath.string().c_str(), &w, &h, &comp, 4);
-      if (!pixels || w <= 0 || h <= 0) {
-        if (pixels) {
-          stbi_image_free(pixels);
-        }
-        continue;
+      if (loadPngRgba(texPath, albedo, gfx)) {
+        hasTex = true;
+        texUsed = texPath.filename().string();
+        break;
       }
-      TextureFactory::destroy(gfx, albedo);
-      albedo.image = gfx.createImage(
-          {static_cast<uint32_t>(w), static_cast<uint32_t>(h), 1}, VK_FORMAT_R8G8B8A8_SRGB,
-          VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
-      gfx.uploadToImage(albedo.image, pixels, static_cast<VkDeviceSize>(w * h * 4),
-                        {static_cast<uint32_t>(w), static_cast<uint32_t>(h), 1});
-      albedo.sampler = gfx.createSampler(VK_FILTER_LINEAR, VK_SAMPLER_ADDRESS_MODE_REPEAT, false);
-      stbi_image_free(pixels);
-      hasTex = true;
-      break;
+    }
+    if (!hasTex) {
+      const std::filesystem::path fallback = findSiblingAlbedo(path);
+      if (!fallback.empty() && loadPngRgba(fallback, albedo, gfx)) {
+        hasTex = true;
+        texUsed = fallback.filename().string();
+        if (out.warning.empty()) {
+          out.warning = "No MTL map_Kd; using " + texUsed;
+        } else {
+          out.warning += "; no MTL map_Kd, using " + texUsed;
+        }
+      }
     }
   }
   if (hasTex) {
     for (auto& tri : gpuTris) {
       tri.uv2pad[3] = 1.0f;
+      // OBJ with no MTL keeps fallback Kd 0.62; don't tint the albedo map.
+      if (materials.empty()) {
+        tri.kd[0] = 1.0f;
+        tri.kd[1] = 1.0f;
+        tri.kd[2] = 1.0f;
+      }
     }
   }
 
@@ -385,18 +445,24 @@ MeshVoxelizeResult MeshVoxelizerGpu::voxelizeObjSurface(GfxDevice& gfx, const st
   const glm::vec3 gridMin = bmin - glm::vec3(static_cast<float>(padding) * voxelSize);
 
   const uint32_t cellCount = static_cast<uint32_t>(n) * static_cast<uint32_t>(n) * static_cast<uint32_t>(n);
+  const uint64_t fineCount = static_cast<uint64_t>(fineN) * static_cast<uint64_t>(fineN) *
+                             static_cast<uint64_t>(fineN);
+  const uint32_t fineWords = static_cast<uint32_t>((fineCount + 31ull) / 32ull);
   const VkDeviceSize triBytes = sizeof(GpuTri) * gpuTris.size();
-  const VkDeviceSize gridBytes = sizeof(uint32_t) * cellCount;
+  const uint32_t maxSamples = cfg.sampleColor ? kMaxColorSamples : 0u;
+  const VkDeviceSize sampleBytes =
+      sizeof(uint32_t) * (1u + 2u * std::max(maxSamples, 1u));
+  const VkDeviceSize fineBytes = sizeof(uint32_t) * fineWords;
 
   AllocatedBuffer triBuf = gfx.createBuffer(
       triBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
       VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
-  AllocatedBuffer occBuf = gfx.createBuffer(gridBytes,
+  AllocatedBuffer occBuf = gfx.createBuffer(fineBytes,
                                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                                                 VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                                                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                                             VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
-  AllocatedBuffer seedBuf = gfx.createBuffer(gridBytes,
+  AllocatedBuffer seedBuf = gfx.createBuffer(sampleBytes,
                                              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                                                  VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                                                  VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
@@ -420,8 +486,8 @@ MeshVoxelizeResult MeshVoxelizerGpu::voxelizeObjSurface(GfxDevice& gfx, const st
   }
 
   VkDescriptorBufferInfo triInfo{triBuf.buffer, 0, triBytes};
-  VkDescriptorBufferInfo occInfo{occBuf.buffer, 0, gridBytes};
-  VkDescriptorBufferInfo seedInfo{seedBuf.buffer, 0, gridBytes};
+  VkDescriptorBufferInfo occInfo{occBuf.buffer, 0, fineBytes};
+  VkDescriptorBufferInfo seedInfo{seedBuf.buffer, 0, sampleBytes};
   VkDescriptorImageInfo texInfo{};
   texInfo.sampler = albedo.sampler;
   texInfo.imageView = albedo.image.view;
@@ -453,21 +519,27 @@ MeshVoxelizeResult MeshVoxelizerGpu::voxelizeObjSurface(GfxDevice& gfx, const st
   pc.conservative = cfg.conservative ? 1 : 0;
   pc.sampleColor = cfg.sampleColor ? 1 : 0;
   pc.triCount = static_cast<int32_t>(gpuTris.size());
+  pc.subdiv = subdiv;
+  pc.maxSamples = static_cast<int32_t>(maxSamples);
 
+  AllocatedBuffer occRead = gfx.createBuffer(fineBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                             VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
+  AllocatedBuffer seedRead = gfx.createBuffer(sampleBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                              VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
   gfx.immediateSubmit([&](VkCommandBuffer cmd) {
-    vkCmdFillBuffer(cmd, occBuf.buffer, 0, gridBytes, 0);
-    vkCmdFillBuffer(cmd, seedBuf.buffer, 0, gridBytes, 0);
+    vkCmdFillBuffer(cmd, occBuf.buffer, 0, fineBytes, 0);
+    vkCmdFillBuffer(cmd, seedBuf.buffer, 0, 4, 0);
     VkMemoryBarrier2 fillBarrier{};
     fillBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
     fillBarrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
     fillBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
     fillBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
     fillBarrier.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT;
-    VkDependencyInfo dep{};
-    dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-    dep.memoryBarrierCount = 1;
-    dep.pMemoryBarriers = &fillBarrier;
-    vkCmdPipelineBarrier2(cmd, &dep);
+    VkDependencyInfo fillDep{};
+    fillDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    fillDep.memoryBarrierCount = 1;
+    fillDep.pMemoryBarriers = &fillBarrier;
+    vkCmdPipelineBarrier2(cmd, &fillDep);
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_, 0, 1, &set, 0,
@@ -475,23 +547,40 @@ MeshVoxelizeResult MeshVoxelizerGpu::voxelizeObjSurface(GfxDevice& gfx, const st
     vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
     const uint32_t groups = (static_cast<uint32_t>(gpuTris.size()) + 63u) / 64u;
     vkCmdDispatch(cmd, groups, 1, 1);
+
+    VkMemoryBarrier2 computeBarrier{};
+    computeBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+    computeBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    computeBarrier.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
+    computeBarrier.dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    computeBarrier.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+    VkDependencyInfo copyDep{};
+    copyDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    copyDep.memoryBarrierCount = 1;
+    copyDep.pMemoryBarriers = &computeBarrier;
+    vkCmdPipelineBarrier2(cmd, &copyDep);
+    VkBufferCopy fineCopy{};
+    fineCopy.size = fineBytes;
+    vkCmdCopyBuffer(cmd, occBuf.buffer, occRead.buffer, 1, &fineCopy);
+    VkBufferCopy seedCopy{};
+    seedCopy.size = sampleBytes;
+    vkCmdCopyBuffer(cmd, seedBuf.buffer, seedRead.buffer, 1, &seedCopy);
   });
 
-  AllocatedBuffer occRead = gfx.createBuffer(gridBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                                             VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
-  AllocatedBuffer seedRead = gfx.createBuffer(gridBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                                              VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
-  gfx.immediateSubmit([&](VkCommandBuffer cmd) {
-    VkBufferCopy copy{};
-    copy.size = gridBytes;
-    vkCmdCopyBuffer(cmd, occBuf.buffer, occRead.buffer, 1, &copy);
-    vkCmdCopyBuffer(cmd, seedBuf.buffer, seedRead.buffer, 1, &copy);
-  });
-
-  std::vector<uint32_t> occ(cellCount);
-  std::vector<uint32_t> seeds(cellCount);
-  std::memcpy(occ.data(), occRead.info.pMappedData, static_cast<size_t>(gridBytes));
-  std::memcpy(seeds.data(), seedRead.info.pMappedData, static_cast<size_t>(gridBytes));
+  std::vector<uint32_t> fineBits(fineWords);
+  std::memcpy(fineBits.data(), occRead.info.pMappedData, static_cast<size_t>(fineBytes));
+  const auto* sampleWords = static_cast<const uint32_t*>(seedRead.info.pMappedData);
+  const uint32_t rawCount = sampleWords ? sampleWords[0] : 0u;
+  const uint32_t nWrite = std::min(rawCount, maxSamples);
+  out.colorSamples = rawCount;
+  out.colorDropped = rawCount > maxSamples ? rawCount - maxSamples : 0u;
+  std::vector<std::pair<uint32_t, uint32_t>> recs;
+  recs.reserve(nWrite);
+  for (uint32_t i = 0; i < nWrite; ++i) {
+    const uint32_t fi = sampleWords[1u + i * 2u];
+    const uint32_t packed = sampleWords[2u + i * 2u];
+    recs.emplace_back(fi, packed);
+  }
 
   gfx.destroyBuffer(triBuf);
   gfx.destroyBuffer(occBuf);
@@ -500,9 +589,85 @@ MeshVoxelizeResult MeshVoxelizerGpu::voxelizeObjSurface(GfxDevice& gfx, const st
   gfx.destroyBuffer(seedRead);
   TextureFactory::destroy(gfx, albedo);
 
-  quantizePalette(occ, seeds, cfg.fallbackMaterial, cfg.sampleColor, out);
+  std::vector<uint32_t> occ(cellCount, 0u);
+  uint32_t occupiedFine = 0;
+  const uint32_t uFineN = static_cast<uint32_t>(fineN);
+  const uint32_t uSub = static_cast<uint32_t>(subdiv);
+  const uint32_t uN = static_cast<uint32_t>(n);
+  for (uint32_t wi = 0; wi < fineWords; ++wi) {
+    uint32_t word = fineBits[wi];
+    while (word != 0u) {
+      const uint32_t bit = static_cast<uint32_t>(std::countr_zero(word));
+      word &= word - 1u;
+      const uint32_t fi = (wi << 5) + bit;
+      if (fi >= fineCount) {
+        break;
+      }
+      ++occupiedFine;
+      const uint32_t x = fi % uFineN;
+      const uint32_t y = (fi / uFineN) % uFineN;
+      const uint32_t z = fi / (uFineN * uFineN);
+      const uint32_t cidx = (x / uSub) + (y / uSub) * uN + (z / uSub) * uN * uN;
+      occ[cidx] = 1u;
+    }
+  }
+
+  std::vector<glm::vec3> coarseRgb(cellCount, glm::vec3(0.62f, 0.64f, 0.68f));
+  if (cfg.sampleColor && !recs.empty()) {
+    std::sort(recs.begin(), recs.end(),
+              [](const std::pair<uint32_t, uint32_t>& a, const std::pair<uint32_t, uint32_t>& b) {
+                return a.first < b.first;
+              });
+    std::vector<glm::vec3> coarseSum(cellCount, glm::vec3(0.0f));
+    std::vector<uint32_t> coarseN(cellCount, 0u);
+    out.fineId.reserve(recs.size());
+    out.fineRgb.reserve(recs.size());
+    for (size_t i = 0; i < recs.size();) {
+      const uint32_t fi = recs[i].first;
+      uint64_t rs = 0;
+      uint64_t gs = 0;
+      uint64_t bs = 0;
+      uint64_t ns = 0;
+      while (i < recs.size() && recs[i].first == fi) {
+        const uint32_t p = recs[i].second;
+        rs += (p >> 16) & 255u;
+        gs += (p >> 8) & 255u;
+        bs += p & 255u;
+        ++ns;
+        ++i;
+      }
+      if (ns == 0u || fi >= fineCount) {
+        continue;
+      }
+      const uint32_t r8 = static_cast<uint32_t>((rs + ns / 2u) / ns);
+      const uint32_t g8 = static_cast<uint32_t>((gs + ns / 2u) / ns);
+      const uint32_t b8 = static_cast<uint32_t>((bs + ns / 2u) / ns);
+      out.fineId.push_back(fi);
+      out.fineRgb.push_back((r8 << 16) | (g8 << 8) | b8);
+      const uint32_t x = fi % uFineN;
+      const uint32_t y = (fi / uFineN) % uFineN;
+      const uint32_t z = fi / (uFineN * uFineN);
+      const uint32_t cidx = (x / uSub) + (y / uSub) * uN + (z / uSub) * uN * uN;
+      if (cidx < cellCount) {
+        coarseSum[cidx] += glm::vec3(static_cast<float>(r8), static_cast<float>(g8),
+                                     static_cast<float>(b8)) /
+                            255.0f;
+        ++coarseN[cidx];
+      }
+    }
+    for (uint32_t i = 0; i < cellCount; ++i) {
+      if (coarseN[i] > 0u) {
+        coarseRgb[i] = coarseSum[i] / static_cast<float>(coarseN[i]);
+      }
+    }
+  }
+  quantizePalette(occ, coarseRgb, cfg.fallbackMaterial, cfg.sampleColor, out);
   out.ok = true;
   out.n = n;
+  out.subdiv = subdiv;
+  out.fineN = fineN;
+  out.fineBits = std::move(fineBits);
+  out.occupiedFine = occupiedFine;
   out.voxelSize = voxelSize;
   out.bmin = gridMin;
   return out;

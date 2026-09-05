@@ -18,6 +18,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -41,10 +42,11 @@ void writeMat4(float* dst, const glm::mat4& m) {
   std::memcpy(dst, glm::value_ptr(m), sizeof(float) * 16);
 }
 
+// 8^3 occupancy in Morton order so each 4^3 octant is 2 uints and each 2^3 is 8 bits.
 constexpr uint32_t kMicroTemplateWords[16] = {
-    0x818181ffu, 0xff818181u, 0x00004281u, 0x81420000u, 0x00240081u, 0x81002400u,
-    0x18000081u, 0x81000018u, 0x18000081u, 0x81000018u, 0x00240081u, 0x81002400u,
-    0x00004281u, 0x81420000u, 0x818181ffu, 0xff818181u,
+    0x00050397u, 0x81000011u, 0x0a006b03u, 0x00422200u, 0x0c6d0005u, 0x00442400u,
+    0x9e0c0a00u, 0x88000018u, 0x18000011u, 0x00503079u, 0x00242200u, 0xa000b630u,
+    0x00444200u, 0xc0d60050u, 0x88000081u, 0xe9c0a000u,
 };
 
 constexpr uint32_t kSolidBrickWords[16] = {
@@ -55,28 +57,10 @@ constexpr uint32_t kSolidBrickWords[16] = {
 
 constexpr uint32_t kEmptyBrickWords[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 
-uint32_t occLevelAxis(uint32_t n, uint32_t shift) {
-  return (n + (1u << shift) - 1u) >> shift;
-}
+static_assert(VoxelScene::kBrickPageWords == 16 + 128 + 4096, "brick page layout vs shader");
 
-uint32_t occLevelWords(uint32_t n, uint32_t shift) {
-  const uint32_t axis = occLevelAxis(n, shift);
-  const uint32_t bits = axis * axis * axis;
-  return std::max(1u, (bits + 31u) / 32u);
-}
-
-// L0 4^3 + L1 8^3 + L2 16^3 packed after each other.
-uint32_t occPyramidWords(uint32_t n) {
-  return occLevelWords(n, 2) + occLevelWords(n, 3) + occLevelWords(n, 4);
-}
-
-void setOccBit(uint32_t* words, uint32_t wordCount, uint32_t axis, uint32_t mx, uint32_t my,
-               uint32_t mz) {
-  const uint32_t bit = mx + my * axis + mz * axis * axis;
-  const uint32_t wi = bit >> 5;
-  if (wi < wordCount) {
-    words[wi] |= 1u << (bit & 31u);
-  }
+uint32_t packRgb888a(uint32_t rgb888) {
+  return 0xFF000000u | (rgb888 & 0x00FFFFFFu);
 }
 
 }  // namespace
@@ -114,7 +98,7 @@ void VoxelScene::init(GfxDevice& gfx) {
     MeshVoxelizeConfig cfg;
     cfg.gridN = importGridN_;
     cfg.padding = importPadding_;
-    cfg.sampleColor = false;
+    cfg.sampleColor = true;
     cfg.conservative = importConservative_;
     importSurfaceMesh(gfx, pirateObj, cfg);
   }
@@ -186,7 +170,20 @@ uint32_t VoxelScene::indexOf(const VoxelObject& o, const glm::ivec3& p) const {
 }
 
 uint32_t VoxelScene::microBitIndex(const glm::ivec3& m) const {
-  return static_cast<uint32_t>(m.y * 64 + m.z * 8 + m.x);
+  const uint32_t x = static_cast<uint32_t>(m.x);
+  const uint32_t y = static_cast<uint32_t>(m.y);
+  const uint32_t z = static_cast<uint32_t>(m.z);
+  uint32_t morton = 0;
+  morton |= (x & 1u) << 0;
+  morton |= (y & 1u) << 1;
+  morton |= (z & 1u) << 2;
+  morton |= ((x >> 1) & 1u) << 3;
+  morton |= ((y >> 1) & 1u) << 4;
+  morton |= ((z >> 1) & 1u) << 5;
+  morton |= ((x >> 2) & 1u) << 6;
+  morton |= ((y >> 2) & 1u) << 7;
+  morton |= ((z >> 2) & 1u) << 8;
+  return morton;
 }
 
 uint32_t VoxelScene::fineBitIndex(const glm::ivec3& f) const {
@@ -244,6 +241,18 @@ void VoxelScene::writeFineByte(uint32_t page, uint32_t microBit, uint8_t value) 
   w[idx] = (w[idx] & ~(0xFFu << shift)) | (static_cast<uint32_t>(value) << shift);
 }
 
+uint32_t VoxelScene::fineColorIndex(const glm::ivec3& micro, const glm::ivec3& fine) const {
+  return microBitIndex(micro) * static_cast<uint32_t>(kFineCount) + fineBitIndex(fine);
+}
+
+void VoxelScene::writeFineRgb(uint32_t page, uint32_t colorIndex, uint32_t rgb888) {
+  if (page == kInvalidBrickPage || colorIndex >= static_cast<uint32_t>(kFinePerBrick)) {
+    return;
+  }
+  uint32_t* w = brickPageWords(page);
+  w[static_cast<uint32_t>(kFineColorOffset) + colorIndex] = packRgb888a(rgb888);
+}
+
 void VoxelScene::fillFineFromOccupancy(uint32_t page) {
   const uint32_t* occ = brickPageWords(page);
   for (int i = 0; i < kMicroCount; ++i) {
@@ -268,6 +277,46 @@ bool VoxelScene::brickPageEmpty(uint32_t page) const {
     }
   }
   return true;
+}
+
+bool VoxelScene::brickPageFull(uint32_t page) const {
+  if (page == kInvalidBrickPage) {
+    return false;
+  }
+  const uint32_t si = page / kPagesPerSlab;
+  if (si >= slabs_.size()) {
+    return false;
+  }
+  const uint32_t* w = brickPageWords(page);
+  for (int i = 0; i < kMicroWords; ++i) {
+    if (w[i] != 0xFFFFFFFFu) {
+      return false;
+    }
+  }
+  for (int i = 0; i < kFineTableBytes; ++i) {
+    if (readFineByte(page, static_cast<uint32_t>(i)) != 0xFFu) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void VoxelScene::tryCollapseFullBrick(VoxelObject& o, uint32_t coarseIndex) {
+  if (!collapseFullBricks_ || o.useImportPalette) {
+    return;
+  }
+  if (coarseIndex >= o.cells.size()) {
+    return;
+  }
+  CoarseCell& c = o.cells[coarseIndex];
+  if (c.material == 0u || c.brickPage == kInvalidBrickPage) {
+    return;
+  }
+  if (!brickPageFull(c.brickPage)) {
+    return;
+  }
+  freeBrickPage(c.brickPage);
+  c.brickPage = kInvalidBrickPage;
 }
 
 void VoxelScene::recountOccupiedMicro() {
@@ -322,6 +371,9 @@ uint32_t VoxelScene::allocBrickPage(const uint32_t* words16) {
     ensureSlabCpu(page / kPagesPerSlab);
   }
   uint32_t* dst = brickPageWords(page);
+  for (int i = 0; i < kBrickPageWords; ++i) {
+    dst[i] = 0u;
+  }
   for (int i = 0; i < kMicroWords; ++i) {
     dst[i] = words16[i];
   }
@@ -471,12 +523,14 @@ bool VoxelScene::setMicroCpu(VoxelObject& o, const glm::ivec3& coarse, const glm
     c.brickPage = kInvalidBrickPage;
     c.material = 0;
     occupiedCount_ = occupiedCount_ > 0 ? occupiedCount_ - 1 : 0;
+  } else {
+    tryCollapseFullBrick(o, idx);
   }
   return true;
 }
 
 bool VoxelScene::setFineCpu(VoxelObject& o, const glm::ivec3& coarse, const glm::ivec3& micro,
-                            const glm::ivec3& fine, bool solid) {
+                            const glm::ivec3& fine, bool solid, bool writeRgb, uint32_t rgb888) {
   if (!inBounds(o, coarse) || !microInBounds(micro) || !fineInBounds(fine) || o.cells.empty()) {
     return false;
   }
@@ -507,29 +561,33 @@ bool VoxelScene::setFineCpu(VoxelObject& o, const glm::ivec3& coarse, const glm:
     return false;
   }
   uint8_t byte = readFineByte(page, bit);
-  if (microWas && solid && byte == 0xFFu) {
-    return false;
-  }
-
   const uint8_t fmask = static_cast<uint8_t>(1u << fineBitIndex(fine));
   const bool was = (byte & fmask) != 0u;
-  if (was == solid) {
-    return false;
+  bool changed = false;
+  if (was != solid) {
+    if (solid) {
+      byte = static_cast<uint8_t>(byte | fmask);
+      writeFineByte(page, bit, byte);
+      if (!microWas) {
+        occ |= omask;
+        ++occupiedMicroCount_;
+      }
+    } else {
+      byte = static_cast<uint8_t>(byte & ~fmask);
+      writeFineByte(page, bit, byte);
+      if (byte == 0u && microWas) {
+        occ &= ~omask;
+        occupiedMicroCount_ = occupiedMicroCount_ > 0 ? occupiedMicroCount_ - 1 : 0;
+      }
+    }
+    changed = true;
   }
-  if (solid) {
-    byte = static_cast<uint8_t>(byte | fmask);
-    writeFineByte(page, bit, byte);
-    if (!microWas) {
-      occ |= omask;
-      ++occupiedMicroCount_;
-    }
-  } else {
-    byte = static_cast<uint8_t>(byte & ~fmask);
-    writeFineByte(page, bit, byte);
-    if (byte == 0u && microWas) {
-      occ &= ~omask;
-      occupiedMicroCount_ = occupiedMicroCount_ > 0 ? occupiedMicroCount_ - 1 : 0;
-    }
+  if (solid && writeRgb) {
+    writeFineRgb(page, fineColorIndex(micro, fine), rgb888);
+    changed = true;
+  }
+  if (!changed) {
+    return false;
   }
   dirtyPages_.insert(page);
 
@@ -538,6 +596,8 @@ bool VoxelScene::setFineCpu(VoxelObject& o, const glm::ivec3& coarse, const glm:
     c.brickPage = kInvalidBrickPage;
     c.material = 0;
     occupiedCount_ = occupiedCount_ > 0 ? occupiedCount_ - 1 : 0;
+  } else {
+    tryCollapseFullBrick(o, idx);
   }
   return true;
 }
@@ -550,8 +610,10 @@ void VoxelScene::ensureCoarseBrick(VoxelObject& o, const glm::ivec3& coarse, uin
   CoarseCell& c = o.cells[idx];
   if (c.material == 0u) {
     ++occupiedCount_;
-    c.material = material;
+    c.material = material == 0u ? 1u : material;
     c.brickPage = allocBrickPage(kEmptyBrickWords);
+  } else if (material >= 2u && c.brickPage != kInvalidBrickPage) {
+    c.material = material;
   }
 }
 
@@ -574,63 +636,11 @@ void VoxelScene::packObjectPool() {
         ++occupiedCount_;
       }
     }
-    o.occMipOffset = static_cast<uint32_t>(occMipCpu_.size());
-    o.occMipWords = occPyramidWords(static_cast<uint32_t>(std::max(o.gridSize, 1)));
-    occMipCpu_.resize(o.occMipOffset + o.occMipWords, 0u);
-    fillOccMip(o, occMipCpu_.data() + o.occMipOffset, o.occMipWords);
+    o.occMipOffset = 0;
+    o.occMipWords = 0;
   }
   recountOccupiedMicro();
   recountOccupiedFine();
-}
-
-void VoxelScene::fillOccMip(const VoxelObject& o, uint32_t* words, uint32_t wordCount) const {
-  if (!words || wordCount == 0) {
-    return;
-  }
-  std::fill(words, words + wordCount, 0u);
-  const int n = o.gridSize;
-  if (n <= 0) {
-    return;
-  }
-  const uint32_t nu = static_cast<uint32_t>(n);
-  const uint32_t l0w = occLevelWords(nu, 2);
-  const uint32_t l1w = occLevelWords(nu, 3);
-  const uint32_t l2w = occLevelWords(nu, 4);
-  if (wordCount < l0w) {
-    return;
-  }
-  const size_t expected =
-      static_cast<size_t>(n) * static_cast<size_t>(n) * static_cast<size_t>(n);
-  if (o.cells.size() != expected) {
-    return;
-  }
-  uint32_t* l0 = words;
-  uint32_t* l1 = (wordCount >= l0w + l1w) ? words + l0w : nullptr;
-  uint32_t* l2 = (l1 && wordCount >= l0w + l1w + l2w) ? words + l0w + l1w : nullptr;
-  const uint32_t a0 = occLevelAxis(nu, 2);
-  const uint32_t a1 = occLevelAxis(nu, 3);
-  const uint32_t a2 = occLevelAxis(nu, 4);
-  for (int z = 0; z < n; ++z) {
-    for (int y = 0; y < n; ++y) {
-      for (int x = 0; x < n; ++x) {
-        const size_t idx = static_cast<size_t>(x) + static_cast<size_t>(y) * static_cast<size_t>(n) +
-                           static_cast<size_t>(z) * static_cast<size_t>(n) * static_cast<size_t>(n);
-        if (o.cells[idx].material == 0u) {
-          continue;
-        }
-        const uint32_t ux = static_cast<uint32_t>(x);
-        const uint32_t uy = static_cast<uint32_t>(y);
-        const uint32_t uz = static_cast<uint32_t>(z);
-        setOccBit(l0, l0w, a0, ux >> 2, uy >> 2, uz >> 2);
-        if (l1) {
-          setOccBit(l1, l1w, a1, ux >> 3, uy >> 3, uz >> 3);
-        }
-        if (l2) {
-          setOccBit(l2, l2w, a2, ux >> 4, uy >> 4, uz >> 4);
-        }
-      }
-    }
-  }
 }
 
 void VoxelScene::uploadOccMip(GfxDevice& gfx) {
@@ -661,8 +671,11 @@ void VoxelScene::fillGpuObjectRecords() {
     g.gridSize[1] = static_cast<uint32_t>(o.gridSize);
     g.gridSize[2] = static_cast<uint32_t>(o.gridSize);
     g.flags = VoxelObject::kFlagEnabled;
-    if (o.nestedMicro) {
+    if (nestedMicroVoxels_) {
       g.flags |= VoxelObject::kFlagNestedMicro;
+    }
+    if (nestedMicroVoxels_ && nestedFineVoxels_) {
+      g.flags |= VoxelObject::kFlagNestedFine;
     }
     if (o.useImportPalette) {
       g.flags |= VoxelObject::kFlagImportPalette;
@@ -818,17 +831,8 @@ void VoxelScene::flushObject(GfxDevice& gfx, int objectIndex) {
   if (objectIndex < 0 || objectIndex >= static_cast<int>(objects_.size())) {
     return;
   }
-  VoxelObject& o = objects_[static_cast<size_t>(objectIndex)];
-  if (o.occMipWords > 0 && o.occMipOffset + o.occMipWords <= occMipCpu_.size()) {
-    fillOccMip(o, occMipCpu_.data() + o.occMipOffset, o.occMipWords);
-  }
   ensureGpuBuffers(gfx);
   uploadGridImage(gfx, static_cast<uint32_t>(objectIndex));
-  if (o.occMipWords > 0 && occMipBuffer_.buffer != VK_NULL_HANDLE) {
-    gfx.uploadToBuffer(occMipBuffer_, occMipCpu_.data() + o.occMipOffset,
-                       sizeof(uint32_t) * o.occMipWords,
-                       sizeof(uint32_t) * static_cast<VkDeviceSize>(o.occMipOffset));
-  }
   flushDirtyPages(gfx);
 }
 
@@ -968,59 +972,122 @@ uint32_t VoxelScene::stampMeshIntoWorld(const MeshVoxelizeResult& r, bool sample
     return 0;
   }
 
+  const int subdiv = std::max(1, r.subdiv);
+  const int fineN = r.fineN > 0 ? r.fineN : r.n * subdiv;
   const float hutExtent = static_cast<float>(r.n) * r.voxelSize;
+  const float importFineVs = r.voxelSize / static_cast<float>(subdiv);
+  const float worldFineVs = wvs / static_cast<float>(kFinePerCoarse);
   const glm::vec3 hutPos(0.0f, 0.5f * hutExtent + 2.5f * voxelSize_, 0.0f);
   const glm::vec3 hutOrigin = hutPos - glm::vec3(0.5f * hutExtent);
   const glm::vec3 worldOrigin =
       world.position - glm::vec3(0.5f * static_cast<float>(wn) * wvs);
+  const int worldFineN = wn * kFinePerCoarse;
 
   world.useImportPalette = sampleColor;
+  world.nestedMicro = true;
+  if (sampleColor) {
+    nestedMicroVoxels_ = true;
+    nestedFineVoxels_ = true;
+  }
   importPalette_.fill(glm::vec4(0.62f, 0.64f, 0.68f, 1.0f));
   importPalette_[0] = glm::vec4(0.0f, 0.0f, 0.0f, 1.0f);
+  // Slot 1 is reserved for ground / default gray. Mesh palette index i → GPU material i+1.
   if (sampleColor) {
-    importPalette_[1] = glm::vec4(0.62f, 0.64f, 0.68f, 1.0f);
-    for (uint32_t i = 1; i < 255; ++i) {
+    const uint32_t used = std::min(r.paletteUsed, 255u);
+    for (uint32_t i = 1; i < used; ++i) {
       importPalette_[i + 1] = glm::vec4(r.palette[i], 1.0f);
     }
   }
 
+  auto coarseMatForFine = [&](int fx, int fy, int fz) -> uint32_t {
+    const int cx = fx / subdiv;
+    const int cy = fy / subdiv;
+    const int cz = fz / subdiv;
+    if (cx < 0 || cy < 0 || cz < 0 || cx >= r.n || cy >= r.n || cz >= r.n) {
+      return 1u;
+    }
+    const size_t src = static_cast<size_t>(cx) + static_cast<size_t>(cy) * static_cast<size_t>(r.n) +
+                       static_cast<size_t>(cz) * static_cast<size_t>(r.n) * static_cast<size_t>(r.n);
+    if (!sampleColor) {
+      return 1u;
+    }
+    if (src >= r.material.size() || r.material[src] == 0u) {
+      return 1u;
+    }
+    return std::min(255u, r.material[src] + 1u);
+  };
+
+  auto placeWorldFine = [&](int wx, int wy, int wz, uint32_t mat, bool hasRgb, uint32_t rgb888) {
+    if (wx < 0 || wy < 0 || wz < 0 || wx >= worldFineN || wy >= worldFineN || wz >= worldFineN) {
+      return false;
+    }
+    const glm::ivec3 absFine(wx, wy, wz);
+    const glm::ivec3 c(absFine.x / kFinePerCoarse, absFine.y / kFinePerCoarse,
+                       absFine.z / kFinePerCoarse);
+    const glm::ivec3 rem = absFine - c * kFinePerCoarse;
+    const glm::ivec3 m(rem.x / kFineRes, rem.y / kFineRes, rem.z / kFineRes);
+    const glm::ivec3 f = rem - m * kFineRes;
+    ensureCoarseBrick(world, c, mat);
+    return setFineCpu(world, c, m, f, true, hasRgb, rgb888);
+  };
+
   uint32_t stamped = 0;
-  const int n = r.n;
-  for (int z = 0; z < n; ++z) {
-    for (int y = 0; y < n; ++y) {
-      for (int x = 0; x < n; ++x) {
-        const size_t src = static_cast<size_t>(x) + static_cast<size_t>(y) * static_cast<size_t>(n) +
-                           static_cast<size_t>(z) * static_cast<size_t>(n) * static_cast<size_t>(n);
-        if (src >= r.material.size() || r.material[src] == 0u) {
-          continue;
+  if (r.fineBits.empty() || fineN <= 0) {
+    return 0;
+  }
+
+  const uint32_t uFineN = static_cast<uint32_t>(fineN);
+  const uint64_t fineCount = static_cast<uint64_t>(uFineN) * uFineN * uFineN;
+  const uint32_t fineWords = static_cast<uint32_t>(r.fineBits.size());
+  size_t colorCursor = 0;
+  const size_t colorCount = std::min(r.fineId.size(), r.fineRgb.size());
+  for (uint32_t wi = 0; wi < fineWords; ++wi) {
+    uint32_t word = r.fineBits[wi];
+    while (word != 0u) {
+      const uint32_t bit = static_cast<uint32_t>(std::countr_zero(word));
+      word &= word - 1u;
+      const uint32_t fi = (wi << 5) + bit;
+      if (fi >= fineCount) {
+        break;
+      }
+      const int fx = static_cast<int>(fi % uFineN);
+      const int fy = static_cast<int>((fi / uFineN) % uFineN);
+      const int fz = static_cast<int>(fi / (uFineN * uFineN));
+      const uint32_t mat = coarseMatForFine(fx, fy, fz);
+      bool hasRgb = false;
+      uint32_t rgb888 = 0;
+      if (sampleColor) {
+        while (colorCursor < colorCount && r.fineId[colorCursor] < fi) {
+          ++colorCursor;
         }
-        uint32_t mat = 1u;
-        if (sampleColor) {
-          mat = std::min(255u, r.material[src] + 1u);
+        if (colorCursor < colorCount && r.fineId[colorCursor] == fi) {
+          rgb888 = r.fineRgb[colorCursor];
+          hasRgb = true;
+        } else {
+          const glm::vec3 p = importPalette_[mat];
+          rgb888 = (static_cast<uint32_t>(p.r * 255.0f + 0.5f) << 16) |
+                   (static_cast<uint32_t>(p.g * 255.0f + 0.5f) << 8) |
+                   static_cast<uint32_t>(p.b * 255.0f + 0.5f);
+          hasRgb = true;
         }
-        const glm::vec3 hutMin = hutOrigin + glm::vec3(x, y, z) * r.voxelSize;
-        const glm::vec3 hutMax = hutMin + glm::vec3(r.voxelSize);
-        const glm::vec3 gmin = (hutMin - worldOrigin) / wvs;
-        const glm::vec3 gmax = (hutMax - worldOrigin) / wvs;
-        const int x0 = std::max(0, static_cast<int>(std::floor(gmin.x)));
-        const int y0 = std::max(0, static_cast<int>(std::floor(gmin.y)));
-        const int z0 = std::max(0, static_cast<int>(std::floor(gmin.z)));
-        const int x1 = std::min(wn - 1, static_cast<int>(std::ceil(gmax.x) - 1.0f));
-        const int y1 = std::min(wn - 1, static_cast<int>(std::ceil(gmax.y) - 1.0f));
-        const int z1 = std::min(wn - 1, static_cast<int>(std::ceil(gmax.z) - 1.0f));
-        if (x0 > x1 || y0 > y1 || z0 > z1) {
-          continue;
-        }
-        for (int wz = z0; wz <= z1; ++wz) {
-          for (int wy = y0; wy <= y1; ++wy) {
-            for (int wx = x0; wx <= x1; ++wx) {
-              const uint32_t idx = indexOf(world, glm::ivec3(wx, wy, wz));
-              CoarseCell& c = world.cells[idx];
-              if (c.brickPage != kInvalidBrickPage) {
-                freeBrickPage(c.brickPage);
-              }
-              c.material = mat;
-              c.brickPage = kInvalidBrickPage;
+      }
+      const glm::vec3 hutMin = hutOrigin + glm::vec3(fx, fy, fz) * importFineVs;
+      const glm::vec3 hutMax = hutMin + glm::vec3(importFineVs);
+      const glm::vec3 gmin = (hutMin - worldOrigin) / worldFineVs;
+      const glm::vec3 gmax = (hutMax - worldOrigin) / worldFineVs;
+      const int x0 = std::max(0, static_cast<int>(std::floor(gmin.x)));
+      const int y0 = std::max(0, static_cast<int>(std::floor(gmin.y)));
+      const int z0 = std::max(0, static_cast<int>(std::floor(gmin.z)));
+      const int x1 = std::min(worldFineN - 1, static_cast<int>(std::ceil(gmax.x) - 1.0f));
+      const int y1 = std::min(worldFineN - 1, static_cast<int>(std::ceil(gmax.y) - 1.0f));
+      const int z1 = std::min(worldFineN - 1, static_cast<int>(std::ceil(gmax.z) - 1.0f));
+      if (x0 > x1 || y0 > y1 || z0 > z1) {
+        continue;
+      }
+      for (int wz = z0; wz <= z1; ++wz) {
+        for (int wy = y0; wy <= y1; ++wy) {
+          for (int wx = x0; wx <= x1; ++wx) {
+            if (placeWorldFine(wx, wy, wz, mat, hasRgb, rgb888)) {
               ++stamped;
             }
           }
@@ -1038,7 +1105,9 @@ bool VoxelScene::importSurfaceMesh(GfxDevice& gfx, const std::string& path,
     return false;
   }
 
-  MeshVoxelizeResult r = voxelizeObjSurface(gfx, voxelizeGpu_, path, cfg);
+  MeshVoxelizeConfig local = cfg;
+  local.fineSubdiv = kFinePerCoarse;
+  MeshVoxelizeResult r = voxelizeObjSurface(gfx, voxelizeGpu_, path, local);
   if (!r.ok) {
     importStatus_ = r.error;
     return false;
@@ -1052,7 +1121,7 @@ bool VoxelScene::importSurfaceMesh(GfxDevice& gfx, const std::string& path,
   }
   buildGroundObject(world);
 
-  const uint32_t stamped = stampMeshIntoWorld(r, cfg.sampleColor);
+  const uint32_t stamped = stampMeshIntoWorld(r, local.sampleColor);
 
   importPath_ = path;
   lastImportedPath_ = path;
@@ -1063,15 +1132,36 @@ bool VoxelScene::importSurfaceMesh(GfxDevice& gfx, const std::string& path,
   packObjectPool();
   fillGpuObjectRecords();
   ensureGpuBuffers(gfx);
+  {
+    const VkDeviceSize slabBytes = sizeof(uint32_t) * kWordsPerSlab;
+    for (BrickSlab& s : slabs_) {
+      if (s.gpu.buffer != VK_NULL_HANDLE) {
+        gfx.uploadToBuffer(s.gpu, s.words.data(), slabBytes);
+      }
+    }
+    dirtyPages_.clear();
+  }
   uploadWorldAndObjects(gfx);
   uploadPalette(gfx);
 
   importStatus_ = "Stamped into world  N=" + std::to_string(r.n) +
-                  "  srcOcc=" + std::to_string(r.occupied) +
-                  "  worldWrites=" + std::to_string(stamped);
+                  "  fineN=" + std::to_string(r.fineN) +
+                  "  srcCoarse=" + std::to_string(r.occupied) +
+                  "  srcFine=" + std::to_string(r.occupiedFine) +
+                  "  worldFines=" + std::to_string(stamped) +
+                  "  palette=" + std::to_string(r.paletteUsed) +
+                  "  fineColors=" + std::to_string(r.fineId.size());
+  if (!r.fineRgb.empty()) {
+    std::unordered_set<uint32_t> uniq(r.fineRgb.begin(), r.fineRgb.end());
+    importStatus_ += "  uniqueRgb=" + std::to_string(uniq.size());
+  }
+  if (r.colorDropped > 0u) {
+    importStatus_ += "  droppedSamples=" + std::to_string(r.colorDropped);
+  }
   if (!r.warning.empty()) {
     importStatus_ += "  (" + r.warning + ")";
   }
+  std::cout << importStatus_ << std::endl;
   return true;
 }
 
@@ -1285,7 +1375,8 @@ std::optional<VoxelScene::PickResult> VoxelScene::pickObject(const VoxelObject& 
     mask = glm::bvec3(false, false, true);
   }
 
-  const bool useNested = o.nestedMicro && nestedMicroVoxels_;
+  const bool useNested = nestedMicroVoxels_;
+  const bool useFine = useNested && nestedFineVoxels_;
 
   auto makeHit = [&](const glm::ivec3& cell, const glm::ivec3& micro, const glm::ivec3& fine,
                      uint32_t mat, glm::bvec3 msk, bool hasMicro, bool hasFine,
@@ -1381,8 +1472,12 @@ std::optional<VoxelScene::PickResult> VoxelScene::pickObject(const VoxelObject& 
 
       if (getMicro(o, mapPos, microPos)) {
         const float tMicroEnter = microT(microMask, microSide + deltaDist);
-        if (auto h = tryFine(microPos, microMask, localPos, tMicroEnter)) {
-          return h;
+        if (useFine) {
+          if (auto h = tryFine(microPos, microMask, localPos, tMicroEnter)) {
+            return h;
+          }
+        } else {
+          return makeHit(mapPos, microPos, glm::ivec3(0), mat, microMask, true, false, tMicroEnter);
         }
       }
 
@@ -1396,8 +1491,12 @@ std::optional<VoxelScene::PickResult> VoxelScene::pickObject(const VoxelObject& 
         if (getMicro(o, mapPos, microPos)) {
           const float tMicroEnter = microT(microMask, microSide);
           glm::vec3 hitPos = localPos + rd * glm::dot(microSide - deltaDist, glm::vec3(microMask));
-          if (auto h = tryFine(microPos, microMask, hitPos, tMicroEnter)) {
-            return h;
+          if (useFine) {
+            if (auto h = tryFine(microPos, microMask, hitPos, tMicroEnter)) {
+              return h;
+            }
+          } else {
+            return makeHit(mapPos, microPos, glm::ivec3(0), mat, microMask, true, false, tMicroEnter);
           }
         }
       }
@@ -1476,7 +1575,7 @@ void VoxelScene::handleEditInput(GLFWwindow* window, GfxDevice& gfx) {
   const uint32_t mat = static_cast<uint32_t>(std::clamp(brushMaterial_, 1, 255));
 
   int changed = 0;
-  if (nestedMicroVoxels_ && (hit->hasFine || hit->hasMicro)) {
+  if (nestedMicroVoxels_ && nestedFineVoxels_ && (hit->hasFine || hit->hasMicro)) {
     glm::ivec3 fine = hit->fine;
     glm::ivec3 micro = hit->micro;
     glm::ivec3 coarse = hit->cell;
@@ -1504,6 +1603,27 @@ void VoxelScene::handleEditInput(GLFWwindow* window, GfxDevice& gfx) {
       }
       if (inBounds(o, placeCoarse) && microInBounds(placeMicro) && fineInBounds(placeFine)) {
         changed = applyFineSphereBrush(o, placeCoarse, placeMicro, placeFine, radius, true, mat);
+      }
+    }
+  } else if (nestedMicroVoxels_ && hit->hasMicro) {
+    glm::ivec3 micro = hit->micro;
+    glm::ivec3 coarse = hit->cell;
+    if (removeEdge) {
+      changed = applyMicroSphereBrush(o, coarse, micro, radius, false, mat);
+    } else if (placeEdge) {
+      glm::ivec3 placeMicro = micro + hit->normal;
+      glm::ivec3 placeCoarse = coarse;
+      for (int a = 0; a < 3; ++a) {
+        if (placeMicro[a] < 0) {
+          placeMicro[a] = kMicroRes - 1;
+          placeCoarse[a] -= 1;
+        } else if (placeMicro[a] >= kMicroRes) {
+          placeMicro[a] = 0;
+          placeCoarse[a] += 1;
+        }
+      }
+      if (inBounds(o, placeCoarse) && microInBounds(placeMicro)) {
+        changed = applyMicroSphereBrush(o, placeCoarse, placeMicro, radius, true, mat);
       }
     }
   } else {

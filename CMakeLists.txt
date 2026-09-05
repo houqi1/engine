@@ -150,6 +150,7 @@ set(VE_SHADER_SOURCES
   voxel.vert
   voxel.frag
   voxel_dda.comp
+  voxel_dda_coarse.comp
   voxelize_surface.comp
 )
 
@@ -157,15 +158,36 @@ set(VE_SPV_FILES "")
 foreach(SHADER ${VE_SHADER_SOURCES})
   set(SRC ${VE_SHADER_SOURCE_DIR}/${SHADER})
   set(SPV ${VE_SHADER_OUTPUT_DIR}/${SHADER}.spv)
-  add_custom_command(
-    OUTPUT ${SPV}
-    COMMAND ${GLSLC} -O -g ${SRC} -o ${SPV}
-    DEPENDS ${SRC}
-    COMMENT "Compiling shader ${SHADER}"
-    VERBATIM
-  )
+  if(SHADER STREQUAL "voxel_dda.comp")
+    # Debug symbols in this kernel bloat VGPR allocation; keep -O only.
+    add_custom_command(
+      OUTPUT ${SPV}
+      COMMAND ${GLSLC} -O ${SRC} -o ${SPV}
+      DEPENDS ${SRC}
+      COMMENT "Compiling shader ${SHADER}"
+      VERBATIM
+    )
+  else()
+    add_custom_command(
+      OUTPUT ${SPV}
+      COMMAND ${GLSLC} -O -g ${SRC} -o ${SPV}
+      DEPENDS ${SRC}
+      COMMENT "Compiling shader ${SHADER}"
+      VERBATIM
+    )
+  endif()
   list(APPEND VE_SPV_FILES ${SPV})
 endforeach()
+
+set(VE_SLIM_SPV ${VE_SHADER_OUTPUT_DIR}/voxel_dda_slim.comp.spv)
+add_custom_command(
+  OUTPUT ${VE_SLIM_SPV}
+  COMMAND ${GLSLC} -O -DENABLE_SHADE=1 ${VE_SHADER_SOURCE_DIR}/voxel_dda_coarse.comp -o ${VE_SLIM_SPV}
+  DEPENDS ${VE_SHADER_SOURCE_DIR}/voxel_dda_coarse.comp
+  COMMENT "Compiling shader voxel_dda_slim.comp"
+  VERBATIM
+)
+list(APPEND VE_SPV_FILES ${VE_SLIM_SPV})
 
 add_custom_target(ve_shaders ALL DEPENDS ${VE_SPV_FILES})
 add_dependencies(vulkan_engine ve_shaders)

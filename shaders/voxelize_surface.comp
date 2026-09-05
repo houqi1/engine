@@ -3,12 +3,16 @@
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant, std430) uniform PC {
-    vec3 bmin;
-    float voxelSize;
+    float bminX;
+    float bminY;
+    float bminZ;
+    float voxelSize;  // coarse cell size; fine size is voxelSize / subdiv
     int N;
     int conservative;
     int sampleColor;
     int triCount;
+    int subdiv;  // 16 = 8 micro * 2 fine per coarse axis
+    int maxSamples;
 } pc;
 
 struct GpuTri {
@@ -25,11 +29,11 @@ layout(set = 0, binding = 0, std430) readonly buffer Tris {
 };
 
 layout(set = 0, binding = 1, std430) buffer Occupancy {
-    uint occ[];
+    uint occBits[];  // packed fineN^3 occupancy, fineN = N * subdiv
 };
 
-layout(set = 0, binding = 2, std430) buffer Seeds {
-    uint seedRgb[];
+layout(set = 0, binding = 2, std430) buffer Samples {
+    uint words[];  // [0]=count, then (fineIndex, packedRgb) pairs
 };
 
 layout(set = 0, binding = 3) uniform sampler2D albedoMap;
@@ -185,14 +189,6 @@ vec3 barycentric(vec3 p, vec3 a, vec3 b, vec3 c) {
     return vec3(u, v, w);
 }
 
-uint packRgba(vec3 rgb) {
-    vec3 c = clamp(rgb, 0.0, 1.0);
-    uint r = uint(c.r * 255.0 + 0.5);
-    uint g = uint(c.g * 255.0 + 0.5);
-    uint b = uint(c.b * 255.0 + 0.5);
-    return (255u << 24) | (r << 16) | (g << 8) | b;
-}
-
 void main() {
     uint tid = gl_GlobalInvocationID.x;
     if (tid >= uint(pc.triCount) || pc.N <= 0) {
@@ -203,51 +199,82 @@ void main() {
     vec3 a = t.p0.xyz;
     vec3 b = t.p1.xyz;
     vec3 c = t.p2.xyz;
-    float vs = max(pc.voxelSize, 1e-8);
+    vec3 gridMin = vec3(pc.bminX, pc.bminY, pc.bminZ);
+    float coarseVs = max(pc.voxelSize, 1e-8);
+    int subdiv = max(pc.subdiv, 1);
     int n = pc.N;
-    vec3 invVs = vec3(1.0 / vs);
+    int fineN = n * subdiv;
+    float fineVs = coarseVs / float(subdiv);
+    vec3 invFine = vec3(1.0 / fineVs);
 
     vec3 tmin = min(a, min(b, c));
     vec3 tmax = max(a, max(b, c));
-    ivec3 i0 = ivec3(floor((tmin - pc.bmin) * invVs));
-    ivec3 i1 = ivec3(floor((tmax - pc.bmin) * invVs));
+    ivec3 f0 = ivec3(floor((tmin - gridMin) * invFine));
+    ivec3 f1 = ivec3(floor((tmax - gridMin) * invFine));
     if (pc.conservative != 0) {
-        i0 -= ivec3(1);
-        i1 += ivec3(1);
+        f0 -= ivec3(1);
+        f1 += ivec3(1);
     }
-    i0 = clamp(i0, ivec3(0), ivec3(n - 1));
-    i1 = clamp(i1, ivec3(0), ivec3(n - 1));
+    f0 = clamp(f0, ivec3(0), ivec3(fineN - 1));
+    f1 = clamp(f1, ivec3(0), ivec3(fineN - 1));
 
-    vec3 halfSize = vec3(0.5 * vs);
+    vec3 fineHalf = vec3(0.5 * fineVs);
+    vec3 coarseHalf = vec3(0.5 * coarseVs);
+    if (pc.conservative != 0) {
+        coarseHalf += fineHalf;
+    }
     vec2 uv0 = t.uv0uv1.xy;
     vec2 uv1 = t.uv0uv1.zw;
     vec2 uv2 = t.uv2pad.xy;
     float hasTex = t.uv2pad.w;
     vec3 kd = t.kd.rgb;
 
-    for (int z = i0.z; z <= i1.z; ++z) {
-        for (int y = i0.y; y <= i1.y; ++y) {
-            for (int x = i0.x; x <= i1.x; ++x) {
-                vec3 boxMin = pc.bmin + vec3(x, y, z) * vs;
-                vec3 center = boxMin + halfSize;
-                if (!triBoxOverlap(center, halfSize, a, b, c)) {
+    ivec3 c0 = f0 / subdiv;
+    ivec3 c1 = f1 / subdiv;
+    for (int cz = c0.z; cz <= c1.z; ++cz) {
+        for (int cy = c0.y; cy <= c1.y; ++cy) {
+            for (int cx = c0.x; cx <= c1.x; ++cx) {
+                vec3 coarseMin = gridMin + vec3(cx, cy, cz) * coarseVs;
+                vec3 coarseCenter = coarseMin + vec3(0.5 * coarseVs);
+                if (!triBoxOverlap(coarseCenter, coarseHalf, a, b, c)) {
                     continue;
                 }
-                uint idx = uint(x) + uint(y) * uint(n) + uint(z) * uint(n) * uint(n);
-                atomicMax(occ[idx], 1u);
-                if (pc.sampleColor == 0) {
-                    continue;
+
+                ivec3 lf0 = max(f0, ivec3(cx, cy, cz) * subdiv);
+                ivec3 lf1 = min(f1, ivec3(cx, cy, cz) * subdiv + (subdiv - 1));
+                for (int z = lf0.z; z <= lf1.z; ++z) {
+                    for (int y = lf0.y; y <= lf1.y; ++y) {
+                        for (int x = lf0.x; x <= lf1.x; ++x) {
+                            vec3 boxMin = gridMin + vec3(x, y, z) * fineVs;
+                            vec3 center = boxMin + fineHalf;
+                            if (!triBoxOverlap(center, fineHalf, a, b, c)) {
+                                continue;
+                            }
+                            uint idx = uint(x) + uint(y) * uint(fineN) + uint(z) * uint(fineN) * uint(fineN);
+                            atomicOr(occBits[idx >> 5], 1u << (idx & 31u));
+                            if (pc.sampleColor == 0 || pc.maxSamples <= 0) {
+                                continue;
+                            }
+                            vec3 q = closestPointOnTriangle(center, a, b, c);
+                            vec3 bary = barycentric(q, a, b, c);
+                            vec2 uv = bary.x * uv0 + bary.y * uv1 + bary.z * uv2;
+                            uv.y = 1.0 - uv.y;
+                            uv = clamp(uv, vec2(0.0), vec2(1.0));
+                            vec3 rgb = kd;
+                            if (hasTex > 0.5) {
+                                rgb *= textureLod(albedoMap, uv, 0.0).rgb;
+                            }
+                            rgb = clamp(rgb, 0.0, 1.0);
+                            uvec3 irgb = uvec3(rgb * 255.0 + 0.5);
+                            uint packed = (255u << 24) | (irgb.r << 16) | (irgb.g << 8) | irgb.b;
+                            uint slot = atomicAdd(words[0], 1u);
+                            if (slot < uint(pc.maxSamples)) {
+                                words[1u + slot * 2u] = idx;
+                                words[2u + slot * 2u] = packed;
+                            }
+                        }
+                    }
                 }
-                vec3 q = closestPointOnTriangle(center, a, b, c);
-                vec3 bary = barycentric(q, a, b, c);
-                vec2 uv = bary.x * uv0 + bary.y * uv1 + bary.z * uv2;
-                vec3 rgb = kd;
-                if (hasTex > 0.5) {
-                    rgb *= textureLod(albedoMap, uv, 0.0).rgb;
-                }
-                uint packed = packRgba(rgb);
-                uint expected = 0u;
-                atomicCompSwap(seedRgb[idx], expected, packed);
             }
         }
     }

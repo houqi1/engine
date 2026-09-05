@@ -15,6 +15,7 @@ class GfxDevice;
 struct MeshVoxelizeConfig {
   int gridN = 48;
   int padding = 1;
+  int fineSubdiv = 16;  // must match VoxelScene::kFinePerCoarse (8^3 micro * 2^3 fine)
   uint32_t fallbackMaterial = 1;
   bool conservative = true;
   bool sampleColor = true;
@@ -23,12 +24,20 @@ struct MeshVoxelizeConfig {
 struct MeshVoxelizeResult {
   bool ok = false;
   int n = 0;
+  int subdiv = 16;
+  int fineN = 0;
   float voxelSize = 0.35f;
   glm::vec3 bmin{0.0f};
-  std::vector<uint32_t> material;
+  std::vector<uint32_t> material;  // coarse palette id (nested-off / occupancy)
+  std::vector<uint32_t> fineBits;
+  std::vector<uint32_t> fineId;   // sorted occupied fine indices with a color sample
+  std::vector<uint32_t> fineRgb;  // 0x00RRGGBB, parallel to fineId
   std::array<glm::vec3, 256> palette{};
   uint32_t paletteUsed = 0;
   uint32_t occupied = 0;
+  uint32_t occupiedFine = 0;
+  uint32_t colorSamples = 0;
+  uint32_t colorDropped = 0;
   std::string error;
   std::string warning;
 };

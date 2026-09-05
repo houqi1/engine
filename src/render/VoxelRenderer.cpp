@@ -9,6 +9,7 @@
 #include <glm/gtc/type_ptr.hpp>
 
 #include <algorithm>
+#include <cstddef>
 #include <cstring>
 #include <optional>
 #include <stdexcept>
@@ -39,9 +40,19 @@ VoxelRenderer::~VoxelRenderer() {
   if (computePipeline_) {
     vkDestroyPipeline(gfx_.device(), computePipeline_, nullptr);
   }
+  if (slimPipeline_) {
+    vkDestroyPipeline(gfx_.device(), slimPipeline_, nullptr);
+  }
+  if (coarsePipeline_) {
+    vkDestroyPipeline(gfx_.device(), coarsePipeline_, nullptr);
+  }
+  if (beamPipeline_) {
+    vkDestroyPipeline(gfx_.device(), beamPipeline_, nullptr);
+  }
   if (pipelineLayout_) {
     vkDestroyPipelineLayout(gfx_.device(), pipelineLayout_, nullptr);
   }
+  gfx_.destroyImage(dummyBeamImage_);
   for (auto& frame : frames_) {
     gfx_.destroyBuffer(frame.frameUBO);
   }
@@ -54,6 +65,8 @@ VoxelRenderer::~VoxelRenderer() {
 }
 
 void VoxelRenderer::init(VoxelScene& scene) {
+  dummyBeamImage_ = gfx_.createImage({1, 1, 1}, kBeamFormat, VK_IMAGE_USAGE_STORAGE_BIT,
+                                     VK_IMAGE_ASPECT_COLOR_BIT, true);
   createDescriptors();
   createOutputImage();
   createTimestampPool();
@@ -127,12 +140,16 @@ void VoxelRenderer::collectGpuTiming(uint32_t frameIndex) {
   };
 
   const float totalMs = toMs(stamps[kTsFrameBegin], stamps[kTsFrameEnd]);
+  const float beamMs = toMs(stamps[kTsFrameBegin], stamps[kTsAfterBeam]);
+  const float mainMs = toMs(stamps[kTsAfterBeam], stamps[kTsAfterCompute]);
   const float computeMs = toMs(stamps[kTsFrameBegin], stamps[kTsAfterCompute]);
   const float blitMs = toMs(stamps[kTsAfterCompute], stamps[kTsAfterBlit]);
   const float uiMs = toMs(stamps[kTsAfterBlit], stamps[kTsFrameEnd]);
 
   constexpr float alpha = 0.15f;
   gpuFrameMs_ = gpuFrameMs_ * (1.0f - alpha) + totalMs * alpha;
+  gpuBeamMs_ = gpuBeamMs_ * (1.0f - alpha) + beamMs * alpha;
+  gpuMainMs_ = gpuMainMs_ * (1.0f - alpha) + mainMs * alpha;
   gpuComputeMs_ = gpuComputeMs_ * (1.0f - alpha) + computeMs * alpha;
   gpuBlitMs_ = gpuBlitMs_ * (1.0f - alpha) + blitMs * alpha;
   gpuUiMs_ = gpuUiMs_ * (1.0f - alpha) + uiMs * alpha;
@@ -151,10 +168,11 @@ void VoxelRenderer::resize() {
   boundPaletteBuffer_ = VK_NULL_HANDLE;
   boundOccMipBuffer_ = VK_NULL_HANDLE;
   boundSkyView_ = VK_NULL_HANDLE;
+  boundBeamView_ = VK_NULL_HANDLE;
 }
 
 void VoxelRenderer::createDescriptors() {
-  VkDescriptorSetLayoutBinding bindings[8]{};
+  VkDescriptorSetLayoutBinding bindings[9]{};
   bindings[0].binding = 0;
   bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
   bindings[0].descriptorCount = 1;
@@ -195,9 +213,14 @@ void VoxelRenderer::createDescriptors() {
   bindings[7].descriptorCount = 1;
   bindings[7].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
+  bindings[8].binding = 8;
+  bindings[8].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+  bindings[8].descriptorCount = 1;
+  bindings[8].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
   VkDescriptorSetLayoutCreateInfo layoutInfo{};
   layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-  layoutInfo.bindingCount = 8;
+  layoutInfo.bindingCount = 9;
   layoutInfo.pBindings = bindings;
   if (vkCreateDescriptorSetLayout(gfx_.device(), &layoutInfo, nullptr, &frameLayout_) !=
       VK_SUCCESS) {
@@ -208,7 +231,7 @@ void VoxelRenderer::createDescriptors() {
       {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, GfxDevice::kFramesInFlight},
       {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
        GfxDevice::kFramesInFlight * (3u + VoxelScene::kMaxBrickSlabs)},
-      {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, GfxDevice::kFramesInFlight},
+      {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, GfxDevice::kFramesInFlight * 2u},
       {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
        GfxDevice::kFramesInFlight * (1u + VoxelScene::kGridTexCount)},
   };
@@ -230,10 +253,56 @@ void VoxelRenderer::createOutputImage() {
   outImage_ = gfx_.createImage({ext.width, ext.height, 1}, kOutFormat,
                                VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
                                VK_IMAGE_ASPECT_COLOR_BIT, true);
+  const uint32_t beamW = std::max(1u, (ext.width + 7u) / 8u);
+  const uint32_t beamH = std::max(1u, (ext.height + 7u) / 8u);
+  beamImage_ = gfx_.createImage({beamW, beamH, 1}, kBeamFormat, VK_IMAGE_USAGE_STORAGE_BIT,
+                                VK_IMAGE_ASPECT_COLOR_BIT, true);
 }
 
 void VoxelRenderer::destroyOutputImage() {
   gfx_.destroyImage(outImage_);
+  gfx_.destroyImage(beamImage_);
+}
+
+VkPipeline VoxelRenderer::createComputePipeline(VkShaderModule shader, DdaSpec spec,
+                                                bool useSpec) const {
+  VkSpecializationMapEntry specEntries[3]{};
+  specEntries[0].constantID = 0;
+  specEntries[0].offset = offsetof(DdaSpec, beamPass);
+  specEntries[0].size = sizeof(uint32_t);
+  specEntries[1].constantID = 1;
+  specEntries[1].offset = offsetof(DdaSpec, enableNested);
+  specEntries[1].size = sizeof(uint32_t);
+  specEntries[2].constantID = 2;
+  specEntries[2].offset = offsetof(DdaSpec, enableShade);
+  specEntries[2].size = sizeof(uint32_t);
+
+  VkSpecializationInfo specInfo{};
+  specInfo.mapEntryCount = 3;
+  specInfo.pMapEntries = specEntries;
+  specInfo.dataSize = sizeof(DdaSpec);
+  specInfo.pData = &spec;
+
+  VkPipelineShaderStageCreateInfo stage{};
+  stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+  stage.module = shader;
+  stage.pName = "main";
+  if (useSpec) {
+    stage.pSpecializationInfo = &specInfo;
+  }
+
+  VkComputePipelineCreateInfo pipeInfo{};
+  pipeInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+  pipeInfo.stage = stage;
+  pipeInfo.layout = pipelineLayout_;
+
+  VkPipeline pipeline = VK_NULL_HANDLE;
+  if (vkCreateComputePipelines(gfx_.device(), VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &pipeline) !=
+      VK_SUCCESS) {
+    throw std::runtime_error("Failed to create voxel DDA compute pipeline");
+  }
+  return pipeline;
 }
 
 void VoxelRenderer::createPipelines() {
@@ -249,22 +318,32 @@ void VoxelRenderer::createPipelines() {
     throw std::runtime_error("Failed to create voxel DDA pipeline layout");
   }
 
-  VkPipelineShaderStageCreateInfo stage{};
-  stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-  stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-  stage.module = comp;
-  stage.pName = "main";
-
-  VkComputePipelineCreateInfo pipeInfo{};
-  pipeInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-  pipeInfo.stage = stage;
-  pipeInfo.layout = pipelineLayout_;
-  if (vkCreateComputePipelines(gfx_.device(), VK_NULL_HANDLE, 1, &pipeInfo, nullptr,
-                               &computePipeline_) != VK_SUCCESS) {
+  VkShaderModule coarseMod = VK_NULL_HANDLE;
+  VkShaderModule slimMod = VK_NULL_HANDLE;
+  try {
+    computePipeline_ = createComputePipeline(comp, DdaSpec{0u, 1u, 1u});
+    beamPipeline_ = createComputePipeline(comp, DdaSpec{1u, 0u, 0u});
+    coarseMod = gfx_.loadShaderModule(shaderDir + "/voxel_dda_coarse.comp.spv");
+    slimMod = gfx_.loadShaderModule(shaderDir + "/voxel_dda_slim.comp.spv");
+    coarsePipeline_ = createComputePipeline(coarseMod, DdaSpec{}, false);
+    slimPipeline_ = createComputePipeline(slimMod, DdaSpec{}, false);
+  } catch (...) {
+    if (slimMod) {
+      vkDestroyShaderModule(gfx_.device(), slimMod, nullptr);
+    }
+    if (coarseMod) {
+      vkDestroyShaderModule(gfx_.device(), coarseMod, nullptr);
+    }
     vkDestroyShaderModule(gfx_.device(), comp, nullptr);
-    throw std::runtime_error("Failed to create voxel DDA compute pipeline");
+    throw;
   }
 
+  if (slimMod) {
+    vkDestroyShaderModule(gfx_.device(), slimMod, nullptr);
+  }
+  if (coarseMod) {
+    vkDestroyShaderModule(gfx_.device(), coarseMod, nullptr);
+  }
   vkDestroyShaderModule(gfx_.device(), comp, nullptr);
 }
 
@@ -274,7 +353,8 @@ void VoxelRenderer::updateDescriptors(VoxelScene& scene) {
       scene.dummyBrickSlabBuffer().buffer == VK_NULL_HANDLE ||
       scene.objectBuffer().buffer == VK_NULL_HANDLE ||
       scene.paletteBuffer().buffer == VK_NULL_HANDLE ||
-      scene.occMipBuffer().buffer == VK_NULL_HANDLE || !scene.hasSky()) {
+      scene.occMipBuffer().buffer == VK_NULL_HANDLE || !scene.hasSky() ||
+      dummyBeamImage_.view == VK_NULL_HANDLE) {
     return;
   }
 
@@ -324,7 +404,12 @@ void VoxelRenderer::updateDescriptors(VoxelScene& scene) {
     occMipInfo.buffer = scene.occMipBuffer().buffer;
     occMipInfo.range = scene.occMipBuffer().size;
 
-    VkWriteDescriptorSet writes[8]{};
+    VkDescriptorImageInfo beamInfo{};
+    beamInfo.imageView =
+        beamImage_.view != VK_NULL_HANDLE ? beamImage_.view : dummyBeamImage_.view;
+    beamInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+    VkWriteDescriptorSet writes[9]{};
     writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[0].dstSet = frame.frameSet;
     writes[0].dstBinding = 0;
@@ -381,7 +466,14 @@ void VoxelRenderer::updateDescriptors(VoxelScene& scene) {
     writes[7].descriptorCount = 1;
     writes[7].pBufferInfo = &occMipInfo;
 
-    vkUpdateDescriptorSets(gfx_.device(), 8, writes, 0, nullptr);
+    writes[8].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[8].dstSet = frame.frameSet;
+    writes[8].dstBinding = 8;
+    writes[8].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    writes[8].descriptorCount = 1;
+    writes[8].pImageInfo = &beamInfo;
+
+    vkUpdateDescriptorSets(gfx_.device(), 9, writes, 0, nullptr);
   }
 
   boundGridSampler_ = scene.gridSampler();
@@ -399,6 +491,7 @@ void VoxelRenderer::updateDescriptors(VoxelScene& scene) {
   boundPaletteBuffer_ = scene.paletteBuffer().buffer;
   boundOccMipBuffer_ = scene.occMipBuffer().buffer;
   boundSkyView_ = scene.sky().image.view;
+  boundBeamView_ = beamImage_.view != VK_NULL_HANDLE ? beamImage_.view : dummyBeamImage_.view;
 }
 
 void VoxelRenderer::updateFrameUBO(VoxelScene& scene, uint32_t frameIndex) {
@@ -425,8 +518,11 @@ void VoxelRenderer::updateFrameUBO(VoxelScene& scene, uint32_t frameIndex) {
   ubo.useSky = (scene.showSky() && scene.hasSky()) ? 1u : 0u;
   ubo.objectCount = scene.objectCount();
   ubo.solidColor = scene.solidColorOutput() ? 1u : 0u;
-  ubo.occMipPyramid = occMipPyramid_ ? 1u : 0u;
-  ubo.padVec4[0] = ubo.padVec4[1] = ubo.padVec4[2] = ubo.padVec4[3] = 0;
+  ubo.padOccMip = 0;
+  ubo.brickBitSkip = brickBitSkip_ ? 1u : 0u;
+  ubo.beamSkip = beamSkip_ ? 1u : 0u;
+  ubo.beamMargin = std::max(0.0f, beamMargin_);
+  ubo.padOccSkip = 0;
   writeVec3(ubo.solidRgb, scene.solidColor());
   ubo.padSolidEnd = 0.0f;
 
@@ -462,7 +558,9 @@ void VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
       scene.objectBuffer().buffer != boundObjectBuffer_ ||
       scene.paletteBuffer().buffer != boundPaletteBuffer_ ||
       scene.occMipBuffer().buffer != boundOccMipBuffer_ ||
-      scene.sky().image.view != boundSkyView_ || outImage_.view == VK_NULL_HANDLE) {
+      scene.sky().image.view != boundSkyView_ || outImage_.view == VK_NULL_HANDLE ||
+      (beamImage_.view != VK_NULL_HANDLE ? beamImage_.view : dummyBeamImage_.view) !=
+          boundBeamView_) {
     updateDescriptors(scene);
   }
 
@@ -494,10 +592,34 @@ void VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
                        VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT);
 
-  vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, computePipeline_);
   vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_, 0, 1,
                           &frameSet, 0, nullptr);
 
+  if (beamSkip_ && beamPipeline_ && beamImage_.image != VK_NULL_HANDLE) {
+    gfx_.transitionImage(frame.cmd, beamImage_.image, VK_IMAGE_LAYOUT_UNDEFINED,
+                         VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT);
+    vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, beamPipeline_);
+    const uint32_t beamX = (beamImage_.extent.width + 7u) / 8u;
+    const uint32_t beamY = (beamImage_.extent.height + 7u) / 8u;
+    vkCmdDispatch(frame.cmd, beamX, beamY, 1);
+    gfx_.transitionImage(frame.cmd, beamImage_.image, VK_IMAGE_LAYOUT_GENERAL,
+                         VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                         VK_ACCESS_2_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                         VK_ACCESS_2_SHADER_READ_BIT);
+  }
+
+  if (timestampPool_) {
+    writeTimestamp(frame.cmd, tsBase + kTsAfterBeam, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+  }
+
+  VkPipeline ddaPipe = computePipeline_;
+  if (traceStage_ >= kStageCoarse) {
+    ddaPipe = coarsePipeline_;
+  } else if (!scene.nestedMicroVoxels()) {
+    ddaPipe = (traceStage_ >= kStageNoShade) ? coarsePipeline_ : slimPipeline_;
+  }
+  vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ddaPipe);
   const uint32_t groupsX = (frame.extent.width + 7u) / 8u;
   const uint32_t groupsY = (frame.extent.height + 7u) / 8u;
   vkCmdDispatch(frame.cmd, groupsX, groupsY, 1);
@@ -657,6 +779,10 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
   ImGui::Text("GPU total:   %.2f ms  (%.0f FPS)", gpuFrameMs_,
               gpuFrameMs_ > 1e-3f ? 1000.0f / gpuFrameMs_ : 0.0f);
   ImGui::Text("  compute:   %.2f ms", gpuComputeMs_);
+  if (beamSkip_) {
+    ImGui::Text("    beam 8x8: %.2f ms", gpuBeamMs_);
+    ImGui::Text("    full DDA: %.2f ms", gpuMainMs_);
+  }
   ImGui::Text("  blit:      %.2f ms", gpuBlitMs_);
   ImGui::Text("  ui/other:  %.2f ms", gpuUiMs_);
   const char* stages[] = {
@@ -668,6 +794,26 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
       "Skip DDA (sky store)",
   };
   ImGui::Combo("Cost Ladder", &traceStage_, stages, IM_ARRAYSIZE(stages));
+  const char* modes[] = {"Shaded", "Albedo", "Normal", "Steps", "Coord", "AO"};
+  ImGui::Combo("Render Mode", &scene.renderMode(), modes, IM_ARRAYSIZE(modes));
+  ImGui::TextDisabled("Steps is here, not in Cost Ladder: dark = few DDA steps, yellow = hit Max Steps.");
+  if (traceStage_ >= kStageInterval) {
+    ImGui::TextDisabled("Ray gen / Skip DDA never walk the grid, so Steps stays sky.");
+  }
+  {
+    const bool tinyCoarse = traceStage_ >= kStageCoarse;
+    const bool tinySlim = !tinyCoarse && !scene.nestedMicroVoxels();
+    if (tinyCoarse) {
+      ImGui::TextUnformatted("DDA kernel: COARSE  (~38 KB, no brick in SPIR-V)");
+    } else if (tinySlim) {
+      ImGui::TextUnformatted("DDA kernel: SLIM    (~22 KB, no brick, shade on)");
+    } else {
+      ImGui::TextUnformatted("DDA kernel: FULL    (~188 KB nested mega-shader)");
+      ImGui::TextDisabled("Still Full because Nested 8^3 is ON and Cost Ladder is above Coarse.");
+    }
+    ImGui::Checkbox("Nested 8^3 (micro bricks)", &scene.nestedMicroVoxels());
+    ImGui::TextDisabled("Off -> slim kernel. Cost Ladder \"Coarse DDA only\" -> coarse kernel.");
+  }
   ImGui::TextDisabled("Compare GPU compute ms at the same camera. Display FPS can lie.");
   ImGui::TextDisabled("Walk the ladder: the step that jumps compute ms is the bottleneck.");
   if (gfx_.vsyncEnabled()) {
@@ -677,20 +823,32 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
   ImGui::Text("Occupied coarse: %u / %u", scene.occupiedCount(), scene.voxelCount());
   ImGui::Text("Brick pages: %u  slabs: %u  pool: %.1f KB", scene.allocatedBrickPages(),
               scene.brickSlabCount(), static_cast<float>(scene.brickPoolBytes()) / 1024.0f);
-  ImGui::Text("Occupancy mip (4^3+8^3+16^3): %.2f KB",
-              static_cast<float>(scene.occMipBytes()) / 1024.0f);
-  ImGui::Checkbox("Occupancy pyramid skip (8^3 / 16^3)", &occMipPyramid_);
-  ImGui::TextDisabled("Off = 4^3 occMip only (old skip). On = also jump empty 8^3 and 16^3.");
+  ImGui::Checkbox("Brick 4^3 / 2^3 bit skip", &brickBitSkip_);
+  ImGui::TextDisabled("Off = 1-cell DDA inside 8^3 (GDVoxelPlayground). On = jump empty octants.");
+  ImGui::Checkbox("Beam depth prepass (8x8)", &beamSkip_);
+  ImGui::BeginDisabled(!beamSkip_);
+  ImGui::SliderFloat("Beam margin (m)", &beamMargin_, 0.0f, 16.0f, "%.2f");
+  ImGui::EndDisabled();
+  ImGui::TextDisabled("1/8 occupancy DDA; full rays start at min(4 corners+centre) - margin.");
+  ImGui::TextDisabled("Off = every pixel walks from the camera (old path).");
+  ImGui::Checkbox("Collapse full bricks to INVALID", &scene.collapseFullBricks());
+  ImGui::TextDisabled("Off = keep a page even when 8^3 x 2^3 is solid. Toggle applies on next edit.");
   ImGui::Text("Occupied 8^3 micros: %u   2^3 fines: %u", scene.occupiedMicroCount(),
               scene.occupiedFineCount());
   ImGui::Separator();
   ImGui::TextWrapped("LMB: remove hit object  |  F: place on hit face  |  RMB drag: look");
   ImGui::SliderInt("Brush Material", &scene.brushMaterial(), 1, 2);
-  ImGui::Checkbox("Edit/Render Nested 8^3 + 2^3", &scene.nestedMicroVoxels());
-  if (scene.nestedMicroVoxels()) {
+  ImGui::Checkbox("Nested 8^3 (micro bricks)", &scene.nestedMicroVoxels());
+  ImGui::BeginDisabled(!scene.nestedMicroVoxels());
+  ImGui::Checkbox("Nested 2^3 (fine voxels)", &scene.nestedFineVoxels());
+  ImGui::EndDisabled();
+  if (scene.nestedMicroVoxels() && scene.nestedFineVoxels()) {
     ImGui::SliderFloat("Brush Radius", &scene.brushRadius(), 0.0f, 8.0f, "%.1f fine voxels");
     ImGui::TextDisabled("coarse -> 8^3 brick -> 2x2x2. Spinner is a 2x2x2 checker.");
     ImGui::TextDisabled("r=0 edits one fine cell (1/16 of a coarse voxel).");
+  } else if (scene.nestedMicroVoxels()) {
+    ImGui::SliderFloat("Brush Radius", &scene.brushRadius(), 0.0f, 8.0f, "%.1f micro voxels");
+    ImGui::TextDisabled("Render/edit 8^3 bricks; 2x2x2 fines are ignored (virtual full micro).");
   } else {
     ImGui::SliderFloat("Brush Radius", &scene.brushRadius(), 0.0f, 8.0f, "%.1f coarse voxels");
     ImGui::TextDisabled("Editing whole coarse cells (each owns an 8^3 brick)");
@@ -724,6 +882,8 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
   ImGui::SliderInt("Import Grid N", &scene.importGridN(), 8, 64);
   ImGui::SliderInt("Import Padding", &scene.importPadding(), 0, 4);
   ImGui::Checkbox("Sample Mesh Color", &scene.importSampleColor());
+  ImGui::TextDisabled(
+      "Sample Color paints each import voxel from the mesh atlas (same 2^3 fine size).");
   if (ImGui::Button("Import Surface OBJ")) {
     MeshVoxelizeConfig cfg;
     cfg.gridN = scene.importGridN();
@@ -746,8 +906,6 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
   ImGui::TextWrapped("%s", scene.importStatus().c_str());
   ImGui::Separator();
 
-  const char* modes[] = {"Shaded", "Albedo", "Normal", "Steps", "Coord", "AO"};
-  ImGui::Combo("Render Mode", &scene.renderMode(), modes, IM_ARRAYSIZE(modes));
   ImGui::Checkbox("Solid Color", &scene.solidColorOutput());
   if (scene.solidColorOutput()) {
     ImGui::ColorEdit3("Voxel Color", &scene.solidColor().x);
