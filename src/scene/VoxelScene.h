@@ -36,10 +36,10 @@ struct GpuVoxelObject {
   float voxelSize;
   float _pad0[3];
   uint32_t gridSize[3];
-  uint32_t flags;  // bit0 nestedMicro, bit1 enabled, bit2 importPalette, bit3 nestedFine
+  uint32_t flags;  // bit0 nestedMicro, bit1 enabled, bit2 import color, bit3 nestedFine
   uint32_t voxelOffset;  // grids[] texture index (0 = world, 1 = spinner)
-  uint32_t occMipOffset;  // occupancy pyramid in uints: 4^3, then 8^3, then 16^3
-  uint32_t occMipWords;   // total words of the three levels
+  uint32_t occMipOffset;  // 4^3 coarse tiles: two uints (64 Morton bits) each
+  uint32_t occMipWords;   // tile count * 2
   uint32_t _pad1;
 };
 static_assert(sizeof(GpuVoxelObject) == 176, "GpuVoxelObject std430 size mismatch");
@@ -86,8 +86,9 @@ public:
   static constexpr int kFineTableBytes = kMicroCount;  // one uint8 per 8^3 micro
   static constexpr int kFineWordsPerTable = kFineTableBytes / 4;
   static constexpr int kFinePerBrick = kFinePerCoarse * kFinePerCoarse * kFinePerCoarse;  // 4096
-  static constexpr int kFineColorWords = kFinePerBrick;  // one uint 0xAARRGGBB per fine
+  // Occupancy then one 0xAARRGGBB per fine. Alpha != 0 means this fine has a sampled color.
   static constexpr int kFineColorOffset = kMicroWords + kFineWordsPerTable;
+  static constexpr int kFineColorWords = kFinePerBrick;
   static constexpr int kBrickPageWords = kFineColorOffset + kFineColorWords;
   static constexpr uint32_t kInvalidBrickPage = 0xFFFFFFFFu;
   static constexpr uint32_t kPagesPerSlab = 2048u;
@@ -205,6 +206,7 @@ private:
   uint32_t stampMeshIntoWorld(const MeshVoxelizeResult& r, bool sampleColor);
   void uploadWorldAndObjects(GfxDevice& gfx);
   void packObjectPool();
+  void fillCoarseDirTiles();
   void fillGpuObjectRecords();
   void uploadOccMip(GfxDevice& gfx);
   void uploadPalette(GfxDevice& gfx);
@@ -256,9 +258,9 @@ private:
   std::string importPath_;
   std::string lastImportedPath_;
   std::string importStatus_{"No import"};
-  int importGridN_ = 48;
+  int importGridN_ = 64;
   int importPadding_ = 1;
-  bool importSampleColor_ = true;
+  bool importSampleColor_ = false;
   bool importConservative_ = true;
 
   std::vector<VoxelObject> objects_;
@@ -270,7 +272,7 @@ private:
   uint32_t nextPage_ = 0;
   uint32_t allocatedPageCount_ = 0;
 
-  int gridSize_ = 48;
+  int gridSize_ = 64;
   float voxelSize_ = 0.35f;
   glm::vec3 lightDir_{0.35f, -1.0f, 0.25f};
   float ambient_ = 0.18f;

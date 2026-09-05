@@ -1,4 +1,7 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "dir_mask_lut.glsl"
 
 // Standalone coarse-grid DDA. No brick/fine/AO functions in this module.
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
@@ -23,11 +26,11 @@ layout(set = 0, binding = 0, std140) uniform VoxelDdaUBO {
     uint useSky;
     uint objectCount;
     uint solidColor;
-    uint _padOccMip;
+    uint dirMaskCoarse;
     uint brickBitSkip;
     uint beamSkip;
     float beamMargin;
-    uint _padOccSkip;
+    uint dirMaskBrick;
     vec3 solidRgb;
     float _padSolidEnd;
 } ubo;
@@ -57,6 +60,10 @@ layout(set = 0, binding = 5, std430) readonly buffer ObjectBuffer {
 
 layout(set = 0, binding = 6, std430) readonly buffer ImportPalette {
     vec4 importPalette[256];
+};
+
+layout(set = 0, binding = 7, std430) readonly buffer OccupancyMip {
+    uint occTiles[];
 };
 
 const uint FLAG_ENABLED = 2u;
@@ -97,6 +104,86 @@ bvec3 stepMask(vec3 sideDist) {
     return lessThanEqual(sideDist.xyz, min(sideDist.yzx, sideDist.zxy));
 }
 
+uint dirOctantFromSgn(vec3 sgn) {
+    return (sgn.x < 0.0 ? 1u : 0u) | (sgn.y < 0.0 ? 2u : 0u) | (sgn.z < 0.0 ? 4u : 0u);
+}
+
+uint morton4Local(ivec3 p) {
+    uint x = uint(p.x & 3);
+    uint y = uint(p.y & 3);
+    uint z = uint(p.z & 3);
+    uint m = 0u;
+    m |= (x & 1u) << 0;
+    m |= (y & 1u) << 1;
+    m |= (z & 1u) << 2;
+    m |= ((x >> 1) & 1u) << 3;
+    m |= ((y >> 1) & 1u) << 4;
+    m |= ((z >> 1) & 1u) << 5;
+    return m;
+}
+
+uvec2 loadCoarseOcc4(GpuVoxelObject o, ivec3 mapPos) {
+    if (o.occMipWords == 0u) {
+        return uvec2(0xFFFFFFFFu);
+    }
+    uint tileN = (o.gridSize.x + 3u) >> 2;
+    uvec3 t = uvec3(mapPos) >> 2;
+    uint tile = t.x + t.y * tileN + t.z * tileN * tileN;
+    uint base = o.occMipOffset + tile * 2u;
+    return uvec2(occTiles[base], occTiles[base + 1u]);
+}
+
+int coarseSkipShift(GpuVoxelObject o, ivec3 mapPos, uint oct) {
+    if (ubo.dirMaskCoarse == 0u) {
+        return -1;
+    }
+    uvec2 occ4 = loadCoarseOcc4(o, mapPos);
+    if ((occ4.x | occ4.y) == 0u) {
+        return 2;
+    }
+    uvec2 reach = kDirMaskLUT[oct * 64u + morton4Local(mapPos)];
+    if ((occ4.x & reach.x) == 0u && (occ4.y & reach.y) == 0u) {
+        return 2;
+    }
+    return -1;
+}
+
+bool jumpAlignedBox(inout ivec3 mapPos, inout vec3 sideDist, inout bvec3 mask, vec3 origin,
+                    vec3 rd, vec3 invDir, vec3 sgn, vec3 deltaDist, ivec3 rayStep, int shift,
+                    vec3 limit, inout uint steps) {
+    ivec3 macro = mapPos >> shift;
+    vec3 boxMin = vec3(macro << shift);
+    vec3 boxMax = min(boxMin + vec3(float(1 << shift)), limit);
+    vec3 t0m = (boxMin - origin) * invDir;
+    vec3 t1m = (boxMax - origin) * invDir;
+    vec3 tLargerM = max(t0m, t1m);
+    float tExitM = min(min(tLargerM.x, tLargerM.y), tLargerM.z);
+    bvec3 skipMask;
+    if (tLargerM.x <= tLargerM.y && tLargerM.x <= tLargerM.z) {
+        skipMask = bvec3(true, false, false);
+    } else if (tLargerM.y <= tLargerM.z) {
+        skipMask = bvec3(false, true, false);
+    } else {
+        skipMask = bvec3(false, false, true);
+    }
+    vec3 newPos = origin + rd * (tExitM + 1e-4);
+    ivec3 newMap = ivec3(clamp(floor(newPos), vec3(0.0), max(limit - vec3(1.0), vec3(0.0))));
+    steps += 1u;
+    if (newMap == mapPos || (newMap >> shift) == macro) {
+        mask = stepMask(sideDist);
+        sideDist += vec3(mask) * deltaDist;
+        mapPos += ivec3(vec3(mask)) * rayStep;
+        return true;
+    }
+    if (any(lessThan(newMap, ivec3(0))) || any(greaterThanEqual(newMap, ivec3(limit)))) {
+        return false;
+    }
+    mapPos = newMap;
+    mask = skipMask;
+    sideDist = (sgn * (vec3(mapPos) - origin) + (sgn * 0.5 + 0.5)) * deltaDist;
+    return true;
+}
+
 struct Hit {
     bool hit;
     float tWorld;
@@ -129,6 +216,7 @@ Hit traceCoarse(GpuVoxelObject o, vec3 Ow, vec3 Dw) {
     if (sgn.x == 0.0) sgn.x = 1.0;
     if (sgn.y == 0.0) sgn.y = 1.0;
     if (sgn.z == 0.0) sgn.z = 1.0;
+    uint oct = dirOctantFromSgn(sgn);
 
     vec3 boundsMax = vec3(o.gridSize);
     vec3 t0 = (vec3(0.0) - ro) * invDir;
@@ -157,11 +245,7 @@ Hit traceCoarse(GpuVoxelObject o, vec3 Ow, vec3 Dw) {
         result.tWorld = max(dot(hitWorld - Ow, Dw), 0.0);
         result.normal = normalize(mat3(o.objectToWorld) * (-vec3(mask) * sgn));
         result.steps = 1u;
-        if ((o.flags & FLAG_IMPORT_PALETTE) != 0u && matId >= 2u && matId < 256u) {
-            result.color = importPalette[matId].rgb;
-        } else {
-            result.color = vec3(0.62, 0.64, 0.68);
-        }
+        result.color = vec3(0.62, 0.64, 0.68);
         return result;
     }
 
@@ -184,12 +268,17 @@ Hit traceCoarse(GpuVoxelObject o, vec3 Ow, vec3 Dw) {
             result.tWorld = dot(hitWorld - Ow, Dw);
             result.normal = normalize(mat3(o.objectToWorld) * (-vec3(mask) * sgn));
             result.steps = steps;
-            if ((o.flags & FLAG_IMPORT_PALETTE) != 0u && matId >= 2u && matId < 256u) {
-                result.color = importPalette[matId].rgb;
-            } else {
-                result.color = vec3(0.62, 0.64, 0.68);
-            }
+            result.color = vec3(0.62, 0.64, 0.68);
             return result;
+        }
+
+        int skipShift = coarseSkipShift(o, mapPos, oct);
+        if (skipShift >= 0) {
+            if (!jumpAlignedBox(mapPos, sideDist, mask, ro, rd, invDir, sgn, deltaDist, rayStep,
+                                skipShift, boundsMax, steps)) {
+                break;
+            }
+            continue;
         }
 
         mask = stepMask(sideDist);

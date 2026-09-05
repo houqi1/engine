@@ -18,7 +18,6 @@
 #include <cstring>
 #include <filesystem>
 #include <stdexcept>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -99,79 +98,15 @@ std::filesystem::path findSiblingAlbedo(const std::filesystem::path& objPath) {
   return images.empty() ? std::filesystem::path{} : images.front();
 }
 
-float colorDist2(const glm::vec3& a, const glm::vec3& b) {
-  const glm::vec3 d = a - b;
-  return glm::dot(d, d);
-}
-
-void quantizePalette(const std::vector<uint32_t>& occ, const std::vector<glm::vec3>& rgb,
-                     uint32_t fallback, bool sampleColor, MeshVoxelizeResult& out) {
-  const size_t count = occ.size();
-  out.material.assign(count, 0u);
-  out.palette.fill(glm::vec3(0.62f, 0.64f, 0.68f));
-  out.palette[0] = glm::vec3(0.0f);
-  out.paletteUsed = 1;
+void fillOccupiedMaterials(const std::vector<uint32_t>& occ, uint32_t fallback,
+                           MeshVoxelizeResult& out) {
+  out.material.assign(occ.size(), 0u);
   out.occupied = 0;
-
-  if (!sampleColor) {
-    for (size_t i = 0; i < count; ++i) {
-      if (occ[i] != 0u) {
-        out.material[i] = fallback;
-        ++out.occupied;
-      }
+  for (size_t i = 0; i < occ.size(); ++i) {
+    if (occ[i] != 0u) {
+      out.material[i] = fallback;
+      ++out.occupied;
     }
-    out.palette[fallback] = glm::vec3(0.62f, 0.64f, 0.68f);
-    out.paletteUsed = std::max(out.paletteUsed, fallback);
-    return;
-  }
-
-  std::vector<glm::vec3> colors;
-  colors.reserve(256);
-  colors.emplace_back(0.0f);
-  std::unordered_map<uint32_t, uint32_t> exact;
-  exact.reserve(256);
-
-  auto addOrNearest = [&](const glm::vec3& sample) -> uint32_t {
-    const uint32_t key = (static_cast<uint32_t>(sample.r * 255.0f + 0.5f) << 16) |
-                         (static_cast<uint32_t>(sample.g * 255.0f + 0.5f) << 8) |
-                         static_cast<uint32_t>(sample.b * 255.0f + 0.5f);
-    const auto it = exact.find(key);
-    if (it != exact.end()) {
-      return it->second;
-    }
-    if (colors.size() < 256) {
-      const uint32_t idx = static_cast<uint32_t>(colors.size());
-      colors.push_back(sample);
-      exact[key] = idx;
-      return idx;
-    }
-    uint32_t best = 1;
-    float bestD = colorDist2(sample, colors[1]);
-    for (uint32_t i = 2; i < colors.size(); ++i) {
-      const float d = colorDist2(sample, colors[i]);
-      if (d < bestD) {
-        bestD = d;
-        best = i;
-      }
-    }
-    return best;
-  };
-
-  for (size_t i = 0; i < count; ++i) {
-    if (occ[i] == 0u) {
-      continue;
-    }
-    ++out.occupied;
-    glm::vec3 sample = glm::vec3(0.62f, 0.64f, 0.68f);
-    if (i < rgb.size()) {
-      sample = rgb[i];
-    }
-    out.material[i] = addOrNearest(sample);
-  }
-
-  out.paletteUsed = static_cast<uint32_t>(colors.size());
-  for (size_t i = 0; i < colors.size(); ++i) {
-    out.palette[i] = colors[i];
   }
 }
 
@@ -612,14 +547,17 @@ MeshVoxelizeResult MeshVoxelizerGpu::voxelizeObjSurface(GfxDevice& gfx, const st
     }
   }
 
-  std::vector<glm::vec3> coarseRgb(cellCount, glm::vec3(0.62f, 0.64f, 0.68f));
+  constexpr uint32_t kGray888 = (158u << 16) | (163u << 8) | 173u;  // 0.62, 0.64, 0.68
+  out.coarseRgb.assign(cellCount, kGray888);
   if (cfg.sampleColor && !recs.empty()) {
     std::sort(recs.begin(), recs.end(),
               [](const std::pair<uint32_t, uint32_t>& a, const std::pair<uint32_t, uint32_t>& b) {
                 return a.first < b.first;
               });
-    std::vector<glm::vec3> coarseSum(cellCount, glm::vec3(0.0f));
-    std::vector<uint32_t> coarseN(cellCount, 0u);
+    std::vector<uint64_t> coarseR(cellCount, 0);
+    std::vector<uint64_t> coarseG(cellCount, 0);
+    std::vector<uint64_t> coarseB(cellCount, 0);
+    std::vector<uint64_t> coarseN(cellCount, 0);
     out.fineId.reserve(recs.size());
     out.fineRgb.reserve(recs.size());
     for (size_t i = 0; i < recs.size();) {
@@ -649,19 +587,23 @@ MeshVoxelizeResult MeshVoxelizerGpu::voxelizeObjSurface(GfxDevice& gfx, const st
       const uint32_t z = fi / (uFineN * uFineN);
       const uint32_t cidx = (x / uSub) + (y / uSub) * uN + (z / uSub) * uN * uN;
       if (cidx < cellCount) {
-        coarseSum[cidx] += glm::vec3(static_cast<float>(r8), static_cast<float>(g8),
-                                     static_cast<float>(b8)) /
-                            255.0f;
+        coarseR[cidx] += r8;
+        coarseG[cidx] += g8;
+        coarseB[cidx] += b8;
         ++coarseN[cidx];
       }
     }
     for (uint32_t i = 0; i < cellCount; ++i) {
       if (coarseN[i] > 0u) {
-        coarseRgb[i] = coarseSum[i] / static_cast<float>(coarseN[i]);
+        const uint32_t nC = static_cast<uint32_t>(coarseN[i]);
+        const uint32_t r8 = static_cast<uint32_t>((coarseR[i] + nC / 2u) / nC);
+        const uint32_t g8 = static_cast<uint32_t>((coarseG[i] + nC / 2u) / nC);
+        const uint32_t b8 = static_cast<uint32_t>((coarseB[i] + nC / 2u) / nC);
+        out.coarseRgb[i] = (r8 << 16) | (g8 << 8) | b8;
       }
     }
   }
-  quantizePalette(occ, coarseRgb, cfg.fallbackMaterial, cfg.sampleColor, out);
+  fillOccupiedMaterials(occ, cfg.fallbackMaterial, out);
   out.ok = true;
   out.n = n;
   out.subdiv = subdiv;

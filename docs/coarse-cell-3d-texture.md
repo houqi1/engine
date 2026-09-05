@@ -2,11 +2,10 @@
 
 Living design note. **Do not implement Phase 2 until Phase 1 is accepted.**
 
-Status: **Phase 1 implemented; user measured no meaningful FPS change. Phase 2 not started.**
+Status: **Phase 2 implemented.** World logical grid is `64³` (`voxelSize` still 0.35 m). Spinner stays `8³`.
 
-- **Phase 1 (in tree):** world `gridSize = 48`, GPU coarse-cell reads are a sampled 3D texture (`R32G32_UINT`, no mips). Visual/edit path unchanged.
-- **Accept result:** overhead did not drop; still GPU-bound. Coarse-cell fetch layout is **not** the limiter at 48³ (~108 KiB fits in cache). Do **not** treat 3D textures as the next FPS project.
-- **Phase 2 (N=64): stopped.** Do not grow the grid to spend the padding until a real bottleneck is fixed.
+- **Phase 1:** GPU coarse-cell reads are a sampled 3D texture (`R32G32_UINT`, no mips).
+- **Phase 2:** `gridSize_ = 64`, `importGridN_ = 64`. AABB 16.8 m → 22.4 m. Payload ~256 KiB. `maxSteps_ = n * 3` (= 192).
 
 Related shipped code:
 
@@ -354,9 +353,9 @@ If far-outside does **not** improve, stop. Do not start Phase 2. Debug: confirm 
 
 ---
 
-## 9. Phase 2 execution (N=64) — gated
+## 9. Phase 2 execution (N=64) — implemented
 
-Only after §8 accept. This makes the **logical** grid 64 so VRAM is voxels, not pitch.
+Logical grid is 64 so VRAM is voxels, not pitch. `voxelSize` unchanged (AABB grows).
 
 ### What changes
 

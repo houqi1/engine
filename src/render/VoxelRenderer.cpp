@@ -518,11 +518,11 @@ void VoxelRenderer::updateFrameUBO(VoxelScene& scene, uint32_t frameIndex) {
   ubo.useSky = (scene.showSky() && scene.hasSky()) ? 1u : 0u;
   ubo.objectCount = scene.objectCount();
   ubo.solidColor = scene.solidColorOutput() ? 1u : 0u;
-  ubo.padOccMip = 0;
+  ubo.dirMaskCoarse = dirMaskCoarse_ ? 1u : 0u;
   ubo.brickBitSkip = brickBitSkip_ ? 1u : 0u;
   ubo.beamSkip = beamSkip_ ? 1u : 0u;
   ubo.beamMargin = std::max(0.0f, beamMargin_);
-  ubo.padOccSkip = 0;
+  ubo.dirMaskBrick = dirMaskBrick_ ? 1u : 0u;
   writeVec3(ubo.solidRgb, scene.solidColor());
   ubo.padSolidEnd = 0.0f;
 
@@ -825,6 +825,12 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
               scene.brickSlabCount(), static_cast<float>(scene.brickPoolBytes()) / 1024.0f);
   ImGui::Checkbox("Brick 4^3 / 2^3 bit skip", &brickBitSkip_);
   ImGui::TextDisabled("Off = 1-cell DDA inside 8^3 (GDVoxelPlayground). On = jump empty octants.");
+  ImGui::BeginDisabled(!brickBitSkip_);
+  ImGui::Checkbox("4^3 direction AND (brick)", &dirMaskBrick_);
+  ImGui::EndDisabled();
+  ImGui::Checkbox("4^3 direction AND (coarse)", &dirMaskCoarse_);
+  ImGui::TextDisabled("Same LUT at two scales. Off = occupancy-only (old path) for A/B.");
+  ImGui::TextDisabled("AND skips 4^3 tiles whose solids all lie behind this ray.");
   ImGui::Checkbox("Beam depth prepass (8x8)", &beamSkip_);
   ImGui::BeginDisabled(!beamSkip_);
   ImGui::SliderFloat("Beam margin (m)", &beamMargin_, 0.0f, 16.0f, "%.2f");
@@ -883,7 +889,7 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
   ImGui::SliderInt("Import Padding", &scene.importPadding(), 0, 4);
   ImGui::Checkbox("Sample Mesh Color", &scene.importSampleColor());
   ImGui::TextDisabled(
-      "Sample Color paints each import voxel from the mesh atlas (same 2^3 fine size).");
+      "Sample Color: each fine stores RGBA; alpha means this voxel has a sampled color.");
   if (ImGui::Button("Import Surface OBJ")) {
     MeshVoxelizeConfig cfg;
     cfg.gridN = scene.importGridN();

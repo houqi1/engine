@@ -162,8 +162,16 @@ foreach(SHADER ${VE_SHADER_SOURCES})
     # Debug symbols in this kernel bloat VGPR allocation; keep -O only.
     add_custom_command(
       OUTPUT ${SPV}
-      COMMAND ${GLSLC} -O ${SRC} -o ${SPV}
-      DEPENDS ${SRC}
+      COMMAND ${GLSLC} -O -I ${VE_SHADER_SOURCE_DIR} ${SRC} -o ${SPV}
+      DEPENDS ${SRC} ${VE_SHADER_SOURCE_DIR}/dir_mask_lut.glsl
+      COMMENT "Compiling shader ${SHADER}"
+      VERBATIM
+    )
+  elseif(SHADER STREQUAL "voxel_dda_coarse.comp")
+    add_custom_command(
+      OUTPUT ${SPV}
+      COMMAND ${GLSLC} -O -g -I ${VE_SHADER_SOURCE_DIR} ${SRC} -o ${SPV}
+      DEPENDS ${SRC} ${VE_SHADER_SOURCE_DIR}/dir_mask_lut.glsl
       COMMENT "Compiling shader ${SHADER}"
       VERBATIM
     )
@@ -182,8 +190,8 @@ endforeach()
 set(VE_SLIM_SPV ${VE_SHADER_OUTPUT_DIR}/voxel_dda_slim.comp.spv)
 add_custom_command(
   OUTPUT ${VE_SLIM_SPV}
-  COMMAND ${GLSLC} -O -DENABLE_SHADE=1 ${VE_SHADER_SOURCE_DIR}/voxel_dda_coarse.comp -o ${VE_SLIM_SPV}
-  DEPENDS ${VE_SHADER_SOURCE_DIR}/voxel_dda_coarse.comp
+  COMMAND ${GLSLC} -O -DENABLE_SHADE=1 -I ${VE_SHADER_SOURCE_DIR} ${VE_SHADER_SOURCE_DIR}/voxel_dda_coarse.comp -o ${VE_SLIM_SPV}
+  DEPENDS ${VE_SHADER_SOURCE_DIR}/voxel_dda_coarse.comp ${VE_SHADER_SOURCE_DIR}/dir_mask_lut.glsl
   COMMENT "Compiling shader voxel_dda_slim.comp"
   VERBATIM
 )

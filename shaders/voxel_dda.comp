@@ -1,4 +1,7 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "dir_mask_lut.glsl"
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
@@ -29,11 +32,11 @@ layout(set = 0, binding = 0, std140) uniform VoxelDdaUBO {
     uint useSky;
     uint objectCount;
     uint solidColor;
-    uint _padOccMip;     // was occMipPyramid (removed: negative win on dense floors)
+    uint dirMaskCoarse;  // 1 = 4^3 direction AND skip on coarse tiles
     uint brickBitSkip;   // 0 = 1-cell DDA in 8^3 (GDVoxelPlayground), 1 = 4^3/2^3 bit skip
     uint beamSkip;       // 0 = off, 1 = full rays start at beam t - margin
     float beamMargin;    // world meters; voxelG subtracts one coarse tile
-    uint _padOccSkip;
+    uint dirMaskBrick;   // 1 = 4^3 direction AND skip inside 8^3 octants
     vec3 solidRgb;
     float _padSolidEnd;
 } ubo;
@@ -62,7 +65,7 @@ struct GpuVoxelObject {
     float _pad1;
     float _pad2;
     uvec3 gridSize;
-    uint flags;  // bit0 nestedMicro, bit1 enabled, bit2 importPalette, bit3 nestedFine
+    uint flags;  // bit0 nestedMicro, bit1 enabled, bit2 import color, bit3 nestedFine
     uint voxelOffset;  // grids[] texture index (0 = world, 1 = spinner)
     uint occMipOffset;  // L0 4^3, then L1 8^3, then L2 16^3
     uint occMipWords;   // total words of the three levels
@@ -75,6 +78,10 @@ layout(set = 0, binding = 5, std430) readonly buffer ObjectBuffer {
 
 layout(set = 0, binding = 6, std430) readonly buffer ImportPalette {
     vec4 importPalette[256];
+};
+
+layout(set = 0, binding = 7, std430) readonly buffer OccupancyMip {
+    uint occTiles[];
 };
 
 layout(set = 0, binding = 8, r32f) uniform image2D beamDepth;
@@ -94,7 +101,7 @@ const uint STAGE_SKIP_DDA = 5u;
 const uint MICRO_WORDS = 16u;
 const uint FINE_WORDS = 128u;
 const uint FINE_COLOR_OFFSET = MICRO_WORDS + FINE_WORDS;
-const uint FINE_COLOR_WORDS = 4096u;  // one 0xAARRGGBB per fine
+const uint FINE_COLOR_WORDS = 4096u;  // one 0xAARRGGBB per fine; alpha = has color
 const uint BRICK_PAGE_WORDS = FINE_COLOR_OFFSET + FINE_COLOR_WORDS;
 const uint PAGES_PER_SLAB = 2048u;
 const uint INVALID_BRICK_PAGE = 0xFFFFFFFFu;
@@ -220,6 +227,35 @@ bool brickOctant4Occupied(uint page, ivec3 mapPos) {
     return (loadBrickWord(page, base) | loadBrickWord(page, base + 1u)) != 0u;
 }
 
+uvec2 loadBrickOcc4(uint page, ivec3 mapPos) {
+    uint oct = morton3Brick(mapPos >> 2);
+    uint base = oct * 2u;
+    return uvec2(loadBrickWord(page, base), loadBrickWord(page, base + 1u));
+}
+
+uint dirOctantFromSgn(vec3 sgn) {
+    return (sgn.x < 0.0 ? 1u : 0u) | (sgn.y < 0.0 ? 2u : 0u) | (sgn.z < 0.0 ? 4u : 0u);
+}
+
+uvec2 dirReach4(uint oct, ivec3 p) {
+    return kDirMaskLUT[oct * 64u + morton3Brick(p & ivec3(3))];
+}
+
+bool dirAndEmpty(uvec2 occ, uvec2 reach) {
+    return (occ.x & reach.x) == 0u && (occ.y & reach.y) == 0u;
+}
+
+uvec2 loadCoarseOcc4(GpuVoxelObject o, ivec3 mapPos) {
+    if (o.occMipWords == 0u) {
+        return uvec2(0xFFFFFFFFu);
+    }
+    uint tileN = (o.gridSize.x + 3u) >> 2;
+    uvec3 t = uvec3(mapPos) >> 2;
+    uint tile = t.x + t.y * tileN + t.z * tileN * tileN;
+    uint base = o.occMipOffset + tile * 2u;
+    return uvec2(occTiles[base], occTiles[base + 1u]);
+}
+
 bool brickOctant2Occupied(uint page, ivec3 mapPos) {
     uint m2 = morton3Brick(mapPos >> 1);  // 0..63
     uint bit = m2 << 3;
@@ -228,17 +264,76 @@ bool brickOctant2Occupied(uint page, ivec3 mapPos) {
 }
 
 // 2 = empty 4^3, 1 = empty 2^3, -1 = DDA one micro (occupied or mixed 2^3).
-int brickSkipShift(uint page, ivec3 mapPos) {
+int brickSkipShift(uint page, ivec3 mapPos, uint oct) {
     if (getMicroVoxel(page, mapPos)) {
         return -1;
     }
-    if (!brickOctant4Occupied(page, mapPos)) {
+    uvec2 occ4 = loadBrickOcc4(page, mapPos);
+    if ((occ4.x | occ4.y) == 0u) {
+        return 2;
+    }
+    if (ubo.dirMaskBrick != 0u && dirAndEmpty(occ4, dirReach4(oct, mapPos))) {
         return 2;
     }
     if (!brickOctant2Occupied(page, mapPos)) {
         return 1;
     }
     return -1;
+}
+
+int coarseSkipShift(GpuVoxelObject o, ivec3 mapPos, uint oct) {
+    if (ubo.dirMaskCoarse == 0u) {
+        return -1;
+    }
+    uvec2 occ4 = loadCoarseOcc4(o, mapPos);
+    if ((occ4.x | occ4.y) == 0u) {
+        return 2;
+    }
+    if (dirAndEmpty(occ4, dirReach4(oct, mapPos))) {
+        return 2;
+    }
+    return -1;
+}
+
+bvec3 stepMask(vec3 sideDist) {
+    return lessThanEqual(sideDist.xyz, min(sideDist.yzx, sideDist.zxy));
+}
+
+// Jump out of an aligned 2^shift box. Returns false if the jump leaves `limit`.
+bool jumpAlignedBox(inout ivec3 mapPos, inout vec3 sideDist, inout bvec3 mask, vec3 origin,
+                    vec3 rd, vec3 invDir, vec3 sgn, vec3 deltaDist, ivec3 rayStep, int shift,
+                    vec3 limit, inout uint steps) {
+    ivec3 macro = mapPos >> shift;
+    vec3 boxMin = vec3(macro << shift);
+    vec3 boxMax = min(boxMin + vec3(float(1 << shift)), limit);
+    vec3 t0m = (boxMin - origin) * invDir;
+    vec3 t1m = (boxMax - origin) * invDir;
+    vec3 tLargerM = max(t0m, t1m);
+    float tExitM = min(min(tLargerM.x, tLargerM.y), tLargerM.z);
+    bvec3 skipMask;
+    if (tLargerM.x <= tLargerM.y && tLargerM.x <= tLargerM.z) {
+        skipMask = bvec3(true, false, false);
+    } else if (tLargerM.y <= tLargerM.z) {
+        skipMask = bvec3(false, true, false);
+    } else {
+        skipMask = bvec3(false, false, true);
+    }
+    vec3 newPos = origin + rd * (tExitM + 1e-4);
+    ivec3 newMap = ivec3(clamp(floor(newPos), vec3(0.0), max(limit - vec3(1.0), vec3(0.0))));
+    steps += 1u;
+    if (newMap == mapPos || (newMap >> shift) == macro) {
+        mask = stepMask(sideDist);
+        sideDist += vec3(mask) * deltaDist;
+        mapPos += ivec3(vec3(mask)) * rayStep;
+        return true;
+    }
+    if (any(lessThan(newMap, ivec3(0))) || any(greaterThanEqual(newMap, ivec3(limit)))) {
+        return false;
+    }
+    mapPos = newMap;
+    mask = skipMask;
+    sideDist = (sgn * (vec3(mapPos) - origin) + (sgn * 0.5 + 0.5)) * deltaDist;
+    return true;
 }
 
 bool solidCoarse(GpuVoxelObject o, ivec3 p) {
@@ -291,15 +386,16 @@ uint readFinePackedRgb(uint page, ivec3 micro, ivec3 fine) {
 }
 
 vec3 unpackRgb888(uint p) {
-    return vec3(float((p >> 16) & 255u), float((p >> 8) & 255u), float(p & 255u)) / 255.0;
+    return vec3(float((p >> 16u) & 255u), float((p >> 8u) & 255u), float(p & 255u)) / 255.0;
 }
 
 vec3 albedoForVoxel(GpuVoxelObject o, uint matId, uint page, ivec3 micro, ivec3 fine,
                     bool usedMicro, bool usedFine) {
+    // Occupancy is solid. Alpha != 0 means this fine has a sampled color.
     if ((o.flags & FLAG_IMPORT_PALETTE) != 0u && page != INVALID_BRICK_PAGE) {
         if (usedFine) {
             uint packed = readFinePackedRgb(page, micro, fine);
-            if ((packed >> 24) != 0u) {
+            if ((packed >> 24u) != 0u) {
                 return unpackRgb888(packed);
             }
         } else if (usedMicro) {
@@ -307,16 +403,12 @@ vec3 albedoForVoxel(GpuVoxelObject o, uint matId, uint page, ivec3 micro, ivec3 
                 ivec3 f = ivec3(i & 1, (i >> 2) & 1, (i >> 1) & 1);
                 if (getFineVoxel(page, micro, f)) {
                     uint packed = readFinePackedRgb(page, micro, f);
-                    if ((packed >> 24) != 0u) {
+                    if ((packed >> 24u) != 0u) {
                         return unpackRgb888(packed);
                     }
                 }
             }
         }
-    }
-    // Slot 1 is ground/default gray. Nested-off / missing fine RGB falls back here.
-    if ((o.flags & FLAG_IMPORT_PALETTE) != 0u && matId >= 2u && matId < 256u) {
-        return importPalette[matId].rgb;
     }
     return vec3(0.62, 0.64, 0.68);
 }
@@ -324,10 +416,6 @@ vec3 albedoForVoxel(GpuVoxelObject o, uint matId, uint page, ivec3 micro, ivec3 
 vec3 stepsToColor(uint steps) {
     float t = clamp(float(steps) / float(max(ubo.maxSteps, 1u)), 0.0, 1.0);
     return mix(vec3(0.05, 0.10, 0.35), vec3(1.0, 0.55, 0.10), t);
-}
-
-bvec3 stepMask(vec3 sideDist) {
-    return lessThanEqual(sideDist.xyz, min(sideDist.yzx, sideDist.zxy));
 }
 
 float vertexAo(vec2 side, float corner) {
@@ -425,6 +513,7 @@ bool traceMicro(uint page, vec3 localPos, vec3 rd, vec3 sgn, bvec3 enterMask, bo
     vec3 t0b = (vec3(0.0) - localPos) * invDir;
     vec3 t1b = (vec3(8.0) - localPos) * invDir;
     float tExitBrick = min(min(max(t0b.x, t1b.x), max(t0b.y, t1b.y)), max(t0b.z, t1b.z));
+    uint oct = dirOctantFromSgn(sgn);
 
     for (int i = 0; i < 48; ++i) {
         if (any(lessThan(mapPos, ivec3(0))) || any(greaterThanEqual(mapPos, ivec3(8)))) {
@@ -457,7 +546,7 @@ bool traceMicro(uint page, vec3 localPos, vec3 rd, vec3 sgn, bvec3 enterMask, bo
             }
         }
 
-        int skipShift = (ubo.brickBitSkip != 0u) ? brickSkipShift(page, mapPos) : -1;
+        int skipShift = (ubo.brickBitSkip != 0u) ? brickSkipShift(page, mapPos, oct) : -1;
         if (skipShift >= 0) {
             ivec3 macro = mapPos >> skipShift;
             vec3 boxMin = vec3(macro << skipShift);
@@ -532,6 +621,7 @@ ObjectHit traverseObject(GpuVoxelObject o, vec3 Ow, vec3 Dw, float tWorldMin, fl
     if (sgn.x == 0.0) sgn.x = 1.0;
     if (sgn.y == 0.0) sgn.y = 1.0;
     if (sgn.z == 0.0) sgn.z = 1.0;
+    uint oct = dirOctantFromSgn(sgn);
 
     vec3 boundsMax = vec3(o.gridSize);
     vec3 t0 = (vec3(0.0) - ro) * invDir;
@@ -647,6 +737,17 @@ ObjectHit traverseObject(GpuVoxelObject o, vec3 Ow, vec3 Dw, float tWorldMin, fl
             }
         }
 
+        if (matId == 0u) {
+            int skipShift = coarseSkipShift(o, mapPos, oct);
+            if (skipShift >= 0) {
+                if (!jumpAlignedBox(mapPos, sideDist, mask, ro, rd, invDir, sgn, deltaDist, rayStep,
+                                    skipShift, boundsMax, steps)) {
+                    break;
+                }
+                continue;
+            }
+        }
+
         mask = stepMask(sideDist);
         sideDist += vec3(mask) * deltaDist;
         mapPos += ivec3(vec3(mask)) * rayStep;
@@ -731,6 +832,7 @@ float traceFirstOccupied(GpuVoxelObject o, vec3 Ow, vec3 Dw) {
     if (sgn.x == 0.0) sgn.x = 1.0;
     if (sgn.y == 0.0) sgn.y = 1.0;
     if (sgn.z == 0.0) sgn.z = 1.0;
+    uint oct = dirOctantFromSgn(sgn);
 
     vec3 boundsMax = vec3(o.gridSize);
     vec3 t0b = (vec3(0.0) - ro) * invDir;
@@ -749,6 +851,8 @@ float traceFirstOccupied(GpuVoxelObject o, vec3 Ow, vec3 Dw) {
     ivec3 rayStep = ivec3(sgn);
     vec3 deltaDist = abs(invDir);
     vec3 sideDist = (sgn * (vec3(mapPos) - pos) + (sgn * 0.5 + 0.5)) * deltaDist;
+    bvec3 mask = bvec3(false);
+    uint steps = 0u;
 
     for (uint i = 0u; i < ubo.maxSteps; ++i) {
         if (!insideGrid(o, mapPos)) {
@@ -766,7 +870,16 @@ float traceFirstOccupied(GpuVoxelObject o, vec3 Ow, vec3 Dw) {
             return max(dot(hitWorld - Ow, Dw), 0.0);
         }
 
-        bvec3 mask = stepMask(sideDist);
+        int skipShift = coarseSkipShift(o, mapPos, oct);
+        if (skipShift >= 0) {
+            if (!jumpAlignedBox(mapPos, sideDist, mask, ro, rd, invDir, sgn, deltaDist, rayStep,
+                                skipShift, boundsMax, steps)) {
+                break;
+            }
+            continue;
+        }
+
+        mask = stepMask(sideDist);
         sideDist += vec3(mask) * deltaDist;
         mapPos += ivec3(vec3(mask)) * rayStep;
     }

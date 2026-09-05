@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -95,12 +96,7 @@ void VoxelScene::init(GfxDevice& gfx) {
   const std::string pirateObj =
       std::string(VE_ASSETS_DIR) + "/meshes/pirate-building/Piratebuilding.obj";
   if (std::filesystem::exists(pirateObj)) {
-    MeshVoxelizeConfig cfg;
-    cfg.gridN = importGridN_;
-    cfg.padding = importPadding_;
-    cfg.sampleColor = true;
-    cfg.conservative = importConservative_;
-    importSurfaceMesh(gfx, pirateObj, cfg);
+    importPath_ = pirateObj;
   }
 }
 
@@ -625,8 +621,52 @@ uint32_t VoxelScene::voxelCount() const {
   return n;
 }
 
-void VoxelScene::packObjectPool() {
+void VoxelScene::fillCoarseDirTiles() {
   occMipCpu_.clear();
+  for (VoxelObject& o : objects_) {
+    o.occMipOffset = static_cast<uint32_t>(occMipCpu_.size());
+    const int n = o.gridSize;
+    const int tileN = (n + 3) / 4;
+    occMipCpu_.reserve(occMipCpu_.size() +
+                       static_cast<size_t>(tileN) * static_cast<size_t>(tileN) *
+                           static_cast<size_t>(tileN) * 2u);
+    for (int tz = 0; tz < tileN; ++tz) {
+      for (int ty = 0; ty < tileN; ++ty) {
+        for (int tx = 0; tx < tileN; ++tx) {
+          uint32_t lo = 0;
+          uint32_t hi = 0;
+          for (int lz = 0; lz < 4; ++lz) {
+            for (int ly = 0; ly < 4; ++ly) {
+              for (int lx = 0; lx < 4; ++lx) {
+                const int x = tx * 4 + lx;
+                const int y = ty * 4 + ly;
+                const int z = tz * 4 + lz;
+                if (x >= n || y >= n || z >= n) {
+                  continue;
+                }
+                const uint32_t idx = indexOf(o, glm::ivec3(x, y, z));
+                if (o.cells[idx].material == 0u) {
+                  continue;
+                }
+                const uint32_t bit = microBitIndex(glm::ivec3(lx, ly, lz));
+                if (bit < 32u) {
+                  lo |= 1u << bit;
+                } else {
+                  hi |= 1u << (bit - 32u);
+                }
+              }
+            }
+          }
+          occMipCpu_.push_back(lo);
+          occMipCpu_.push_back(hi);
+        }
+      }
+    }
+    o.occMipWords = static_cast<uint32_t>(occMipCpu_.size()) - o.occMipOffset;
+  }
+}
+
+void VoxelScene::packObjectPool() {
   occupiedCount_ = 0;
   for (size_t i = 0; i < objects_.size(); ++i) {
     VoxelObject& o = objects_[i];
@@ -636,9 +676,8 @@ void VoxelScene::packObjectPool() {
         ++occupiedCount_;
       }
     }
-    o.occMipOffset = 0;
-    o.occMipWords = 0;
   }
+  fillCoarseDirTiles();
   recountOccupiedMicro();
   recountOccupiedFine();
 }
@@ -831,9 +870,16 @@ void VoxelScene::flushObject(GfxDevice& gfx, int objectIndex) {
   if (objectIndex < 0 || objectIndex >= static_cast<int>(objects_.size())) {
     return;
   }
+  fillCoarseDirTiles();
+  fillGpuObjectRecords();
   ensureGpuBuffers(gfx);
   uploadGridImage(gfx, static_cast<uint32_t>(objectIndex));
   flushDirtyPages(gfx);
+  uploadOccMip(gfx);
+  if (!objectsGpu_.empty()) {
+    gfx.uploadToBuffer(objectBuffer_, objectsGpu_.data(),
+                       sizeof(GpuVoxelObject) * objectsGpu_.size());
+  }
 }
 
 void VoxelScene::uploadObjectTransforms(GfxDevice& gfx) {
@@ -991,33 +1037,8 @@ uint32_t VoxelScene::stampMeshIntoWorld(const MeshVoxelizeResult& r, bool sample
   }
   importPalette_.fill(glm::vec4(0.62f, 0.64f, 0.68f, 1.0f));
   importPalette_[0] = glm::vec4(0.0f, 0.0f, 0.0f, 1.0f);
-  // Slot 1 is reserved for ground / default gray. Mesh palette index i → GPU material i+1.
-  if (sampleColor) {
-    const uint32_t used = std::min(r.paletteUsed, 255u);
-    for (uint32_t i = 1; i < used; ++i) {
-      importPalette_[i + 1] = glm::vec4(r.palette[i], 1.0f);
-    }
-  }
 
-  auto coarseMatForFine = [&](int fx, int fy, int fz) -> uint32_t {
-    const int cx = fx / subdiv;
-    const int cy = fy / subdiv;
-    const int cz = fz / subdiv;
-    if (cx < 0 || cy < 0 || cz < 0 || cx >= r.n || cy >= r.n || cz >= r.n) {
-      return 1u;
-    }
-    const size_t src = static_cast<size_t>(cx) + static_cast<size_t>(cy) * static_cast<size_t>(r.n) +
-                       static_cast<size_t>(cz) * static_cast<size_t>(r.n) * static_cast<size_t>(r.n);
-    if (!sampleColor) {
-      return 1u;
-    }
-    if (src >= r.material.size() || r.material[src] == 0u) {
-      return 1u;
-    }
-    return std::min(255u, r.material[src] + 1u);
-  };
-
-  auto placeWorldFine = [&](int wx, int wy, int wz, uint32_t mat, bool hasRgb, uint32_t rgb888) {
+  auto placeWorldFine = [&](int wx, int wy, int wz, bool hasColor, uint32_t rgb888) {
     if (wx < 0 || wy < 0 || wz < 0 || wx >= worldFineN || wy >= worldFineN || wz >= worldFineN) {
       return false;
     }
@@ -1027,8 +1048,8 @@ uint32_t VoxelScene::stampMeshIntoWorld(const MeshVoxelizeResult& r, bool sample
     const glm::ivec3 rem = absFine - c * kFinePerCoarse;
     const glm::ivec3 m(rem.x / kFineRes, rem.y / kFineRes, rem.z / kFineRes);
     const glm::ivec3 f = rem - m * kFineRes;
-    ensureCoarseBrick(world, c, mat);
-    return setFineCpu(world, c, m, f, true, hasRgb, rgb888);
+    ensureCoarseBrick(world, c, 1u);
+    return setFineCpu(world, c, m, f, true, hasColor, rgb888);
   };
 
   uint32_t stamped = 0;
@@ -1053,22 +1074,27 @@ uint32_t VoxelScene::stampMeshIntoWorld(const MeshVoxelizeResult& r, bool sample
       const int fx = static_cast<int>(fi % uFineN);
       const int fy = static_cast<int>((fi / uFineN) % uFineN);
       const int fz = static_cast<int>(fi / (uFineN * uFineN));
-      const uint32_t mat = coarseMatForFine(fx, fy, fz);
-      bool hasRgb = false;
+      bool hasColor = false;
       uint32_t rgb888 = 0;
       if (sampleColor) {
+        hasColor = true;
+        const int cx = fx / subdiv;
+        const int cy = fy / subdiv;
+        const int cz = fz / subdiv;
+        if (cx >= 0 && cy >= 0 && cz >= 0 && cx < r.n && cy < r.n && cz < r.n) {
+          const size_t cidx = static_cast<size_t>(cx) +
+                              static_cast<size_t>(cy) * static_cast<size_t>(r.n) +
+                              static_cast<size_t>(cz) * static_cast<size_t>(r.n) *
+                                  static_cast<size_t>(r.n);
+          if (cidx < r.coarseRgb.size()) {
+            rgb888 = r.coarseRgb[cidx];
+          }
+        }
         while (colorCursor < colorCount && r.fineId[colorCursor] < fi) {
           ++colorCursor;
         }
         if (colorCursor < colorCount && r.fineId[colorCursor] == fi) {
           rgb888 = r.fineRgb[colorCursor];
-          hasRgb = true;
-        } else {
-          const glm::vec3 p = importPalette_[mat];
-          rgb888 = (static_cast<uint32_t>(p.r * 255.0f + 0.5f) << 16) |
-                   (static_cast<uint32_t>(p.g * 255.0f + 0.5f) << 8) |
-                   static_cast<uint32_t>(p.b * 255.0f + 0.5f);
-          hasRgb = true;
         }
       }
       const glm::vec3 hutMin = hutOrigin + glm::vec3(fx, fy, fz) * importFineVs;
@@ -1087,7 +1113,7 @@ uint32_t VoxelScene::stampMeshIntoWorld(const MeshVoxelizeResult& r, bool sample
       for (int wz = z0; wz <= z1; ++wz) {
         for (int wy = y0; wy <= y1; ++wy) {
           for (int wx = x0; wx <= x1; ++wx) {
-            if (placeWorldFine(wx, wy, wz, mat, hasRgb, rgb888)) {
+            if (placeWorldFine(wx, wy, wz, hasColor, rgb888)) {
               ++stamped;
             }
           }
@@ -1107,11 +1133,17 @@ bool VoxelScene::importSurfaceMesh(GfxDevice& gfx, const std::string& path,
 
   MeshVoxelizeConfig local = cfg;
   local.fineSubdiv = kFinePerCoarse;
+  std::cout << "Import voxelize " << path << (local.sampleColor ? " (sample color)" : "") << std::endl;
+  const auto t0 = std::chrono::steady_clock::now();
   MeshVoxelizeResult r = voxelizeObjSurface(gfx, voxelizeGpu_, path, local);
+  const auto t1 = std::chrono::steady_clock::now();
   if (!r.ok) {
     importStatus_ = r.error;
     return false;
   }
+  std::cout << "Import voxelize done in "
+            << std::chrono::duration<float>(t1 - t0).count() << "s  occupiedFine="
+            << r.occupiedFine << "  colorSamples=" << r.colorSamples << std::endl;
 
   VoxelObject& world = objects_[0];
   for (CoarseCell& c : world.cells) {
@@ -1122,6 +1154,7 @@ bool VoxelScene::importSurfaceMesh(GfxDevice& gfx, const std::string& path,
   buildGroundObject(world);
 
   const uint32_t stamped = stampMeshIntoWorld(r, local.sampleColor);
+  std::cout << "Import stamp done  worldFines=" << stamped << std::endl;
 
   importPath_ = path;
   lastImportedPath_ = path;
@@ -1149,8 +1182,7 @@ bool VoxelScene::importSurfaceMesh(GfxDevice& gfx, const std::string& path,
                   "  srcCoarse=" + std::to_string(r.occupied) +
                   "  srcFine=" + std::to_string(r.occupiedFine) +
                   "  worldFines=" + std::to_string(stamped) +
-                  "  palette=" + std::to_string(r.paletteUsed) +
-                  "  fineColors=" + std::to_string(r.fineId.size());
+                  "  rgba=" + std::to_string(r.fineRgb.size());
   if (!r.fineRgb.empty()) {
     std::unordered_set<uint32_t> uniq(r.fineRgb.begin(), r.fineRgb.end());
     importStatus_ += "  uniqueRgb=" + std::to_string(uniq.size());

@@ -38,11 +38,11 @@ private:
     uint32_t useSky;
     uint32_t objectCount;
     uint32_t solidColor;
-    uint32_t padOccMip;
+    uint32_t dirMaskCoarse;
     uint32_t brickBitSkip;
     uint32_t beamSkip;
     float beamMargin;
-    uint32_t padOccSkip;
+    uint32_t dirMaskBrick;
     float solidRgb[3];
     float padSolidEnd;
   };
@@ -125,6 +125,8 @@ private:
   float displayFps_ = 0.0f;
   int traceStage_ = 0;
   bool brickBitSkip_ = true;
+  bool dirMaskBrick_ = true;
+  bool dirMaskCoarse_ = true;
   bool beamSkip_ = true;
   float beamMargin_ = 5.6f;  // 16 coarse cells * 0.35 m, voxelG one-tile pad
 
