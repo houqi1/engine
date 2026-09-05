@@ -59,6 +59,10 @@ Voxel-only: `VoxelScene`, `VoxelRenderer`.
 
 Windows runners: `run_engine.bat`, `run_engine_voxel.bat`.
 
+The voxel Windows runners use Release. Reproducible 1440p GPU benchmarks,
+quality checks, optimization findings, and the remaining sustained-performance
+limits are documented in [Voxel Performance](docs/voxel-performance.md).
+
 ## Layout
 
 ```

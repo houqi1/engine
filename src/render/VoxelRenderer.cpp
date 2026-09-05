@@ -10,7 +10,11 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <iostream>
+#include <locale>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -27,9 +31,130 @@ void writeVec3(float* dst, const glm::vec3& v) {
   dst[2] = v.z;
 }
 
+void printPipelineExecutableStatistics(VkDevice device, VkPipeline pipeline) {
+  const auto getProperties = reinterpret_cast<PFN_vkGetPipelineExecutablePropertiesKHR>(
+      vkGetDeviceProcAddr(device, "vkGetPipelineExecutablePropertiesKHR"));
+  const auto getStatistics = reinterpret_cast<PFN_vkGetPipelineExecutableStatisticsKHR>(
+      vkGetDeviceProcAddr(device, "vkGetPipelineExecutableStatisticsKHR"));
+  if (!getProperties || !getStatistics) {
+    std::cerr << "[VoxelPipelineStats] query entry points unavailable\n";
+    return;
+  }
+
+  auto enumerate = [](auto query, auto& values, VkStructureType type) -> VkResult {
+    for (int attempt = 0; attempt < 4; ++attempt) {
+      uint32_t count = 0;
+      VkResult status = query(&count, nullptr);
+      if (status != VK_SUCCESS) {
+        return status;
+      }
+      values.assign(count, {});
+      for (auto& value : values) {
+        value.sType = type;
+      }
+      if (count == 0) {
+        return VK_SUCCESS;
+      }
+      status = query(&count, values.data());
+      if (status == VK_INCOMPLETE) {
+        continue;
+      }
+      if (status == VK_SUCCESS) {
+        values.resize(count);
+      }
+      return status;
+    }
+    return VK_INCOMPLETE;
+  };
+
+  VkPipelineInfoKHR pipelineInfo{};
+  pipelineInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR;
+  pipelineInfo.pipeline = pipeline;
+  std::vector<VkPipelineExecutablePropertiesKHR> executables;
+  const VkResult propertiesStatus = enumerate(
+      [&](uint32_t* count, VkPipelineExecutablePropertiesKHR* values) {
+        return getProperties(device, &pipelineInfo, count, values);
+      }, executables, VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR);
+  if (propertiesStatus != VK_SUCCESS) {
+    std::cerr << "[VoxelPipelineStats] executable enumeration failed: VkResult="
+              << propertiesStatus << '\n';
+    return;
+  }
+  std::cout << "[VoxelPipelineStats] executables=" << executables.size() << '\n';
+  for (uint32_t index = 0; index < executables.size(); ++index) {
+    const auto& executable = executables[index];
+    std::cout << "[VoxelPipelineStats] executable=" << index << " name=" << executable.name
+              << " stages=" << executable.stages << " subgroupSize=" << executable.subgroupSize
+              << " description=" << executable.description << '\n';
+
+    VkPipelineExecutableInfoKHR executableInfo{};
+    executableInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR;
+    executableInfo.pipeline = pipeline;
+    executableInfo.executableIndex = index;
+    std::vector<VkPipelineExecutableStatisticKHR> statistics;
+    const VkResult statisticsStatus = enumerate(
+        [&](uint32_t* count, VkPipelineExecutableStatisticKHR* values) {
+          return getStatistics(device, &executableInfo, count, values);
+        }, statistics, VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR);
+    if (statisticsStatus != VK_SUCCESS) {
+      std::cerr << "[VoxelPipelineStats] executable=" << index
+                << " statistics enumeration failed: VkResult=" << statisticsStatus << '\n';
+      continue;
+    }
+    std::cout << "[VoxelPipelineStats] executable=" << index
+              << " statistics=" << statistics.size() << '\n';
+    for (const auto& statistic : statistics) {
+      std::cout << "[VoxelPipelineStats] executable=" << index << " name=" << statistic.name
+                << " value=";
+      switch (statistic.format) {
+        case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR:
+          std::cout << "BOOL32:" << (statistic.value.b32 ? "true" : "false");
+          break;
+        case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR:
+          std::cout << "INT64:" << statistic.value.i64;
+          break;
+        case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR:
+          std::cout << "UINT64:" << statistic.value.u64;
+          break;
+        case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_FLOAT64_KHR: {
+          const auto flags = std::cout.flags();
+          const auto precision = std::cout.precision(17);
+          std::cout << "FLOAT64:" << std::defaultfloat << statistic.value.f64;
+          std::cout.flags(flags);
+          std::cout.precision(precision);
+          break;
+        }
+        default:
+          std::cout << "unknown-format:" << statistic.format;
+          break;
+      }
+      std::cout << " description=" << statistic.description << '\n';
+    }
+  }
+}
+
 }  // namespace
 
-VoxelRenderer::VoxelRenderer(GfxDevice& gfx) : gfx_(gfx) {}
+VoxelRenderer::VoxelRenderer(GfxDevice& gfx) : gfx_(gfx) {
+  const char* generic = std::getenv("VE_VOXEL_GENERIC_SHADER");
+  forceGenericShader_ = generic && std::strcmp(generic, "1") == 0;
+}
+
+void VoxelRenderer::configureBenchmark(const BenchmarkSettings& settings, uint32_t warmup,
+                                       uint32_t frames) {
+  if (imguiReady_ || timestampPool_ || frames == 0 || settings.stage > kStageSkipDda) {
+    throw std::runtime_error("Invalid benchmark configuration (must configure before init)");
+  }
+  benchmark_ = true;
+  benchmarkWarmup_ = warmup;
+  benchmarkFrames_ = frames;
+  benchmarkTimings_.reserve(frames);
+  beamSkip_ = settings.beam;
+  brickBitSkip_ = settings.brickSkip;
+  dirMaskBrick_ = settings.dirBrick;
+  dirMaskCoarse_ = settings.dirCoarse;
+  traceStage_ = static_cast<int>(settings.stage);
+}
 
 VoxelRenderer::~VoxelRenderer() {
   gfx_.waitIdle();
@@ -39,6 +164,15 @@ VoxelRenderer::~VoxelRenderer() {
 
   if (computePipeline_) {
     vkDestroyPipeline(gfx_.device(), computePipeline_, nullptr);
+  }
+  if (specializedFullPipeline_) {
+    vkDestroyPipeline(gfx_.device(), specializedFullPipeline_, nullptr);
+  }
+  if (specializedSinglePipeline_) {
+    vkDestroyPipeline(gfx_.device(), specializedSinglePipeline_, nullptr);
+  }
+  if (specializedColorPipeline_) {
+    vkDestroyPipeline(gfx_.device(), specializedColorPipeline_, nullptr);
   }
   if (slimPipeline_) {
     vkDestroyPipeline(gfx_.device(), slimPipeline_, nullptr);
@@ -94,6 +228,16 @@ void VoxelRenderer::createTimestampPool() {
   VkPhysicalDeviceProperties props{};
   vkGetPhysicalDeviceProperties(gfx_.physicalDevice(), &props);
   timestampPeriodNs_ = props.limits.timestampPeriod;
+  uint32_t familyCount = 0;
+  vkGetPhysicalDeviceQueueFamilyProperties(gfx_.physicalDevice(), &familyCount, nullptr);
+  std::vector<VkQueueFamilyProperties> families(familyCount);
+  vkGetPhysicalDeviceQueueFamilyProperties(gfx_.physicalDevice(), &familyCount, families.data());
+  const uint32_t validBits = families.at(gfx_.graphicsQueueFamily()).timestampValidBits;
+  if (validBits == 0 || timestampPeriodNs_ <= 0.0f ||
+      (benchmark_ && !props.limits.timestampComputeAndGraphics)) {
+    throw std::runtime_error("GPU queue does not support the required benchmark timestamps");
+  }
+  timestampMask_ = validBits >= 64 ? UINT64_MAX : ((uint64_t{1} << validBits) - 1);
 
   VkQueryPoolCreateInfo info{};
   info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
@@ -131,29 +275,125 @@ void VoxelRenderer::collectGpuTiming(uint32_t frameIndex) {
       gfx_.device(), timestampPool_, firstQuery, kTsPerFrame, sizeof(stamps), stamps,
       sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
   if (result != VK_SUCCESS) {
-    return;
+    // Called only after this slot's fence, or device idle. Never reset an unread query.
+    throw std::runtime_error("Failed to collect completed voxel GPU timestamps: " +
+                             std::to_string(result));
   }
 
   auto toMs = [&](uint64_t a, uint64_t b) {
-    const double deltaTicks = static_cast<double>(b - a);
-    return static_cast<float>(deltaTicks * static_cast<double>(timestampPeriodNs_) * 1e-6);
+    const double deltaTicks = static_cast<double>((b - a) & timestampMask_);
+    return deltaTicks * static_cast<double>(timestampPeriodNs_) * 1e-6;
   };
 
-  const float totalMs = toMs(stamps[kTsFrameBegin], stamps[kTsFrameEnd]);
-  const float beamMs = toMs(stamps[kTsFrameBegin], stamps[kTsAfterBeam]);
-  const float mainMs = toMs(stamps[kTsAfterBeam], stamps[kTsAfterCompute]);
-  const float computeMs = toMs(stamps[kTsFrameBegin], stamps[kTsAfterCompute]);
-  const float blitMs = toMs(stamps[kTsAfterCompute], stamps[kTsAfterBlit]);
-  const float uiMs = toMs(stamps[kTsAfterBlit], stamps[kTsFrameEnd]);
+  const GpuTiming timing{
+      timestampSubmissions_[frameIndex],
+      toMs(stamps[kTsFrameBegin], stamps[kTsFrameEnd]),
+      toMs(stamps[kTsFrameBegin], stamps[kTsAfterBeam]),
+      toMs(stamps[kTsAfterBeam], stamps[kTsAfterCompute]),
+      toMs(stamps[kTsFrameBegin], stamps[kTsAfterCompute]),
+      toMs(stamps[kTsAfterCompute], stamps[kTsAfterBlit]),
+      toMs(stamps[kTsAfterBlit], stamps[kTsFrameEnd]),
+  };
+  if (benchmark_ && timing.submission >= benchmarkWarmup_ &&
+      timing.submission < uint64_t{benchmarkWarmup_} + benchmarkFrames_) {
+    benchmarkTimings_.push_back(timing);
+  }
 
   constexpr float alpha = 0.15f;
-  gpuFrameMs_ = gpuFrameMs_ * (1.0f - alpha) + totalMs * alpha;
-  gpuBeamMs_ = gpuBeamMs_ * (1.0f - alpha) + beamMs * alpha;
-  gpuMainMs_ = gpuMainMs_ * (1.0f - alpha) + mainMs * alpha;
-  gpuComputeMs_ = gpuComputeMs_ * (1.0f - alpha) + computeMs * alpha;
-  gpuBlitMs_ = gpuBlitMs_ * (1.0f - alpha) + blitMs * alpha;
-  gpuUiMs_ = gpuUiMs_ * (1.0f - alpha) + uiMs * alpha;
+  gpuFrameMs_ = gpuFrameMs_ * (1.0f - alpha) + static_cast<float>(timing.totalMs) * alpha;
+  gpuBeamMs_ = gpuBeamMs_ * (1.0f - alpha) + static_cast<float>(timing.beamMs) * alpha;
+  gpuMainMs_ = gpuMainMs_ * (1.0f - alpha) + static_cast<float>(timing.mainMs) * alpha;
+  gpuComputeMs_ = gpuComputeMs_ * (1.0f - alpha) + static_cast<float>(timing.computeMs) * alpha;
+  gpuBlitMs_ = gpuBlitMs_ * (1.0f - alpha) + static_cast<float>(timing.blitMs) * alpha;
+  gpuUiMs_ = gpuUiMs_ * (1.0f - alpha) + static_cast<float>(timing.uiMs) * alpha;
   timestampPending_[frameIndex] = false;
+}
+
+std::vector<VoxelRenderer::GpuTiming> VoxelRenderer::finishBenchmark() {
+  if (!benchmark_ || submittedFrames_ != uint64_t{benchmarkWarmup_} + benchmarkFrames_) {
+    throw std::runtime_error("Benchmark did not submit exactly warmup + measured frames");
+  }
+  if (vkDeviceWaitIdle(gfx_.device()) != VK_SUCCESS) {
+    throw std::runtime_error("GPU failed while draining benchmark frames");
+  }
+  for (uint32_t i = 0; i < GfxDevice::kFramesInFlight; ++i) {
+    collectGpuTiming(i);
+  }
+  std::sort(benchmarkTimings_.begin(), benchmarkTimings_.end(),
+            [](const GpuTiming& a, const GpuTiming& b) { return a.submission < b.submission; });
+  if (benchmarkTimings_.size() != benchmarkFrames_) {
+    throw std::runtime_error("Benchmark GPU timing sample count mismatch");
+  }
+  for (size_t i = 0; i < benchmarkTimings_.size(); ++i) {
+    if (benchmarkTimings_[i].submission != uint64_t{benchmarkWarmup_} + i) {
+      throw std::runtime_error("Benchmark GPU timing submissions are not contiguous");
+    }
+  }
+  return benchmarkTimings_;
+}
+
+void VoxelRenderer::capturePpm(const std::string& path) {
+  if (!outImage_.image || outImage_.layout != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
+    throw std::runtime_error("Capture requires a completed rendered output image");
+  }
+  if (vkDeviceWaitIdle(gfx_.device()) != VK_SUCCESS) {
+    throw std::runtime_error("GPU failed before benchmark capture");
+  }
+  std::ofstream file(path, std::ios::binary | std::ios::trunc);
+  file.imbue(std::locale::classic());
+  if (!file) {
+    throw std::runtime_error("Cannot open benchmark capture: " + path);
+  }
+  const uint32_t width = outImage_.extent.width;
+  const uint32_t height = outImage_.extent.height;
+  const VkDeviceSize bytes = VkDeviceSize{width} * height * 4;
+  AllocatedBuffer staging = gfx_.createBuffer(bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                               VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
+  try {
+    gfx_.immediateSubmit([&](VkCommandBuffer cmd) {
+      gfx_.transitionImage(cmd, outImage_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT,
+                           VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+      VkBufferImageCopy region{};
+      region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+      region.imageSubresource.layerCount = 1;
+      region.imageExtent = {width, height, 1};
+      vkCmdCopyImageToBuffer(cmd, outImage_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                             staging.buffer, 1, &region);
+      VkMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+      barrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+      barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+      barrier.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
+      barrier.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+      VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+      dependency.memoryBarrierCount = 1;
+      dependency.pMemoryBarriers = &barrier;
+      vkCmdPipelineBarrier2(cmd, &dependency);
+    });
+    if (vkQueueWaitIdle(gfx_.graphicsQueue()) != VK_SUCCESS || !staging.info.pMappedData ||
+        vmaInvalidateAllocation(gfx_.allocator(), staging.allocation, 0, bytes) != VK_SUCCESS) {
+      throw std::runtime_error("Failed to read benchmark RGBA output");
+    }
+    file << "P6\n" << width << ' ' << height << "\n255\n";
+    const auto* rgba = static_cast<const uint8_t*>(staging.info.pMappedData);
+    std::vector<char> row(static_cast<size_t>(width) * 3);
+    for (uint32_t y = 0; y < height; ++y) {
+      for (uint32_t x = 0; x < width; ++x) {
+        const size_t src = (static_cast<size_t>(y) * width + x) * 4;
+        std::memcpy(row.data() + static_cast<size_t>(x) * 3, rgba + src, 3);
+      }
+      file.write(row.data(), static_cast<std::streamsize>(row.size()));
+    }
+    file.close();
+    if (!file) {
+      throw std::runtime_error("Failed to write benchmark capture: " + path);
+    }
+  } catch (...) {
+    gfx_.destroyBuffer(staging);
+    throw;
+  }
+  gfx_.destroyBuffer(staging);
 }
 
 void VoxelRenderer::resize() {
@@ -266,7 +506,7 @@ void VoxelRenderer::destroyOutputImage() {
 
 VkPipeline VoxelRenderer::createComputePipeline(VkShaderModule shader, DdaSpec spec,
                                                 bool useSpec) const {
-  VkSpecializationMapEntry specEntries[3]{};
+  VkSpecializationMapEntry specEntries[8]{};
   specEntries[0].constantID = 0;
   specEntries[0].offset = offsetof(DdaSpec, beamPass);
   specEntries[0].size = sizeof(uint32_t);
@@ -276,9 +516,24 @@ VkPipeline VoxelRenderer::createComputePipeline(VkShaderModule shader, DdaSpec s
   specEntries[2].constantID = 2;
   specEntries[2].offset = offsetof(DdaSpec, enableShade);
   specEntries[2].size = sizeof(uint32_t);
+  specEntries[3].constantID = 3;
+  specEntries[3].offset = offsetof(DdaSpec, shadedOnly);
+  specEntries[3].size = sizeof(uint32_t);
+  specEntries[4].constantID = 4;
+  specEntries[4].offset = offsetof(DdaSpec, singleObject);
+  specEntries[4].size = sizeof(uint32_t);
+  specEntries[5].constantID = 5;
+  specEntries[5].offset = offsetof(DdaSpec, groupHeight);
+  specEntries[5].size = sizeof(uint32_t);
+  specEntries[6].constantID = 6;
+  specEntries[6].offset = offsetof(DdaSpec, fineOnly);
+  specEntries[6].size = sizeof(uint32_t);
+  specEntries[7].constantID = 7;
+  specEntries[7].offset = offsetof(DdaSpec, colorMode);
+  specEntries[7].size = sizeof(uint32_t);
 
   VkSpecializationInfo specInfo{};
-  specInfo.mapEntryCount = 3;
+  specInfo.mapEntryCount = 8;
   specInfo.pMapEntries = specEntries;
   specInfo.dataSize = sizeof(DdaSpec);
   specInfo.pData = &spec;
@@ -296,18 +551,30 @@ VkPipeline VoxelRenderer::createComputePipeline(VkShaderModule shader, DdaSpec s
   pipeInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
   pipeInfo.stage = stage;
   pipeInfo.layout = pipelineLayout_;
+  if (gfx_.pipelineExecutableStatisticsEnabled()) {
+    pipeInfo.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
+  }
 
   VkPipeline pipeline = VK_NULL_HANDLE;
   if (vkCreateComputePipelines(gfx_.device(), VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &pipeline) !=
       VK_SUCCESS) {
     throw std::runtime_error("Failed to create voxel DDA compute pipeline");
   }
+  if (gfx_.pipelineExecutableStatisticsEnabled()) {
+    std::cout << "[VoxelPipelineStats] pipeline=" << pipeline << " shader=" << shader
+              << " useSpec=" << useSpec << " beamPass=" << spec.beamPass
+              << " shadedOnly=" << spec.shadedOnly << " singleObject=" << spec.singleObject
+              << " groupHeight=" << spec.groupHeight << '\n';
+    printPipelineExecutableStatistics(gfx_.device(), pipeline);
+  }
   return pipeline;
 }
 
 void VoxelRenderer::createPipelines() {
   const std::string shaderDir = VE_SHADER_DIR;
-  VkShaderModule comp = gfx_.loadShaderModule(shaderDir + "/voxel_dda.comp.spv");
+  VkShaderModule comp = gfx_.loadShaderModule(
+      shaderDir + (gfx_.storageBufferNonUniformIndexing() ? "/voxel_dda_indexed.comp.spv"
+                                                       : "/voxel_dda.comp.spv"));
 
   VkPipelineLayoutCreateInfo layoutInfo{};
   layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -321,7 +588,10 @@ void VoxelRenderer::createPipelines() {
   VkShaderModule coarseMod = VK_NULL_HANDLE;
   VkShaderModule slimMod = VK_NULL_HANDLE;
   try {
-    computePipeline_ = createComputePipeline(comp, DdaSpec{0u, 1u, 1u});
+    computePipeline_ = createComputePipeline(comp, DdaSpec{0u, 1u, 1u, 0u, 0u});
+    specializedFullPipeline_ = createComputePipeline(comp, DdaSpec{0u, 1u, 1u, 1u, 0u, 8u});
+    specializedSinglePipeline_ = createComputePipeline(comp, DdaSpec{0u, 1u, 1u, 1u, 1u, 8u, 1u, 0u});
+    specializedColorPipeline_ = createComputePipeline(comp, DdaSpec{0u, 1u, 1u, 1u, 1u, 8u, 1u, 1u});
     beamPipeline_ = createComputePipeline(comp, DdaSpec{1u, 0u, 0u});
     coarseMod = gfx_.loadShaderModule(shaderDir + "/voxel_dda_coarse.comp.spv");
     slimMod = gfx_.loadShaderModule(shaderDir + "/voxel_dda_slim.comp.spv");
@@ -358,6 +628,8 @@ void VoxelRenderer::updateDescriptors(VoxelScene& scene) {
     return;
   }
 
+  // All frame sets are rewritten together, only on infrequent resource changes.
+  gfx_.waitIdle();
   for (auto& frame : frames_) {
     VkDescriptorBufferInfo uboInfo{};
     uboInfo.buffer = frame.frameUBO.buffer;
@@ -520,7 +792,7 @@ void VoxelRenderer::updateFrameUBO(VoxelScene& scene, uint32_t frameIndex) {
   ubo.solidColor = scene.solidColorOutput() ? 1u : 0u;
   ubo.dirMaskCoarse = dirMaskCoarse_ ? 1u : 0u;
   ubo.brickBitSkip = brickBitSkip_ ? 1u : 0u;
-  ubo.beamSkip = beamSkip_ ? 1u : 0u;
+  ubo.beamSkip = (beamSkip_ && traceStage_ < kStageCoarse && scene.nestedMicroVoxels()) ? 1u : 0u;
   ubo.beamMargin = std::max(0.0f, beamMargin_);
   ubo.dirMaskBrick = dirMaskBrick_ ? 1u : 0u;
   writeVec3(ubo.solidRgb, scene.solidColor());
@@ -531,10 +803,37 @@ void VoxelRenderer::updateFrameUBO(VoxelScene& scene, uint32_t frameIndex) {
     throw std::runtime_error("Voxel DDA UBO is not host-mapped");
   }
   std::memcpy(mapped, &ubo, sizeof(ubo));
+  if (vmaFlushAllocation(gfx_.allocator(), frames_[frameIndex].frameUBO.allocation,
+                         0, sizeof(ubo)) != VK_SUCCESS) {
+    throw std::runtime_error("Failed to flush voxel frame UBO");
+  }
 }
 
-void VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
+bool VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
   displayFps_ = displayFps;
+
+  // UI requests must not destroy resources referenced by an unsubmitted command buffer.
+  if (importRequested_ || removeImportRequested_ || rebuildRequested_) {
+    gfx_.waitIdle();
+    if (importRequested_) {
+      MeshVoxelizeConfig cfg;
+      cfg.gridN = scene.importGridN();
+      cfg.padding = scene.importPadding();
+      cfg.sampleColor = scene.importSampleColor();
+      const std::string path = scene.importPath().empty()
+                                   ? std::string(VE_ASSETS_DIR) + "/meshes/cube.obj"
+                                   : scene.importPath();
+      scene.importSurfaceMesh(gfx_, path, cfg);
+    }
+    if (removeImportRequested_) {
+      scene.removeImportedMesh(gfx_);
+    }
+    if (rebuildRequested_) {
+      scene.rebuildVoxels(gfx_);
+    }
+    importRequested_ = removeImportRequested_ = rebuildRequested_ = false;
+    boundGridSampler_ = VK_NULL_HANDLE;
+  }
 
   if (gfx_.swapchainWasRecreated()) {
     resize();
@@ -544,6 +843,7 @@ void VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
   if (outImage_.image == VK_NULL_HANDLE) {
     createOutputImage();
   }
+  scene.uploadObjectTransforms(gfx_);
   bool brickSlabsChanged = scene.brickSlabCount() != boundBrickSlabCount_;
   for (uint32_t i = 0; i < scene.brickSlabCount() && !brickSlabsChanged; ++i) {
     brickSlabsChanged = scene.brickSlabBuffer(i).buffer != boundBrickSlabs_[i];
@@ -566,39 +866,51 @@ void VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
 
   FrameContext frame{};
   if (!gfx_.beginFrame(frame)) {
-    return;
+    return false;
   }
 
   if (outImage_.image == VK_NULL_HANDLE || scene.gridSampler() == VK_NULL_HANDLE ||
       scene.gridImage(0).view == VK_NULL_HANDLE ||
       scene.objectBuffer().buffer == VK_NULL_HANDLE) {
     gfx_.endFrame(frame);
-    return;
+    return false;
   }
 
   collectGpuTiming(frame.frameIndex);
-  scene.uploadObjectTransforms(gfx_);
   updateFrameUBO(scene, frame.frameIndex);
   VkDescriptorSet frameSet = frames_[frame.frameIndex].frameSet;
 
   const uint32_t tsBase = frame.frameIndex * kTsPerFrame;
   if (timestampPool_) {
     vkCmdResetQueryPool(frame.cmd, timestampPool_, tsBase, kTsPerFrame);
-    writeTimestamp(frame.cmd, tsBase + kTsFrameBegin, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT);
   }
 
-  // Compute writes the raycast result.
-  gfx_.transitionImage(frame.cmd, outImage_.image, VK_IMAGE_LAYOUT_UNDEFINED,
-                       VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+  // Images are shared across frame slots. Order the previous blit/main reads before reuse;
+  // unchanged scenes no longer implicitly drain the queue through a transform upload.
+  gfx_.transitionImage(frame.cmd, outImage_.image, outImage_.layout,
+                       VK_IMAGE_LAYOUT_GENERAL,
+                       outImage_.layout == VK_IMAGE_LAYOUT_UNDEFINED
+                           ? VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                       outImage_.layout == VK_IMAGE_LAYOUT_UNDEFINED ? 0 : VK_ACCESS_2_TRANSFER_READ_BIT,
                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT);
+  if (beamImage_.image && (beamSkip_ || beamImage_.layout == VK_IMAGE_LAYOUT_UNDEFINED)) {
+    gfx_.transitionImage(frame.cmd, beamImage_.image, beamImage_.layout, VK_IMAGE_LAYOUT_GENERAL,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                          VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT,
+                          VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                          VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT);
+  }
+
+  // Start at compute, after reuse dependencies, not at TOP while the previous frame runs.
+  if (timestampPool_) {
+    writeTimestamp(frame.cmd, tsBase + kTsFrameBegin, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+  }
 
   vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_, 0, 1,
                           &frameSet, 0, nullptr);
 
-  if (beamSkip_ && beamPipeline_ && beamImage_.image != VK_NULL_HANDLE) {
-    gfx_.transitionImage(frame.cmd, beamImage_.image, VK_IMAGE_LAYOUT_UNDEFINED,
-                         VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
-                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT);
+  if (beamSkip_ && traceStage_ < kStageCoarse && scene.nestedMicroVoxels() &&
+      beamPipeline_ && beamImage_.image != VK_NULL_HANDLE) {
     vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, beamPipeline_);
     const uint32_t beamX = (beamImage_.extent.width + 7u) / 8u;
     const uint32_t beamY = (beamImage_.extent.height + 7u) / 8u;
@@ -614,14 +926,34 @@ void VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
   }
 
   VkPipeline ddaPipe = computePipeline_;
+  activeKernelName_ = "FULL generic";
   if (traceStage_ >= kStageCoarse) {
     ddaPipe = coarsePipeline_;
+    activeKernelName_ = "COARSE";
   } else if (!scene.nestedMicroVoxels()) {
     ddaPipe = (traceStage_ >= kStageNoShade) ? coarsePipeline_ : slimPipeline_;
+    activeKernelName_ = (traceStage_ >= kStageNoShade) ? "COARSE" : "SLIM shaded";
+  } else if (!forceGenericShader_ && traceStage_ == kStageFull && scene.renderMode() == 0 &&
+             !scene.solidColorOutput()) {
+    if (scene.objectCount() == 1 &&
+        (scene.objectFlags(0) & (VoxelObject::kFlagNestedMicro | VoxelObject::kFlagNestedFine)) ==
+            (VoxelObject::kFlagNestedMicro | VoxelObject::kFlagNestedFine)) {
+      const bool colored = (scene.objectFlags(0) & VoxelObject::kFlagImportPalette) != 0;
+      ddaPipe = colored ? specializedColorPipeline_ : specializedSinglePipeline_;
+      activeKernelName_ = colored ? "FULL specialized (fine, sampled color)" : "FULL specialized (fine)";
+    } else {
+      ddaPipe = specializedFullPipeline_;
+      activeKernelName_ = "FULL specialized (shaded, dynamic object count)";
+    }
+  }
+  if (benchmark_ && submittedFrames_ == 0) {
+    std::cout << "DDA kernel: " << activeKernelName_
+              << " generic_override=" << forceGenericShader_ << std::endl;
   }
   vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ddaPipe);
   const uint32_t groupsX = (frame.extent.width + 7u) / 8u;
-  const uint32_t groupsY = (frame.extent.height + 7u) / 8u;
+  const uint32_t groupHeight = 8u;
+  const uint32_t groupsY = (frame.extent.height + groupHeight - 1u) / groupHeight;
   vkCmdDispatch(frame.cmd, groupsX, groupsY, 1);
 
   if (timestampPool_) {
@@ -635,7 +967,7 @@ void VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
                        VK_ACCESS_2_TRANSFER_READ_BIT);
 
   gfx_.transitionImage(frame.cmd, frame.swapchainImage, VK_IMAGE_LAYOUT_UNDEFINED,
-                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_TRANSFER_BIT, 0,
                        VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
 
   VkImageBlit blit{};
@@ -694,15 +1026,28 @@ void VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
 
   if (timestampPool_) {
     writeTimestamp(frame.cmd, tsBase + kTsFrameEnd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT);
-    timestampPending_[frame.frameIndex] = true;
   }
 
   gfx_.endFrame(frame);
+  outImage_.layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+  if (beamImage_.image) {
+    beamImage_.layout = VK_IMAGE_LAYOUT_GENERAL;
+  }
+  if (timestampPool_) {
+    timestampSubmissions_[frame.frameIndex] = submittedFrames_;
+    timestampPending_[frame.frameIndex] = true;
+  }
+  ++submittedFrames_;
+  return true;
 }
 
 void VoxelRenderer::initImGui() {
   IMGUI_CHECKVERSION();
   ImGui::CreateContext();
+  if (benchmark_) {
+    ImGui::GetIO().IniFilename = nullptr;
+    ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NoMouse;
+  }
   ImGui::StyleColorsDark();
 
   VkDescriptorPoolSize poolSizes[] = {
@@ -771,7 +1116,18 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
   ImGui_ImplGlfw_NewFrame();
   ImGui::NewFrame();
 
-  ImGui::Begin("Voxel DDA");
+  ImGuiWindowFlags flags = 0;
+  if (benchmark_) {
+    ImGui::SetNextWindowPos(ImVec2(10.0f, 10.0f), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(
+        ImVec2(520.0f, std::clamp(static_cast<float>(gfx_.swapchainExtent().height) - 20.0f,
+                                 32.0f, 900.0f)),
+        ImGuiCond_Always);
+    ImGui::SetNextWindowCollapsed(false, ImGuiCond_Always);
+    flags = ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
+            ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings;
+  }
+  ImGui::Begin("Voxel DDA", nullptr, flags);
   ImGui::TextWrapped("GPU: %s", gfx_.deviceName().c_str());
   ImGui::Text("Present: %s", gfx_.presentModeName());
   ImGui::Text("Display FPS: %.1f  (%.2f ms)", displayFps,
@@ -781,7 +1137,7 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
   ImGui::Text("  compute:   %.2f ms", gpuComputeMs_);
   if (beamSkip_) {
     ImGui::Text("    beam 8x8: %.2f ms", gpuBeamMs_);
-    ImGui::Text("    full DDA: %.2f ms", gpuMainMs_);
+    ImGui::Text("    main DDA: %.2f ms", gpuMainMs_);
   }
   ImGui::Text("  blit:      %.2f ms", gpuBlitMs_);
   ImGui::Text("  ui/other:  %.2f ms", gpuUiMs_);
@@ -801,15 +1157,9 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
     ImGui::TextDisabled("Ray gen / Skip DDA never walk the grid, so Steps stays sky.");
   }
   {
-    const bool tinyCoarse = traceStage_ >= kStageCoarse;
-    const bool tinySlim = !tinyCoarse && !scene.nestedMicroVoxels();
-    if (tinyCoarse) {
-      ImGui::TextUnformatted("DDA kernel: COARSE  (~38 KB, no brick in SPIR-V)");
-    } else if (tinySlim) {
-      ImGui::TextUnformatted("DDA kernel: SLIM    (~22 KB, no brick, shade on)");
-    } else {
-      ImGui::TextUnformatted("DDA kernel: FULL    (~188 KB nested mega-shader)");
-      ImGui::TextDisabled("Still Full because Nested 8^3 is ON and Cost Ladder is above Coarse.");
+    ImGui::Text("DDA kernel: %s", activeKernelName_);
+    if (forceGenericShader_) {
+      ImGui::TextDisabled("VE_VOXEL_GENERIC_SHADER=1: full specialization disabled.");
     }
     ImGui::Checkbox("Nested 8^3 (micro bricks)", &scene.nestedMicroVoxels());
     ImGui::TextDisabled("Off -> slim kernel. Cost Ladder \"Coarse DDA only\" -> coarse kernel.");
@@ -829,14 +1179,14 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
   ImGui::Checkbox("4^3 direction AND (brick)", &dirMaskBrick_);
   ImGui::EndDisabled();
   ImGui::Checkbox("4^3 direction AND (coarse)", &dirMaskCoarse_);
-  ImGui::TextDisabled("Same LUT at two scales. Off = occupancy-only (old path) for A/B.");
+  ImGui::TextDisabled("Off disables coarse tile skipping. Beam certification is independent.");
   ImGui::TextDisabled("AND skips 4^3 tiles whose solids all lie behind this ray.");
-  ImGui::Checkbox("Beam depth prepass (8x8)", &beamSkip_);
+  ImGui::Checkbox("Beam empty-prefix prepass (8x8)", &beamSkip_);
   ImGui::BeginDisabled(!beamSkip_);
-  ImGui::SliderFloat("Beam margin (m)", &beamMargin_, 0.0f, 16.0f, "%.2f");
+  ImGui::SliderFloat("Beam margin (m)", &beamMargin_, 0.0f, 16.0f, "%.3f");
   ImGui::EndDisabled();
-  ImGui::TextDisabled("1/8 occupancy DDA; full rays start at min(4 corners+centre) - margin.");
-  ImGui::TextDisabled("Off = every pixel walks from the camera (old path).");
+  ImGui::TextDisabled("Entire tile frustum: skip only a certified empty prefix.");
+  ImGui::TextDisabled("Margin adds a roundoff guard; off = trace from the camera.");
   ImGui::Checkbox("Collapse full bricks to INVALID", &scene.collapseFullBricks());
   ImGui::TextDisabled("Off = keep a page even when 8^3 x 2^3 is solid. Toggle applies on next edit.");
   ImGui::Text("Occupied 8^3 micros: %u   2^3 fines: %u", scene.occupiedMicroCount(),
@@ -891,23 +1241,11 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
   ImGui::TextDisabled(
       "Sample Color: each fine stores RGBA; alpha means this voxel has a sampled color.");
   if (ImGui::Button("Import Surface OBJ")) {
-    MeshVoxelizeConfig cfg;
-    cfg.gridN = scene.importGridN();
-    cfg.padding = scene.importPadding();
-    cfg.sampleColor = scene.importSampleColor();
-    const std::string path = scene.importPath().empty() ? defaultObj : scene.importPath();
-    scene.importSurfaceMesh(gfx_, path, cfg);
-    boundGridViews_.fill(VK_NULL_HANDLE);
-    boundGridSampler_ = VK_NULL_HANDLE;
-    boundObjectBuffer_ = VK_NULL_HANDLE;
-    boundPaletteBuffer_ = VK_NULL_HANDLE;
+    importRequested_ = true;
   }
   ImGui::SameLine();
   if (ImGui::Button("Remove Imported")) {
-    scene.removeImportedMesh(gfx_);
-    boundGridViews_.fill(VK_NULL_HANDLE);
-    boundGridSampler_ = VK_NULL_HANDLE;
-    boundObjectBuffer_ = VK_NULL_HANDLE;
+    removeImportRequested_ = true;
   }
   ImGui::TextWrapped("%s", scene.importStatus().c_str());
   ImGui::Separator();
@@ -942,12 +1280,7 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
     scene.maxSteps() = static_cast<uint32_t>(maxSteps);
   }
   if (rebuild) {
-    scene.rebuildVoxels(gfx_);
-    boundGridViews_.fill(VK_NULL_HANDLE);
-    boundGridSampler_ = VK_NULL_HANDLE;
-    boundBrickSlabs_.fill(VK_NULL_HANDLE);
-    boundBrickSlabCount_ = 0;
-    boundObjectBuffer_ = VK_NULL_HANDLE;
+    rebuildRequested_ = true;
   }
   ImGui::End();
 

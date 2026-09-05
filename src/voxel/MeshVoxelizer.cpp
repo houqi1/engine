@@ -502,6 +502,18 @@ MeshVoxelizeResult MeshVoxelizerGpu::voxelizeObjSurface(GfxDevice& gfx, const st
     vkCmdCopyBuffer(cmd, seedBuf.buffer, seedRead.buffer, 1, &seedCopy);
   });
 
+  if (vmaInvalidateAllocation(gfx.allocator(), occRead.allocation, 0, fineBytes) != VK_SUCCESS ||
+      vmaInvalidateAllocation(gfx.allocator(), seedRead.allocation, 0, sampleBytes) != VK_SUCCESS) {
+    gfx.destroyBuffer(triBuf);
+    gfx.destroyBuffer(occBuf);
+    gfx.destroyBuffer(seedBuf);
+    gfx.destroyBuffer(occRead);
+    gfx.destroyBuffer(seedRead);
+    TextureFactory::destroy(gfx, albedo);
+    out.error = "Failed to invalidate voxelize readback memory";
+    return out;
+  }
+
   std::vector<uint32_t> fineBits(fineWords);
   std::memcpy(fineBits.data(), occRead.info.pMappedData, static_cast<size_t>(fineBytes));
   const auto* sampleWords = static_cast<const uint32_t*>(seedRead.info.pMappedData);

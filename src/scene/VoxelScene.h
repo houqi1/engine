@@ -132,6 +132,7 @@ public:
   uint32_t brickSlabCount() const { return static_cast<uint32_t>(slabs_.size()); }
   const AllocatedBuffer& brickSlabBuffer(uint32_t i) const { return slabs_[i].gpu; }
   uint32_t objectCount() const { return static_cast<uint32_t>(objectsGpu_.size()); }
+  uint32_t objectFlags(uint32_t i) const { return objectsGpu_.at(i).flags; }
 
   uint32_t voxelCount() const;
   uint32_t occupiedCount() const { return occupiedCount_; }
@@ -265,6 +266,7 @@ private:
 
   std::vector<VoxelObject> objects_;
   std::vector<GpuVoxelObject> objectsGpu_;
+  std::vector<GpuVoxelObject> uploadedObjectsGpu_;
   std::vector<uint32_t> occMipCpu_;
   std::vector<BrickSlab> slabs_;
   std::vector<uint32_t> freePages_;

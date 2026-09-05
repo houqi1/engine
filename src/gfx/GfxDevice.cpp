@@ -4,6 +4,7 @@
 #include <vk_mem_alloc.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -219,6 +220,28 @@ void GfxDevice::selectDevice() {
   deviceName_ = physicalDevice_.properties.deviceName ? physicalDevice_.properties.deviceName
                                                        : "Unknown GPU";
 
+  const char* portableBricksEnv = std::getenv("VE_VOXEL_PORTABLE_BRICKS");
+  const bool forcePortableBricks = portableBricksEnv && std::strcmp(portableBricksEnv, "1") == 0;
+  VkPhysicalDeviceVulkan12Features optionalFeatures12{};
+  optionalFeatures12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+  optionalFeatures12.shaderStorageBufferArrayNonUniformIndexing = VK_TRUE;
+  // Query the selected GPU and extend vkb's enable chain only if supported.
+  // Keep this out of the selector's required features so the portable path still works.
+  storageBufferNonUniformIndexing_ = !forcePortableBricks &&
+      physicalDevice_.enable_extension_features_if_present(optionalFeatures12);
+
+  const char* pipelineStatsEnv = std::getenv("VE_VOXEL_PIPELINE_STATS");
+  const bool requestPipelineStats = pipelineStatsEnv && std::strcmp(pipelineStatsEnv, "1") == 0;
+  if (requestPipelineStats) {
+    VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR optionalPipelineStats{};
+    optionalPipelineStats.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR;
+    optionalPipelineStats.pipelineExecutableInfo = VK_TRUE;
+    pipelineExecutableStatisticsEnabled_ = physicalDevice_.enable_extension_if_present(
+        VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME) &&
+        physicalDevice_.enable_extension_features_if_present(optionalPipelineStats);
+  }
+
   {
     const VkSampleCountFlags supported =
         physicalDevice_.properties.limits.framebufferColorSampleCounts &
@@ -252,11 +275,22 @@ void GfxDevice::selectDevice() {
 
   std::cout << "Using GPU: " << deviceName_ << std::endl;
   std::cout << "MSAA samples: " << static_cast<uint32_t>(msaaSamples_) << std::endl;
+  const char* brickBackend = storageBufferNonUniformIndexing_ ? "nonuniform indexed" : "portable";
+  const char* brickOverride = forcePortableBricks ? " (VE_VOXEL_PORTABLE_BRICKS=1)" : "";
+  std::cout << "Voxel brick backend: " << brickBackend << brickOverride << std::endl;
+  if (requestPipelineStats) {
+    std::cout << "[VoxelPipelineStats] "
+              << (pipelineExecutableStatisticsEnabled_
+                      ? "enabled"
+                      : "unavailable: extension or pipelineExecutableInfo unsupported")
+              << std::endl;
+  }
   {
     std::ofstream log("vulkan_engine.log", std::ios::app);
     if (log) {
       log << "Using GPU: " << deviceName_ << '\n';
       log << "MSAA samples: " << static_cast<uint32_t>(msaaSamples_) << '\n';
+      log << "Voxel brick backend: " << brickBackend << brickOverride << '\n';
     }
   }
 }
@@ -448,7 +482,9 @@ void GfxDevice::endFrame(const FrameContext& frameCtx) {
   vkEndCommandBuffer(frameCtx.cmd);
 
   VkSemaphore renderFinished = renderFinishedSemaphores_[frameCtx.imageIndex];
-  VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+  // Voxel rendering blits first; raster rendering uses a color attachment.
+  VkPipelineStageFlags waitStage =
+      VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
 
   VkSubmitInfo submitInfo{};
   submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -563,13 +599,42 @@ void GfxDevice::uploadToBuffer(AllocatedBuffer& dst, const void* data, VkDeviceS
   AllocatedBuffer staging =
       createBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
   std::memcpy(staging.info.pMappedData, data, static_cast<size_t>(size));
+  if (vmaFlushAllocation(allocator_, staging.allocation, 0, size) != VK_SUCCESS) {
+    destroyBuffer(staging);
+    fail("Failed to flush buffer upload staging memory");
+  }
 
   immediateSubmit([&](VkCommandBuffer cmd) {
+    // Order shared-buffer users before the overwrite, including earlier submissions.
+    VkBufferMemoryBarrier2 barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
+    barrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    barrier.srcAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+    barrier.dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    barrier.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.buffer = dst.buffer;
+    barrier.offset = dstOffset;
+    barrier.size = size;
+    VkDependencyInfo dependency{};
+    dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dependency.bufferMemoryBarrierCount = 1;
+    dependency.pBufferMemoryBarriers = &barrier;
+    vkCmdPipelineBarrier2(cmd, &dependency);
+
     VkBufferCopy copy{};
     copy.srcOffset = 0;
     copy.dstOffset = dstOffset;
     copy.size = size;
     vkCmdCopyBuffer(cmd, staging.buffer, dst.buffer, 1, &copy);
+
+    // A host fence wait alone does not make transfer writes visible to GPU consumers.
+    barrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    barrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    barrier.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+    vkCmdPipelineBarrier2(cmd, &dependency);
   });
 
   destroyBuffer(staging);
@@ -754,6 +819,10 @@ void GfxDevice::uploadToImage(AllocatedImage& image, const void* data, VkDeviceS
   AllocatedBuffer staging =
       createBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
   std::memcpy(staging.info.pMappedData, data, static_cast<size_t>(size));
+  if (vmaFlushAllocation(allocator_, staging.allocation, 0, size) != VK_SUCCESS) {
+    destroyBuffer(staging);
+    fail("Failed to flush image upload staging memory");
+  }
 
   const uint32_t mipLevels = std::max(1u, image.mipLevels);
   generateMips = generateMips && mipLevels > 1;
@@ -845,6 +914,10 @@ void GfxDevice::uploadToImage3D(AllocatedImage& image, const void* data, VkDevic
   AllocatedBuffer staging =
       createBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
   std::memcpy(staging.info.pMappedData, data, static_cast<size_t>(size));
+  if (vmaFlushAllocation(allocator_, staging.allocation, 0, size) != VK_SUCCESS) {
+    destroyBuffer(staging);
+    fail("Failed to flush 3D image upload staging memory");
+  }
 
   const VkImageLayout oldLayout = image.layout;
   const bool fromUndefined = oldLayout == VK_IMAGE_LAYOUT_UNDEFINED;
@@ -977,6 +1050,10 @@ void GfxDevice::uploadCubemapRGBA32F(AllocatedImage& image, const float* data) {
   AllocatedBuffer staging = createBuffer(totalFloats * sizeof(float), VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                                          VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
   std::memcpy(staging.info.pMappedData, data, static_cast<size_t>(totalFloats * sizeof(float)));
+  if (vmaFlushAllocation(allocator_, staging.allocation, 0, totalFloats * sizeof(float)) != VK_SUCCESS) {
+    destroyBuffer(staging);
+    fail("Failed to flush cubemap upload staging memory");
+  }
 
   std::vector<VkBufferImageCopy> regions;
   regions.reserve(mipLevels * 6u);

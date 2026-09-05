@@ -1,12 +1,12 @@
 @echo off
 setlocal
 set "ROOT=%~dp0"
-set "EXE=%ROOT%build\Debug\vulkan_engine_voxel.exe"
-set "DIR=%ROOT%build\Debug"
+set "EXE=%ROOT%build\Release\vulkan_engine_voxel.exe"
+set "DIR=%ROOT%build\Release"
 
 if not exist "%EXE%" (
   echo [ERROR] Not found: %EXE%
-  echo Build the project first.
+  echo Build first: cmake --build build --config Release --target vulkan_engine_voxel --parallel
   pause
   exit /b 1
 )

@@ -113,6 +113,7 @@ void VoxelScene::cleanup(GfxDevice& gfx) {
   TextureFactory::destroy(gfx, sky_);
   objects_.clear();
   objectsGpu_.clear();
+  uploadedObjectsGpu_.clear();
   occMipCpu_.clear();
   slabs_.clear();
   freePages_.clear();
@@ -702,8 +703,9 @@ void VoxelScene::fillGpuObjectRecords() {
       continue;
     }
     GpuVoxelObject g{};
-    writeMat4(g.worldToObject, o.worldToObject());
-    writeMat4(g.objectToWorld, o.objectToWorld());
+    const glm::mat4 objectToWorld = o.objectToWorld();
+    writeMat4(g.worldToObject, glm::inverse(objectToWorld));
+    writeMat4(g.objectToWorld, objectToWorld);
     g.voxelSize = o.voxelSize;
     g._pad0[0] = g._pad0[1] = g._pad0[2] = 0.0f;
     g.gridSize[0] = static_cast<uint32_t>(o.gridSize);
@@ -822,6 +824,10 @@ void VoxelScene::ensureGpuBuffers(GfxDevice& gfx) {
     }
   }
   if (objectBuffer_.buffer == VK_NULL_HANDLE || objectBuffer_.size < objectBytes) {
+    uploadedObjectsGpu_.clear();
+    if (objectBuffer_.buffer != VK_NULL_HANDLE) {
+      gfx.waitIdle();
+    }
     gfx.destroyBuffer(objectBuffer_);
     objectBuffer_ = gfx.createBuffer(objectBytes,
                                      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
@@ -876,20 +882,28 @@ void VoxelScene::flushObject(GfxDevice& gfx, int objectIndex) {
   uploadGridImage(gfx, static_cast<uint32_t>(objectIndex));
   flushDirtyPages(gfx);
   uploadOccMip(gfx);
-  if (!objectsGpu_.empty()) {
-    gfx.uploadToBuffer(objectBuffer_, objectsGpu_.data(),
-                       sizeof(GpuVoxelObject) * objectsGpu_.size());
-  }
+  uploadObjectTransforms(gfx);
 }
 
 void VoxelScene::uploadObjectTransforms(GfxDevice& gfx) {
   fillGpuObjectRecords();
   if (objectsGpu_.empty()) {
+    uploadedObjectsGpu_.clear();
     return;
   }
+  const size_t objectBytes = sizeof(GpuVoxelObject) * objectsGpu_.size();
+  if (objectBuffer_.buffer != VK_NULL_HANDLE &&
+      uploadedObjectsGpu_.size() == objectsGpu_.size() &&
+      std::memcmp(uploadedObjectsGpu_.data(), objectsGpu_.data(), objectBytes) == 0) {
+    return;
+  }
+
+  // The buffer is shared by all frames; only unchanged records can avoid the wait.
+  uploadedObjectsGpu_.clear();
+  gfx.waitIdle();
   ensureGpuBuffers(gfx);
-  gfx.uploadToBuffer(objectBuffer_, objectsGpu_.data(),
-                     sizeof(GpuVoxelObject) * objectsGpu_.size());
+  gfx.uploadToBuffer(objectBuffer_, objectsGpu_.data(), objectBytes);
+  uploadedObjectsGpu_ = objectsGpu_;
 }
 
 void VoxelScene::buildGroundObject(VoxelObject& o) {
@@ -960,6 +974,9 @@ void VoxelScene::buildSpinnerObject(VoxelObject& o) {
 }
 
 void VoxelScene::rebuildVoxels(GfxDevice& gfx) {
+  // Static frames no longer drain the queue through an object upload.
+  gfx.waitIdle();
+  uploadedObjectsGpu_.clear();
   const int n = std::clamp(gridSize_, 8, 64);
   gridSize_ = n;
   maxSteps_ = static_cast<uint32_t>(std::max(16, n * 3));
@@ -1001,10 +1018,7 @@ void VoxelScene::uploadWorldAndObjects(GfxDevice& gfx) {
     uploadGridImage(gfx, i);
   }
   uploadOccMip(gfx);
-  if (!objectsGpu_.empty() && objectBuffer_.buffer != VK_NULL_HANDLE) {
-    gfx.uploadToBuffer(objectBuffer_, objectsGpu_.data(),
-                       sizeof(GpuVoxelObject) * objectsGpu_.size());
-  }
+  uploadObjectTransforms(gfx);
 }
 
 uint32_t VoxelScene::stampMeshIntoWorld(const MeshVoxelizeResult& r, bool sampleColor) {

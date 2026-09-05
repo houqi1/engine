@@ -103,6 +103,9 @@ public:
   bool swapchainWasRecreated() const { return swapchainRecreated_; }
   void clearSwapchainRecreatedFlag() { swapchainRecreated_ = false; }
   const std::string& deviceName() const { return deviceName_; }
+  // True only when the optional feature is enabled on the logical device.
+  bool storageBufferNonUniformIndexing() const { return storageBufferNonUniformIndexing_; }
+  bool pipelineExecutableStatisticsEnabled() const { return pipelineExecutableStatisticsEnabled_; }
   // Preferred MSAA for scene color/depth (4x when supported, else 2x/1x).
   VkSampleCountFlagBits msaaSamples() const { return msaaSamples_; }
 
@@ -134,6 +137,8 @@ private:
   vkb::PhysicalDevice physicalDevice_{};
   vkb::Device device_{};
   std::string deviceName_;
+  bool storageBufferNonUniformIndexing_ = false;
+  bool pipelineExecutableStatisticsEnabled_ = false;
   VkSampleCountFlagBits msaaSamples_ = VK_SAMPLE_COUNT_1_BIT;
   VkQueue graphicsQueue_ = VK_NULL_HANDLE;
   uint32_t graphicsQueueFamily_ = 0;

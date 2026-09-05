@@ -1,4 +1,4 @@
-$log = 'C:\Users\win11\engine\build\Debug\voxel_launch.log'
+$log = 'C:\Users\win11\engine\build\Release\voxel_launch.log'
 function Log([string]$msg) {
   $line = ('[{0}] {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $msg)
   Add-Content -Path $log -Value $line -Encoding UTF8
@@ -6,7 +6,7 @@ function Log([string]$msg) {
 
 try {
   $root = 'C:\Users\win11\engine'
-  $dir = Join-Path $root 'build\Debug'
+  $dir = Join-Path $root 'build\Release'
   $exe = Join-Path $dir 'vulkan_engine_voxel.exe'
   $sdkBin = 'C:\VulkanSDK\1.4.357.0\Bin'
 

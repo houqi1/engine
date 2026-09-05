@@ -163,7 +163,7 @@ foreach(SHADER ${VE_SHADER_SOURCES})
     add_custom_command(
       OUTPUT ${SPV}
       COMMAND ${GLSLC} -O -I ${VE_SHADER_SOURCE_DIR} ${SRC} -o ${SPV}
-      DEPENDS ${SRC} ${VE_SHADER_SOURCE_DIR}/dir_mask_lut.glsl
+      DEPENDS ${SRC} ${VE_SHADER_SOURCE_DIR}/dir_mask_lut.glsl ${VE_SHADER_SOURCE_DIR}/voxel_beam.glsl ${VE_SHADER_SOURCE_DIR}/voxel_ao.glsl
       COMMENT "Compiling shader ${SHADER}"
       VERBATIM
     )
@@ -186,6 +186,16 @@ foreach(SHADER ${VE_SHADER_SOURCES})
   endif()
   list(APPEND VE_SPV_FILES ${SPV})
 endforeach()
+
+set(VE_INDEXED_SPV ${VE_SHADER_OUTPUT_DIR}/voxel_dda_indexed.comp.spv)
+add_custom_command(
+  OUTPUT ${VE_INDEXED_SPV}
+  COMMAND ${GLSLC} -O -DVE_NONUNIFORM_BRICKS=1 --target-env=vulkan1.2 -I ${VE_SHADER_SOURCE_DIR} ${VE_SHADER_SOURCE_DIR}/voxel_dda.comp -o ${VE_INDEXED_SPV}
+  DEPENDS ${VE_SHADER_SOURCE_DIR}/voxel_dda.comp ${VE_SHADER_SOURCE_DIR}/dir_mask_lut.glsl ${VE_SHADER_SOURCE_DIR}/voxel_beam.glsl ${VE_SHADER_SOURCE_DIR}/voxel_ao.glsl
+  COMMENT "Compiling shader voxel_dda_indexed.comp"
+  VERBATIM
+)
+list(APPEND VE_SPV_FILES ${VE_INDEXED_SPV})
 
 set(VE_SLIM_SPV ${VE_SHADER_OUTPUT_DIR}/voxel_dda_slim.comp.spv)
 add_custom_command(

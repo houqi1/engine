@@ -6,15 +6,42 @@
 
 #include <array>
 #include <cstdint>
+#include <string>
+#include <vector>
 
 class VoxelRenderer {
 public:
+  struct BenchmarkSettings {
+    bool beam = true;
+    bool brickSkip = true;
+    bool dirBrick = true;
+    bool dirCoarse = true;
+    uint32_t stage = 0;
+  };
+
+  struct GpuTiming {
+    uint64_t submission = 0;  // Zero-based rendered submission, including warmup.
+    double totalMs = 0.0;
+    double beamMs = 0.0;
+    double mainMs = 0.0;
+    double computeMs = 0.0;
+    double blitMs = 0.0;
+    double uiMs = 0.0;
+  };
+
   explicit VoxelRenderer(GfxDevice& gfx);
   ~VoxelRenderer();
 
+  // Configure before init; the normal UI is rendered but cannot change the scene.
+  void configureBenchmark(const BenchmarkSettings& settings, uint32_t warmup, uint32_t frames);
   void init(VoxelScene& scene);
   void resize();
-  void draw(VoxelScene& scene, float displayFps);
+  bool draw(VoxelScene& scene, float displayFps);
+  std::vector<GpuTiming> finishBenchmark();
+  float beamMargin() const { return beamMargin_; }
+  const char* activeKernelName() const { return activeKernelName_; }
+  // P6 RGB bytes from the pre-UI RGBA8 output, without gamma conversion or alpha.
+  void capturePpm(const std::string& path);
 
 private:
   // Must match shaders/voxel_dda.comp std140 layout.
@@ -75,6 +102,11 @@ private:
     uint32_t beamPass = 0;
     uint32_t enableNested = 1;
     uint32_t enableShade = 1;
+    uint32_t shadedOnly = 0;
+    uint32_t singleObject = 0;
+    uint32_t groupHeight = 8;
+    uint32_t fineOnly = 0;
+    uint32_t colorMode = 2;
   };
 
   void createDescriptors();
@@ -101,9 +133,14 @@ private:
 
   VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
   VkPipeline computePipeline_ = VK_NULL_HANDLE;
+  VkPipeline specializedFullPipeline_ = VK_NULL_HANDLE;
+  VkPipeline specializedSinglePipeline_ = VK_NULL_HANDLE;
+  VkPipeline specializedColorPipeline_ = VK_NULL_HANDLE;
   VkPipeline slimPipeline_ = VK_NULL_HANDLE;
   VkPipeline coarsePipeline_ = VK_NULL_HANDLE;
   VkPipeline beamPipeline_ = VK_NULL_HANDLE;
+  bool forceGenericShader_ = false;
+  const char* activeKernelName_ = "Not rendered";
 
   AllocatedImage outImage_{};
   AllocatedImage beamImage_{};
@@ -122,17 +159,27 @@ private:
   VkImageView boundSkyView_ = VK_NULL_HANDLE;
   VkImageView boundBeamView_ = VK_NULL_HANDLE;
   bool imguiReady_ = false;
+  bool importRequested_ = false;
+  bool removeImportRequested_ = false;
+  bool rebuildRequested_ = false;
   float displayFps_ = 0.0f;
   int traceStage_ = 0;
   bool brickBitSkip_ = true;
   bool dirMaskBrick_ = true;
   bool dirMaskCoarse_ = true;
   bool beamSkip_ = true;
-  float beamMargin_ = 5.6f;  // 16 coarse cells * 0.35 m, voxelG one-tile pad
+  float beamMargin_ = 0.001f;  // Additional world-space roundoff guard for certified prefixes.
 
   VkQueryPool timestampPool_ = VK_NULL_HANDLE;
   float timestampPeriodNs_ = 1.0f;
+  uint64_t timestampMask_ = UINT64_MAX;
   std::array<bool, GfxDevice::kFramesInFlight> timestampPending_{};
+  std::array<uint64_t, GfxDevice::kFramesInFlight> timestampSubmissions_{};
+  uint64_t submittedFrames_ = 0;
+  bool benchmark_ = false;
+  uint32_t benchmarkWarmup_ = 0;
+  uint32_t benchmarkFrames_ = 0;
+  std::vector<GpuTiming> benchmarkTimings_;
   float gpuFrameMs_ = 0.0f;
   float gpuComputeMs_ = 0.0f;
   float gpuBeamMs_ = 0.0f;
