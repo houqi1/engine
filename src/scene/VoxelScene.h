@@ -31,7 +31,7 @@ struct VoxelHit {
   int objectIndex = 0;
 };
 
-// Must match shaders/voxel_dda.comp std430 GpuVoxelObject (176 bytes).
+// Must match shaders/voxel_dda.comp std430 GpuVoxelObject (208 bytes).
 struct GpuVoxelObject {
   float worldToObject[16];
   float objectToWorld[16];
@@ -43,8 +43,12 @@ struct GpuVoxelObject {
   uint32_t occMipOffset;  // 4^3 coarse tiles: two uints (64 Morton bits) each
   uint32_t occMipWords;   // tile count * 2
   uint32_t _pad1;
+  float occMin[3];  // coarse inclusive
+  float _padOccMin;
+  float occMax[3];  // coarse exclusive
+  float _padOccMax;
 };
-static_assert(sizeof(GpuVoxelObject) == 176, "GpuVoxelObject std430 size mismatch");
+static_assert(sizeof(GpuVoxelObject) == 208, "GpuVoxelObject std430 size mismatch");
 
 // Must match shaders/voxel_dda.comp std430 CoarseCell.
 struct CoarseCell {
@@ -73,6 +77,8 @@ struct VoxelObject {
   uint32_t voxelOffset = 0;  // grids[] texture index (0 = world, 1 = spinner)
   uint32_t occMipOffset = 0;
   uint32_t occMipWords = 0;
+  glm::vec3 occMin{0.0f};
+  glm::vec3 occMax{0.0f};
 
   glm::mat4 objectToWorld() const;
   glm::mat4 worldToObject() const;

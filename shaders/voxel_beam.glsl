@@ -52,7 +52,7 @@ float conservativeBeamT(ivec2 beamPixel, ivec2 fullSize) {
     for (uint objectIndex = 0u; objectIndex < ubo.objectCount; ++objectIndex) {
         GpuVoxelObject o = objects[objectIndex];
         if ((o.flags & FLAG_ENABLED) == 0u || o.voxelSize <= 0.0 ||
-            any(equal(o.gridSize, uvec3(0u)))) {
+            any(equal(o.gridSize, uvec3(0u))) || any(greaterThanEqual(o.occMin, o.occMax))) {
             continue;
         }
         // loadCoarseOcc4 uses cubic-grid strides. Unknown layouts cannot certify emptiness.
@@ -69,19 +69,20 @@ float conservativeBeamT(ivec2 beamPixel, ivec2 fullSize) {
         vec3 dMax = direction + extent + directionPad;
         vec3 originPad = vec3(2.0e-4) + roundoff *
             (absolute * abs(ubo.cameraPos) + abs(o.worldToObject[3].xyz)) / o.voxelSize;
-        vec3 bounds = vec3(o.gridSize);
+        vec3 boundsMin = o.occMin;
+        vec3 boundsMax = o.occMax;
         if (!all(lessThan(abs(origin) + originPad + abs(dMin) + abs(dMax), vec3(FLT_MAX)))) {
             return 0.0;
         }
 
         // Necessary overlap inequalities for the entire beam at s >= 0:
-        // origin + originPad + s*dMax >= 0, origin - originPad + s*dMin <= bounds.
+        // origin + originPad + s*dMax >= occMin, origin - originPad + s*dMin <= occMax.
         float enter = 0.0;
         float exit = safeDepth;
         bool misses = false;
         for (int axis = 0; axis < 3; ++axis) {
-            float lower = -origin[axis] - originPad[axis];
-            float upper = bounds[axis] - origin[axis] + originPad[axis];
+            float lower = boundsMin[axis] - origin[axis] - originPad[axis];
+            float upper = boundsMax[axis] - origin[axis] + originPad[axis];
             if (dMax[axis] > 0.0) {
                 enter = max(enter, lower / dMax[axis]);
             } else if (dMax[axis] < 0.0) {
@@ -126,19 +127,19 @@ float conservativeBeamT(ivec2 beamPixel, ivec2 fullSize) {
             if (!(b > a)) {
                 break;
             }
-            vec3 pad = originPad + roundoff * (abs(origin) + b * speed + bounds + 1.0);
+            vec3 pad = originPad + roundoff * (abs(origin) + b * speed + boundsMax + 1.0);
             vec3 boxMin = origin + min(a * dMin, b * dMin) - pad;
             vec3 boxMax = origin + max(a * dMax, b * dMax) + pad;
             if (!all(lessThan(abs(boxMin) + abs(boxMax), vec3(FLT_MAX)))) {
                 return 0.0;
             }
-            if (any(lessThan(boxMax, vec3(0.0))) || any(greaterThan(boxMin, bounds))) {
+            if (any(lessThan(boxMax, boundsMin)) || any(greaterThan(boxMin, boundsMax))) {
                 a = b;
                 continue;
             }
             // Inclusive floor after outward padding also keeps boundary-touching cells.
-            ivec3 cellMin = ivec3(clamp(floor(boxMin), vec3(0.0), bounds - 1.0));
-            ivec3 cellMax = ivec3(clamp(floor(boxMax), vec3(0.0), bounds - 1.0));
+            ivec3 cellMin = ivec3(clamp(floor(boxMin), boundsMin, boundsMax - 1.0));
+            ivec3 cellMax = ivec3(clamp(floor(boxMax), boundsMin, boundsMax - 1.0));
             ivec3 tileMin = cellMin >> 2;
             ivec3 tileMax = cellMax >> 2;
             ivec3 span = tileMax - tileMin + 1;

@@ -68,7 +68,7 @@ layout(set = 0, binding = 3, std430) readonly buffer BrickPool {
 
 layout(set = 0, binding = 4) uniform sampler2D skyMap;
 
-// Must match src/scene/VoxelScene.h GpuVoxelObject (176 bytes, std430).
+// Must match src/scene/VoxelScene.h GpuVoxelObject (208 bytes, std430).
 struct GpuVoxelObject {
     mat4 worldToObject;
     mat4 objectToWorld;
@@ -82,6 +82,10 @@ struct GpuVoxelObject {
     uint occMipOffset;  // 4^3 coarse tiles only: two uints (64 Morton bits) each
     uint occMipWords;   // tile count * 2
     uint _pad4;
+    vec3 occMin;  // coarse inclusive
+    float _padOccMin;
+    vec3 occMax;  // coarse exclusive
+    float _padOccMax;
 };
 
 layout(set = 0, binding = 5, std430) readonly buffer ObjectBuffer {
@@ -153,6 +157,10 @@ vec3 sampleSky(vec3 dir) {
 
 bool insideGrid(GpuVoxelObject o, ivec3 p) {
     return all(greaterThanEqual(p, ivec3(0))) && all(lessThan(p, ivec3(o.gridSize)));
+}
+
+bool insideOcc(GpuVoxelObject o, ivec3 p) {
+    return all(greaterThanEqual(p, ivec3(o.occMin))) && all(lessThan(p, ivec3(o.occMax)));
 }
 
 CoarseCell readCell(GpuVoxelObject o, ivec3 p) {
@@ -284,13 +292,13 @@ bvec3 stepMask(vec3 sideDist) {
     return lessThanEqual(sideDist.xyz, min(sideDist.yzx, sideDist.zxy));
 }
 
-// Jump out of an aligned 2^shift box. Returns false if the jump leaves `limit`.
+// Jump out of an aligned 2^shift box. Returns false if the jump leaves [boundsMin, boundsMax).
 bool jumpAlignedBox(inout ivec3 mapPos, inout vec3 sideDist, inout bvec3 mask, vec3 origin,
                     vec3 rd, vec3 invDir, vec3 sgn, vec3 deltaDist, ivec3 rayStep, int shift,
-                    vec3 limit, inout uint steps) {
+                    vec3 boundsMin, vec3 boundsMax, inout uint steps) {
     ivec3 macro = mapPos >> shift;
     vec3 boxMin = vec3(macro << shift);
-    vec3 boxMax = min(boxMin + vec3(float(1 << shift)), limit);
+    vec3 boxMax = min(boxMin + vec3(float(1 << shift)), boundsMax);
     vec3 t0m = (boxMin - origin) * invDir;
     vec3 t1m = (boxMax - origin) * invDir;
     vec3 tLargerM = max(t0m, t1m);
@@ -304,7 +312,9 @@ bool jumpAlignedBox(inout ivec3 mapPos, inout vec3 sideDist, inout bvec3 mask, v
         skipMask = bvec3(false, false, true);
     }
     vec3 newPos = origin + rd * (tExitM + 1e-4);
-    ivec3 newMap = ivec3(clamp(floor(newPos), vec3(0.0), max(limit - vec3(1.0), vec3(0.0))));
+    vec3 lo = boundsMin;
+    vec3 hi = max(boundsMax - vec3(1.0), boundsMin);
+    ivec3 newMap = ivec3(clamp(floor(newPos), lo, hi));
     steps += 1u;
     if (newMap == mapPos || (newMap >> shift) == macro) {
         mask = stepMask(sideDist);
@@ -312,7 +322,7 @@ bool jumpAlignedBox(inout ivec3 mapPos, inout vec3 sideDist, inout bvec3 mask, v
         mapPos += ivec3(vec3(mask)) * rayStep;
         return true;
     }
-    if (any(lessThan(newMap, ivec3(0))) || any(greaterThanEqual(newMap, ivec3(limit)))) {
+    if (any(lessThan(newMap, ivec3(boundsMin))) || any(greaterThanEqual(newMap, ivec3(boundsMax)))) {
         return false;
     }
     mapPos = newMap;
@@ -644,8 +654,12 @@ ObjectHit traverseObject(GpuVoxelObject o, vec3 Ow, vec3 Dw, float tWorldMin, fl
     if (sgn.z == 0.0) sgn.z = 1.0;
     uint oct = dirOctantFromSgn(sgn);
 
-    vec3 boundsMax = vec3(o.gridSize);
-    vec3 t0 = (vec3(0.0) - ro) * invDir;
+    vec3 boundsMin = o.occMin;
+    vec3 boundsMax = o.occMax;
+    if (any(greaterThanEqual(boundsMin, boundsMax))) {
+        return result;
+    }
+    vec3 t0 = (boundsMin - ro) * invDir;
     vec3 t1 = (boundsMax - ro) * invDir;
     vec3 tSmaller = min(t0, t1);
     vec3 tLarger = max(t0, t1);
@@ -659,9 +673,9 @@ ObjectHit traverseObject(GpuVoxelObject o, vec3 Ow, vec3 Dw, float tWorldMin, fl
     }
 
     vec3 pos = ro + rd * (tEnter + 1e-4);
-    ivec3 mapPos = ivec3(clamp(floor(pos), vec3(0.0), boundsMax - vec3(1.0)));
+    ivec3 mapPos = ivec3(clamp(floor(pos), boundsMin, max(boundsMax - vec3(1.0), boundsMin)));
     vec3 gridEntryPos = ro + rd * (gridEnter + 1e-4);
-    ivec3 startPos = ivec3(clamp(floor(gridEntryPos), vec3(0.0), boundsMax - vec3(1.0)));
+    ivec3 startPos = ivec3(clamp(floor(gridEntryPos), boundsMin, max(boundsMax - vec3(1.0), boundsMin)));
 
     vec3 deltaDist = abs(invDir);
     // Keep the same time origin before and after aligned coarse skips.
@@ -698,7 +712,7 @@ ObjectHit traverseObject(GpuVoxelObject o, vec3 Ow, vec3 Dw, float tWorldMin, fl
 
     for (uint i = 0u; i < ubo.maxSteps; ++i) {
         steps += 1u;
-        if (!insideGrid(o, mapPos)) {
+        if (!insideOcc(o, mapPos) || !insideGrid(o, mapPos)) {
             break;
         }
 
@@ -767,7 +781,7 @@ ObjectHit traverseObject(GpuVoxelObject o, vec3 Ow, vec3 Dw, float tWorldMin, fl
             int skipShift = coarseSkipShift(o, mapPos, oct);
             if (skipShift >= 0) {
                 if (!jumpAlignedBox(mapPos, sideDist, mask, ro, rd, invDir, sgn, deltaDist, rayStep,
-                                    skipShift, boundsMax, steps)) {
+                                    skipShift, boundsMin, boundsMax, steps)) {
                     break;
                 }
                 continue;
@@ -780,9 +794,13 @@ ObjectHit traverseObject(GpuVoxelObject o, vec3 Ow, vec3 Dw, float tWorldMin, fl
     }
 
     result.steps = steps;
+    if (hit) {
+        vec3 hitLocalMeters = (ro + rd * tHitLocal) * o.voxelSize;
+        vec3 hitWorld = (o.objectToWorld * vec4(hitLocalMeters, 1.0)).xyz;
+        result.tWorld = dot(hitWorld - Ow, Dw);
+        result.hit = true;
+    }
     if (RENDER_MODE == MODE_STEPS) {
-        result.hit = hit;
-        result.tWorld = hit ? tHitLocal : FLT_MAX;
         result.color = stepsToColor(steps);
         return result;
     }
@@ -793,11 +811,6 @@ ObjectHit traverseObject(GpuVoxelObject o, vec3 Ow, vec3 Dw, float tWorldMin, fl
         usedMicro = true;
         usedFine = true;
     }
-
-    vec3 hitLocalMeters = (ro + rd * tHitLocal) * o.voxelSize;
-    vec3 hitWorld = (o.objectToWorld * vec4(hitLocalMeters, 1.0)).xyz;
-    result.tWorld = dot(hitWorld - Ow, Dw);
-    result.hit = true;
 
     if (kEnableShade == 0u ||
         ((SOLID_COLOR != 0u || TRACE_STAGE >= STAGE_NO_SHADE) &&
@@ -889,24 +902,21 @@ void main() {
     }
 
     vec3 color = vec3(0.0);
-    float bestT = FLT_MAX;
+    float bestT = t1;
     uint bestSteps = 0u;
     bool anyHit = false;
 
     for (uint i = 0u; i < ubo.objectCount; ++i) {
         ObjectHit h = traverseObject(objects[i], ubo.cameraPos, dir, t0, t1);
         bestSteps = max(bestSteps, h.steps);
-        if (RENDER_MODE == MODE_STEPS) {
-            // Keep max steps visualization across objects.
-            color = stepsToColor(bestSteps);
-            anyHit = anyHit || h.hit;
-            continue;
-        }
         if (h.hit && h.tWorld < bestT) {
             bestT = h.tWorld;
             color = h.color;
             anyHit = true;
         }
+    }
+    if (RENDER_MODE == MODE_STEPS) {
+        color = stepsToColor(bestSteps);
     }
 
     if (!anyHit && RENDER_MODE != MODE_STEPS) {

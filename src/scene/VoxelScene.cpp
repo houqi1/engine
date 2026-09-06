@@ -636,8 +636,12 @@ void VoxelScene::fillCoarseDirTiles() {
   occMipCpu_.clear();
   for (VoxelObject& o : objects_) {
     o.occMipOffset = static_cast<uint32_t>(occMipCpu_.size());
+    o.occMin = glm::vec3(0.0f);
+    o.occMax = glm::vec3(0.0f);
     const int n = o.gridSize;
     const int tileN = (n + 3) / 4;
+    glm::ivec3 occMn(n);
+    glm::ivec3 occMx(-1);
     occMipCpu_.reserve(occMipCpu_.size() +
                        static_cast<size_t>(tileN) * static_cast<size_t>(tileN) *
                            static_cast<size_t>(tileN) * 2u);
@@ -659,6 +663,8 @@ void VoxelScene::fillCoarseDirTiles() {
                 if (o.cells[idx].material == 0u) {
                   continue;
                 }
+                occMn = glm::min(occMn, glm::ivec3(x, y, z));
+                occMx = glm::max(occMx, glm::ivec3(x, y, z));
                 const uint32_t bit = microBitIndex(glm::ivec3(lx, ly, lz));
                 if (bit < 32u) {
                   lo |= 1u << bit;
@@ -672,6 +678,10 @@ void VoxelScene::fillCoarseDirTiles() {
           occMipCpu_.push_back(hi);
         }
       }
+    }
+    if (occMx.x >= occMn.x) {
+      o.occMin = glm::vec3(occMn);
+      o.occMax = glm::vec3(occMx + 1);
     }
     o.occMipWords = static_cast<uint32_t>(occMipCpu_.size()) - o.occMipOffset;
   }
@@ -735,6 +745,14 @@ void VoxelScene::fillGpuObjectRecords() {
     g.occMipOffset = o.occMipOffset;
     g.occMipWords = o.occMipWords;
     g._pad1 = 0;
+    g.occMin[0] = o.occMin.x;
+    g.occMin[1] = o.occMin.y;
+    g.occMin[2] = o.occMin.z;
+    g._padOccMin = 0.0f;
+    g.occMax[0] = o.occMax.x;
+    g.occMax[1] = o.occMax.y;
+    g.occMax[2] = o.occMax.z;
+    g._padOccMax = 0.0f;
     objectsGpu_.push_back(g);
   }
 }
@@ -1571,8 +1589,12 @@ std::optional<VoxelScene::PickResult> VoxelScene::pickObject(const VoxelObject& 
   const glm::vec3 sgn(rd.x >= 0.0f ? 1.0f : -1.0f, rd.y >= 0.0f ? 1.0f : -1.0f,
                       rd.z >= 0.0f ? 1.0f : -1.0f);
 
-  const glm::vec3 boundsMax(static_cast<float>(o.gridSize));
-  const glm::vec3 t0 = (glm::vec3(0.0f) - ro) * invDir;
+  if (o.occMax.x <= o.occMin.x && o.occMax.y <= o.occMin.y && o.occMax.z <= o.occMin.z) {
+    return std::nullopt;
+  }
+  const glm::vec3 boundsMin = o.occMin;
+  const glm::vec3 boundsMax = o.occMax;
+  const glm::vec3 t0 = (boundsMin - ro) * invDir;
   const glm::vec3 t1 = (boundsMax - ro) * invDir;
   const glm::vec3 tSmaller = glm::min(t0, t1);
   const glm::vec3 tLarger = glm::max(t0, t1);
@@ -1583,8 +1605,8 @@ std::optional<VoxelScene::PickResult> VoxelScene::pickObject(const VoxelObject& 
   }
 
   glm::vec3 pos = ro + rd * (tEnter + 1e-4f);
-  glm::ivec3 mapPos =
-      glm::clamp(glm::ivec3(glm::floor(pos)), glm::ivec3(0), glm::ivec3(o.gridSize - 1));
+  glm::ivec3 mapPos = glm::clamp(glm::ivec3(glm::floor(pos)), glm::ivec3(boundsMin),
+                                 glm::ivec3(boundsMax) - 1);
   const glm::ivec3 startPos = mapPos;
   const glm::vec3 deltaDist = glm::abs(invDir);
   glm::vec3 sideDist = (sgn * (glm::vec3(mapPos) - pos) + (sgn * 0.5f + 0.5f)) * deltaDist;
@@ -1622,8 +1644,11 @@ std::optional<VoxelScene::PickResult> VoxelScene::pickObject(const VoxelObject& 
     return PickResult{hit, tWorld};
   };
 
+  const glm::ivec3 occLo(boundsMin);
+  const glm::ivec3 occHi(boundsMax);
   for (uint32_t i = 0; i < std::max(maxSteps_, 1u); ++i) {
-    if (!inBounds(o, mapPos)) {
+    if (!inBounds(o, mapPos) || glm::any(glm::lessThan(mapPos, occLo)) ||
+        glm::any(glm::greaterThanEqual(mapPos, occHi))) {
       break;
     }
 

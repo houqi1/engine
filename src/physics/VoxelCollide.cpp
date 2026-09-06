@@ -115,17 +115,9 @@ void considerContact(const VoxelScene& scene, const RigidBody& a, const RigidBod
 
 void testList(const VoxelScene& scene, const RigidBody& a, const RigidBody& b,
               const VoxelObject& oa, const VoxelObject& ob, const ShapeClass& ca,
-              const std::vector<uint32_t>& ids, const glm::vec3& interMn, const glm::vec3& interMx,
-              std::vector<Contact>& out) {
-  const float s = fineSize(oa);
+              const std::vector<uint32_t>& ids, std::vector<Contact>& out) {
   for (uint32_t id : ids) {
-    const glm::ivec3 p = unpackFine(id, ca.fineN);
-    const glm::vec3 worldP = glm::vec3(oa.objectToWorld() * glm::vec4(fineCenterLocal(oa, p), 1.0f));
-    if (worldP.x + s < interMn.x || worldP.x - s > interMx.x || worldP.y + s < interMn.y ||
-        worldP.y - s > interMx.y || worldP.z + s < interMn.z || worldP.z - s > interMx.z) {
-      continue;
-    }
-    considerContact(scene, a, b, oa, ob, p, out);
+    considerContact(scene, a, b, oa, ob, unpackFine(id, ca.fineN), out);
   }
 }
 
@@ -169,20 +161,24 @@ void collidePair(VoxelScene& scene, const RigidBody& a, const RigidBody& b, cons
       !worldAabb(scene, b.shapeIndex, cb, bmn, bmx)) {
     return;
   }
+  const VoxelObject& oa = scene.cpuObject(a.shapeIndex);
+  const VoxelObject& ob = scene.cpuObject(b.shapeIndex);
+  // 6-neighbor probe sees one fine cell outside the occupancy AABB.
+  const float pad = std::max(fineSize(oa), fineSize(ob));
+  amn -= pad;
+  amx += pad;
+  bmn -= pad;
+  bmx += pad;
   if (amn.x > bmx.x || amx.x < bmn.x || amn.y > bmx.y || amx.y < bmn.y || amn.z > bmx.z ||
       amx.z < bmn.z) {
     return;
   }
-  const glm::vec3 interMn = glm::max(amn, bmn);
-  const glm::vec3 interMx = glm::min(amx, bmx);
-  const VoxelObject& oa = scene.cpuObject(a.shapeIndex);
-  const VoxelObject& ob = scene.cpuObject(b.shapeIndex);
   const size_t before = out.size();
   if (a.invM > 0.0f) {
-    testList(scene, a, b, oa, ob, ca, ca.corners, interMn, interMx, out);
+    testList(scene, a, b, oa, ob, ca, ca.corners, out);
   }
   if (b.invM > 0.0f) {
-    testList(scene, b, a, ob, oa, cb, cb.corners, interMn, interMx, out);
+    testList(scene, b, a, ob, oa, cb, cb.corners, out);
   }
   if (out.size() - before > static_cast<size_t>(kMaxContactsPerPair)) {
     std::partial_sort(out.begin() + static_cast<std::ptrdiff_t>(before),

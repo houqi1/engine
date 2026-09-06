@@ -52,6 +52,10 @@ struct GpuVoxelObject {
     uint occMipOffset;
     uint occMipWords;
     uint _pad4;
+    vec3 occMin;
+    float _padOccMin;
+    vec3 occMax;
+    float _padOccMax;
 };
 
 layout(set = 0, binding = 5, std430) readonly buffer ObjectBuffer {
@@ -136,10 +140,10 @@ int coarseSkipShift(GpuVoxelObject o, ivec3 mapPos, uint oct) {
 
 bool jumpAlignedBox(inout ivec3 mapPos, inout vec3 sideDist, inout bvec3 mask, vec3 origin,
                     vec3 rd, vec3 invDir, vec3 sgn, vec3 deltaDist, ivec3 rayStep, int shift,
-                    vec3 limit, inout uint steps) {
+                    vec3 boundsMin, vec3 boundsMax, inout uint steps) {
     ivec3 macro = mapPos >> shift;
     vec3 boxMin = vec3(macro << shift);
-    vec3 boxMax = min(boxMin + vec3(float(1 << shift)), limit);
+    vec3 boxMax = min(boxMin + vec3(float(1 << shift)), boundsMax);
     vec3 t0m = (boxMin - origin) * invDir;
     vec3 t1m = (boxMax - origin) * invDir;
     vec3 tLargerM = max(t0m, t1m);
@@ -153,7 +157,9 @@ bool jumpAlignedBox(inout ivec3 mapPos, inout vec3 sideDist, inout bvec3 mask, v
         skipMask = bvec3(false, false, true);
     }
     vec3 newPos = origin + rd * (tExitM + 1e-4);
-    ivec3 newMap = ivec3(clamp(floor(newPos), vec3(0.0), max(limit - vec3(1.0), vec3(0.0))));
+    vec3 lo = boundsMin;
+    vec3 hi = max(boundsMax - vec3(1.0), boundsMin);
+    ivec3 newMap = ivec3(clamp(floor(newPos), lo, hi));
     steps += 1u;
     if (newMap == mapPos || (newMap >> shift) == macro) {
         mask = stepMask(sideDist);
@@ -161,7 +167,7 @@ bool jumpAlignedBox(inout ivec3 mapPos, inout vec3 sideDist, inout bvec3 mask, v
         mapPos += ivec3(vec3(mask)) * rayStep;
         return true;
     }
-    if (any(lessThan(newMap, ivec3(0))) || any(greaterThanEqual(newMap, ivec3(limit)))) {
+    if (any(lessThan(newMap, ivec3(boundsMin))) || any(greaterThanEqual(newMap, ivec3(boundsMax)))) {
         return false;
     }
     mapPos = newMap;
@@ -178,7 +184,7 @@ struct Hit {
     uint steps;
 };
 
-Hit traceCoarse(GpuVoxelObject o, vec3 Ow, vec3 Dw) {
+Hit traceCoarse(GpuVoxelObject o, vec3 Ow, vec3 Dw, float tWorldMax) {
     Hit result;
     result.hit = false;
     result.tWorld = FLT_MAX;
@@ -204,19 +210,24 @@ Hit traceCoarse(GpuVoxelObject o, vec3 Ow, vec3 Dw) {
     if (sgn.z == 0.0) sgn.z = 1.0;
     uint oct = dirOctantFromSgn(sgn);
 
-    vec3 boundsMax = vec3(o.gridSize);
-    vec3 t0 = (vec3(0.0) - ro) * invDir;
+    vec3 boundsMin = o.occMin;
+    vec3 boundsMax = o.occMax;
+    if (any(greaterThanEqual(boundsMin, boundsMax))) {
+        return result;
+    }
+    vec3 t0 = (boundsMin - ro) * invDir;
     vec3 t1 = (boundsMax - ro) * invDir;
     vec3 tSmaller = min(t0, t1);
     vec3 tLarger = max(t0, t1);
     float tEnter = max(max(tSmaller.x, tSmaller.y), max(tSmaller.z, 0.0));
     float tExit = min(min(tLarger.x, tLarger.y), tLarger.z);
+    tExit = min(tExit, tWorldMax / max(o.voxelSize, 1e-6));
     if (tEnter > tExit) {
         return result;
     }
 
     vec3 pos = ro + rd * (tEnter + 1e-4);
-    ivec3 mapPos = ivec3(clamp(floor(pos), vec3(0.0), boundsMax - vec3(1.0)));
+    ivec3 mapPos = ivec3(clamp(floor(pos), boundsMin, max(boundsMax - vec3(1.0), boundsMin)));
     ivec3 startPos = mapPos;
     vec3 deltaDist = abs(invDir);
     vec3 sideDist = (sgn * (vec3(mapPos) - pos) + (sgn * 0.5 + 0.5)) * deltaDist;
@@ -244,7 +255,8 @@ Hit traceCoarse(GpuVoxelObject o, vec3 Ow, vec3 Dw) {
 
     for (int i = 0; i < MAX_RAY_STEPS; ++i) {
         steps = uint(i + 1);
-        if (any(lessThan(mapPos, ivec3(0))) || any(greaterThanEqual(uvec3(mapPos), o.gridSize))) {
+        if (any(lessThan(mapPos, ivec3(boundsMin))) ||
+            any(greaterThanEqual(mapPos, ivec3(boundsMax)))) {
             break;
         }
 
@@ -268,7 +280,7 @@ Hit traceCoarse(GpuVoxelObject o, vec3 Ow, vec3 Dw) {
         int skipShift = coarseSkipShift(o, mapPos, oct);
         if (skipShift >= 0) {
             if (!jumpAlignedBox(mapPos, sideDist, mask, ro, rd, invDir, sgn, deltaDist, rayStep,
-                                skipShift, boundsMax, steps)) {
+                                skipShift, boundsMin, boundsMax, steps)) {
                 break;
             }
             continue;
@@ -308,7 +320,7 @@ void main() {
     vec3 hitAlbedo = vec3(0.0);
 
     for (uint i = 0u; i < ubo.objectCount; ++i) {
-        Hit h = traceCoarse(objects[i], ubo.cameraPos, dir);
+        Hit h = traceCoarse(objects[i], ubo.cameraPos, dir, FLT_MAX);
         bestSteps = max(bestSteps, h.steps);
         if (h.hit && h.tWorld < bestT) {
             bestT = h.tWorld;
