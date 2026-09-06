@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -29,6 +30,67 @@ void writeVec3(float* dst, const glm::vec3& v) {
   dst[0] = v.x;
   dst[1] = v.y;
   dst[2] = v.z;
+}
+
+void drawCornerNormals(VoxelScene& scene, const glm::mat4& viewProj, ImVec2 display) {
+  std::vector<physics::DebugCornerNormal> corners;
+  scene.gatherCornerNormals(1, 0, corners);
+  ImDrawList* dl = ImGui::GetForegroundDrawList();
+  auto project = [&](const glm::vec3& world, ImVec2& out) -> bool {
+    const glm::vec4 clip = viewProj * glm::vec4(world, 1.0f);
+    if (clip.w <= 1.0e-4f) {
+      return false;
+    }
+    const float iw = 1.0f / clip.w;
+    const float nx = clip.x * iw;
+    const float ny = clip.y * iw;
+    if (nx < -1.2f || nx > 1.2f || ny < -1.2f || ny > 1.2f) {
+      return false;
+    }
+    out.x = (nx * 0.5f + 0.5f) * display.x;
+    out.y = (ny * 0.5f + 0.5f) * display.y;
+    return true;
+  };
+  constexpr float kLen = 1.5f;
+  const float midY = scene.cpuObject(1).position.y;
+  for (int i = 0; i < static_cast<int>(corners.size()); ++i) {
+    const physics::DebugCornerNormal& cn = corners[static_cast<size_t>(i)];
+    ImVec2 a{};
+    if (!project(cn.p, a)) {
+      continue;
+    }
+    const char* tb = cn.p.y < midY ? "bot" : "top";
+    dl->AddCircleFilled(a, 5.0f, IM_COL32(255, 255, 255, 255));
+    if (!cn.hit) {
+      dl->AddCircle(a, 9.0f, IM_COL32(160, 160, 160, 255), 0, 2.0f);
+      char miss[40];
+      std::snprintf(miss, sizeof(miss), "#%d %s miss", i, tb);
+      dl->AddText(ImVec2(a.x + 8.0f, a.y - 8.0f), IM_COL32(180, 180, 180, 255), miss);
+      continue;
+    }
+    ImVec2 b{};
+    if (!project(cn.p + cn.n * kLen, b)) {
+      continue;
+    }
+    const ImU32 col = cn.n.y >= 0.5f ? IM_COL32(50, 255, 80, 255)
+                    : (cn.n.y <= -0.2f ? IM_COL32(255, 50, 50, 255) : IM_COL32(255, 220, 40, 255));
+    dl->AddLine(a, b, col, 3.0f);
+    dl->AddCircleFilled(b, 4.0f, col);
+    char buf[112];
+    std::snprintf(buf, sizeof(buf), "#%d %s n=(%.2f,%.2f,%.2f) d=%.3f", i, tb, cn.n.x, cn.n.y,
+                  cn.n.z, cn.d);
+    dl->AddText(ImVec2(b.x + 6.0f, b.y - 8.0f), col, buf);
+  }
+  // Magenta = contacts the solver actually used (may differ from the 8 probes).
+  for (const physics::Contact& c : scene.physicsDebug().lastContacts) {
+    ImVec2 a{};
+    ImVec2 b{};
+    if (!project(c.p, a) || !project(c.p + c.n * (kLen * 0.7f), b)) {
+      continue;
+    }
+    dl->AddLine(a, b, IM_COL32(255, 80, 255, 255), 5.0f);
+    dl->AddCircleFilled(a, 7.0f, IM_COL32(255, 80, 255, 220));
+  }
 }
 
 void printPipelineExecutableStatistics(VkDevice device, VkPipeline pipeline) {
@@ -1116,6 +1178,11 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
   ImGui_ImplGlfw_NewFrame();
   ImGui::NewFrame();
 
+  if (scene.simulate() && scene.cpuObjectCount() >= 2) {
+    const glm::mat4 viewProj = scene.camera().proj() * scene.camera().view();
+    drawCornerNormals(scene, viewProj, ImGui::GetIO().DisplaySize);
+  }
+
   ImGuiWindowFlags flags = 0;
   if (benchmark_) {
     ImGui::SetNextWindowPos(ImVec2(10.0f, 10.0f), ImGuiCond_Always);
@@ -1208,6 +1275,21 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
   } else {
     ImGui::SliderFloat("Brush Radius", &scene.brushRadius(), 0.0f, 8.0f, "%.1f coarse voxels");
     ImGui::TextDisabled("Editing whole coarse cells (each owns an 8^3 brick)");
+  }
+  {
+    bool sim = scene.simulate();
+    if (ImGui::Checkbox("Simulate", &sim)) {
+      scene.setSimulate(gfx_, sim);
+    }
+    ImGui::TextDisabled("On = solid test box falls on 3.2 m ground. Off = spinner.");
+    if (scene.simulate()) {
+      ImGui::Text("Test box corners: %u   edges: %u", scene.physicsCornerCount(1),
+                  scene.physicsEdgeCount(1));
+      ImGui::TextDisabled("Corner rays: green = n.y up, red = n.y down, grey = no hit.");
+      const physics::DebugSolve ds = scene.physicsDebug();
+      ImGui::Text("Solve contacts=%d  maxD=%.3f  minNy=%.2f", ds.contacts, ds.maxD, ds.minNy);
+      ImGui::Text("Box v=(%.2f,%.2f,%.2f) |w|=%.2f", ds.v.x, ds.v.y, ds.v.z, glm::length(ds.w));
+    }
   }
   ImGui::Checkbox("Show Rotating Object", &scene.spinnerEnabled());
   ImGui::SliderFloat("Spin Speed", &scene.spinSpeed(), -3.0f, 3.0f, "%.2f rad/s");

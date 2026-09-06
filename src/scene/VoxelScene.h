@@ -3,6 +3,8 @@
 #include "core/Camera.h"
 #include "gfx/GpuTypes.h"
 #include "gfx/Texture.h"
+#include "physics/PhysicsWorld.h"
+#include "physics/VoxelCollide.h"
 #include "voxel/MeshVoxelizer.h"
 
 #include <glm/glm.hpp>
@@ -178,6 +180,24 @@ public:
   float& spinSpeed() { return spinSpeed_; }
   bool& spinnerEnabled() { return spinnerEnabled_; }
 
+  bool simulate() const { return simulate_; }
+  void setSimulate(GfxDevice& gfx, bool on);
+  int cpuObjectCount() const { return static_cast<int>(objects_.size()); }
+  const VoxelObject& cpuObject(int i) const { return objects_.at(static_cast<size_t>(i)); }
+  VoxelObject& cpuObject(int i) { return objects_.at(static_cast<size_t>(i)); }
+  bool occupancyFine(int objectIndex, const glm::ivec3& coarse, const glm::ivec3& micro,
+                     const glm::ivec3& fine) const;
+  uint32_t occupancyMaterial(int objectIndex, const glm::ivec3& coarse) const;
+  uint32_t coarseBrickPage(int objectIndex, const glm::ivec3& coarse) const;
+  void collectOccupiedFines(int objectIndex, const glm::ivec3& coarse,
+                            std::vector<glm::ivec3>& out) const;
+  void notifyOccupancyChanged(int objectIndex);
+  uint32_t physicsCornerCount(int objectIndex) const;
+  uint32_t physicsEdgeCount(int objectIndex) const;
+  physics::DebugSolve physicsDebug() const { return physics_.debugSolve(); }
+  void gatherCornerNormals(int fromObj, int againstObj,
+                           std::vector<physics::DebugCornerNormal>& out) const;
+
   std::optional<VoxelHit> lastHit() const { return lastHit_; }
 
 private:
@@ -212,6 +232,8 @@ private:
 
   void buildGroundObject(VoxelObject& o);
   void buildSpinnerObject(VoxelObject& o);
+  void buildTestBoxObject(VoxelObject& o);
+  void clearObjectPages(VoxelObject& o);
   uint32_t stampMeshIntoWorld(const MeshVoxelizeResult& r, bool sampleColor);
   void uploadWorldAndObjects(GfxDevice& gfx);
   void packObjectPool();
@@ -308,6 +330,8 @@ private:
   float time_ = 0.0f;
   float spinSpeed_ = 0.8f;
   bool spinnerEnabled_ = false;
+  bool simulate_ = false;
+  physics::PhysicsWorld physics_;
 
   bool prevLmb_ = false;
   bool prevF_ = false;

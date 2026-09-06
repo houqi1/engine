@@ -72,6 +72,10 @@ set(VE_VOXEL_SOURCES
   src/scene/VoxelScene.cpp
   src/render/VoxelRenderer.cpp
   src/voxel/MeshVoxelizer.cpp
+  src/physics/Classify.cpp
+  src/physics/VoxelCollide.cpp
+  src/physics/Solver.cpp
+  src/physics/PhysicsWorld.cpp
 )
 
 function(ve_configure_target target_name)

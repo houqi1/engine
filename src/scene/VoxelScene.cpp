@@ -2,6 +2,7 @@
 
 #include "gfx/GfxDevice.h"
 #include "gfx/Texture.h"
+#include "physics/VoxelCollide.h"
 
 #include <GLFW/glfw3.h>
 #include <imgui.h>
@@ -94,6 +95,7 @@ void VoxelScene::init(GfxDevice& gfx) {
   }
 
   rebuildVoxels(gfx);
+  physics_.attach(*this);
 
   const std::string pirateObj =
       std::string(VE_ASSETS_DIR) + "/meshes/pirate-building/Piratebuilding.obj";
@@ -133,7 +135,13 @@ void VoxelScene::update(float dt) {
   for (VoxelObject& o : objects_) {
     o.nestedMicro = nestedMicroVoxels_;
   }
-  if (objects_.size() >= 2) {
+  if (simulate_) {
+    if (objects_.size() >= 2) {
+      objects_[1].enabled = true;
+    }
+    physics_.step(dt);
+    physics_.syncTransformsToScene();
+  } else if (objects_.size() >= 2) {
     objects_[1].enabled = spinnerEnabled_;
     objects_[1].rotation = glm::angleAxis(time_ * spinSpeed_, glm::vec3(0.0f, 1.0f, 0.0f));
   }
@@ -975,6 +983,169 @@ void VoxelScene::buildSpinnerObject(VoxelObject& o) {
   }
 }
 
+void VoxelScene::clearObjectPages(VoxelObject& o) {
+  for (CoarseCell& c : o.cells) {
+    if (c.brickPage != kInvalidBrickPage) {
+      freeBrickPage(c.brickPage);
+      c.brickPage = kInvalidBrickPage;
+    }
+    c.material = 0;
+  }
+}
+
+void VoxelScene::buildTestBoxObject(VoxelObject& o) {
+  constexpr int kN = 8;
+  o.gridSize = kN;
+  o.voxelSize = voxelSize_;
+  o.nestedMicro = nestedMicroVoxels_;
+  o.editable = true;
+  o.enabled = true;
+  o.useImportPalette = false;
+  o.rotation = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+  // 2x2x2 solid at coarse (3,3,3)-(4,4,4) so COM ~= grid center (6.4 m).
+  // Local bottom y=4.8 m; world bottom = position.y - 6.4 + 4.8 = position.y - 1.6.
+  // position.y = 8 m → world bottom 6.4 m, 3.2 m above the 3.2 m ground.
+  o.position = glm::vec3(0.0f, 8.0f, 0.0f);
+
+  const size_t count = static_cast<size_t>(kN) * static_cast<size_t>(kN) * static_cast<size_t>(kN);
+  o.cells.assign(count, CoarseCell{});
+  constexpr uint32_t kMat = 1u;
+  for (int z = 3; z <= 4; ++z) {
+    for (int y = 3; y <= 4; ++y) {
+      for (int x = 3; x <= 4; ++x) {
+        const uint32_t idx = static_cast<uint32_t>(x) + static_cast<uint32_t>(y) * static_cast<uint32_t>(kN) +
+                             static_cast<uint32_t>(z) * static_cast<uint32_t>(kN) * static_cast<uint32_t>(kN);
+        o.cells[idx].material = kMat;
+        o.cells[idx].brickPage = kInvalidBrickPage;
+      }
+    }
+  }
+}
+
+void VoxelScene::setSimulate(GfxDevice& gfx, bool on) {
+  if (simulate_ == on) {
+    return;
+  }
+  simulate_ = on;
+  if (objects_.size() < 2) {
+    return;
+  }
+  clearObjectPages(objects_[1]);
+  if (on) {
+    buildTestBoxObject(objects_[1]);
+    objects_[1].enabled = true;
+  } else {
+    buildSpinnerObject(objects_[1]);
+    objects_[1].enabled = spinnerEnabled_;
+  }
+  packObjectPool();
+  flushObject(gfx, 1);
+  physics_.attach(*this);
+  physics_.rebuildFromScene();
+}
+
+bool VoxelScene::occupancyFine(int objectIndex, const glm::ivec3& coarse, const glm::ivec3& micro,
+                               const glm::ivec3& fine) const {
+  if (objectIndex < 0 || objectIndex >= static_cast<int>(objects_.size())) {
+    return false;
+  }
+  return getFine(objects_[static_cast<size_t>(objectIndex)], coarse, micro, fine);
+}
+
+uint32_t VoxelScene::occupancyMaterial(int objectIndex, const glm::ivec3& coarse) const {
+  if (objectIndex < 0 || objectIndex >= static_cast<int>(objects_.size())) {
+    return 0;
+  }
+  const VoxelObject& o = objects_[static_cast<size_t>(objectIndex)];
+  if (!inBounds(o, coarse) || o.cells.empty()) {
+    return 0;
+  }
+  return cellAt(o, indexOf(o, coarse)).material;
+}
+
+uint32_t VoxelScene::coarseBrickPage(int objectIndex, const glm::ivec3& coarse) const {
+  if (objectIndex < 0 || objectIndex >= static_cast<int>(objects_.size())) {
+    return kInvalidBrickPage;
+  }
+  const VoxelObject& o = objects_[static_cast<size_t>(objectIndex)];
+  if (!inBounds(o, coarse) || o.cells.empty()) {
+    return kInvalidBrickPage;
+  }
+  return cellAt(o, indexOf(o, coarse)).brickPage;
+}
+
+void VoxelScene::collectOccupiedFines(int objectIndex, const glm::ivec3& coarse,
+                                      std::vector<glm::ivec3>& out) const {
+  out.clear();
+  if (objectIndex < 0 || objectIndex >= static_cast<int>(objects_.size())) {
+    return;
+  }
+  const VoxelObject& o = objects_[static_cast<size_t>(objectIndex)];
+  if (!inBounds(o, coarse) || o.cells.empty()) {
+    return;
+  }
+  const CoarseCell& cell = cellAt(o, indexOf(o, coarse));
+  if (cell.material == 0u) {
+    return;
+  }
+  const glm::ivec3 base = coarse * kFinePerCoarse;
+  if (cell.brickPage == kInvalidBrickPage) {
+    out.reserve(static_cast<size_t>(kFinePerBrick));
+    for (int z = 0; z < kFinePerCoarse; ++z) {
+      for (int y = 0; y < kFinePerCoarse; ++y) {
+        for (int x = 0; x < kFinePerCoarse; ++x) {
+          out.push_back(base + glm::ivec3(x, y, z));
+        }
+      }
+    }
+    return;
+  }
+  for (int mz = 0; mz < kMicroRes; ++mz) {
+    for (int my = 0; my < kMicroRes; ++my) {
+      for (int mx = 0; mx < kMicroRes; ++mx) {
+        const glm::ivec3 micro(mx, my, mz);
+        if (!getMicro(o, coarse, micro)) {
+          continue;
+        }
+        const uint8_t byte = readFineByte(cell.brickPage, microBitIndex(micro));
+        for (int fz = 0; fz < kFineRes; ++fz) {
+          for (int fy = 0; fy < kFineRes; ++fy) {
+            for (int fx = 0; fx < kFineRes; ++fx) {
+              const glm::ivec3 fine(fx, fy, fz);
+              if ((byte & static_cast<uint8_t>(1u << fineBitIndex(fine))) == 0u) {
+                continue;
+              }
+              out.push_back(base + micro * kFineRes + fine);
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+void VoxelScene::notifyOccupancyChanged(int objectIndex) { physics_.markDirty(objectIndex); }
+
+uint32_t VoxelScene::physicsCornerCount(int objectIndex) const {
+  const physics::ShapeClass* sc = physics_.shapeClass(objectIndex);
+  return sc ? static_cast<uint32_t>(sc->corners.size()) : 0u;
+}
+
+uint32_t VoxelScene::physicsEdgeCount(int objectIndex) const {
+  const physics::ShapeClass* sc = physics_.shapeClass(objectIndex);
+  return sc ? static_cast<uint32_t>(sc->edges.size()) : 0u;
+}
+
+void VoxelScene::gatherCornerNormals(int fromObj, int againstObj,
+                                     std::vector<physics::DebugCornerNormal>& out) const {
+  out.clear();
+  const physics::ShapeClass* sc = physics_.shapeClass(fromObj);
+  if (!sc) {
+    return;
+  }
+  physics::gatherCornerNormals(*this, *sc, fromObj, againstObj, out);
+}
+
 void VoxelScene::rebuildVoxels(GfxDevice& gfx) {
   // Static frames no longer drain the queue through an object upload.
   gfx.waitIdle();
@@ -996,13 +1167,19 @@ void VoxelScene::rebuildVoxels(GfxDevice& gfx) {
   objects_.clear();
   objects_.resize(2);
   buildGroundObject(objects_[0]);
-  buildSpinnerObject(objects_[1]);
+  if (simulate_) {
+    buildTestBoxObject(objects_[1]);
+  } else {
+    buildSpinnerObject(objects_[1]);
+  }
 
   packObjectPool();
   fillGpuObjectRecords();
   ensureGpuBuffers(gfx);
   uploadWorldAndObjects(gfx);
   dirtyPages_.clear();
+  physics_.attach(*this);
+  physics_.rebuildFromScene();
 
   if (!lastImportedPath_.empty()) {
     MeshVoxelizeConfig cfg;
@@ -1686,6 +1863,7 @@ void VoxelScene::handleEditInput(GLFWwindow* window, GfxDevice& gfx) {
     recountOccupiedMicro();
     recountOccupiedFine();
     flushObject(gfx, objIndex);
+    notifyOccupancyChanged(objIndex);
   }
   lastHit_ = pickCenterRay();
 }
