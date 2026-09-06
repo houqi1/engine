@@ -59,7 +59,8 @@ struct VoxelObject {
 
   glm::vec3 position{0.0f};
   glm::quat rotation{1.0f, 0.0f, 0.0f, 0.0f};
-  float voxelSize = 0.35f;
+  // Coarse cell meters. Default is 16 * 0.1 m so one fine cell matches Teardown.
+  float voxelSize = 1.6f;
   int gridSize = 16;
   bool nestedMicro = true;
   bool editable = true;
@@ -83,6 +84,10 @@ public:
   static constexpr int kFineRes = 2;
   static constexpr int kFineCount = kFineRes * kFineRes * kFineRes;
   static constexpr int kFinePerCoarse = kMicroRes * kFineRes;  // 16
+  // Visible shape is the fine cell. Physics must use the same 0.1 m grain as Teardown.
+  static constexpr float kGameplayVoxelMeters = 0.1f;
+  static constexpr float kDefaultVoxelSize =
+      kGameplayVoxelMeters * static_cast<float>(kFinePerCoarse);
   static constexpr int kFineTableBytes = kMicroCount;  // one uint8 per 8^3 micro
   static constexpr int kFineWordsPerTable = kFineTableBytes / 4;
   static constexpr int kFinePerBrick = kFinePerCoarse * kFinePerCoarse * kFinePerCoarse;  // 4096
@@ -145,6 +150,9 @@ public:
 
   int& gridSize() { return gridSize_; }
   float& voxelSize() { return voxelSize_; }
+  float microVoxelSize() const { return voxelSize_ / static_cast<float>(kMicroRes); }
+  float fineVoxelSize() const { return voxelSize_ / static_cast<float>(kFinePerCoarse); }
+  float gameplayVoxelSize() const { return fineVoxelSize(); }
   glm::vec3& lightDir() { return lightDir_; }
   glm::vec3 gridOrigin() const;
   glm::uvec3 gridDims() const { return glm::uvec3(static_cast<uint32_t>(gridSize_)); }
@@ -275,7 +283,7 @@ private:
   uint32_t allocatedPageCount_ = 0;
 
   int gridSize_ = 64;
-  float voxelSize_ = 0.35f;
+  float voxelSize_ = kDefaultVoxelSize;
   glm::vec3 lightDir_{0.35f, -1.0f, 0.25f};
   float ambient_ = 0.18f;
   float aoStrength_ = 1.0f;

@@ -25,7 +25,7 @@ struct MeshVoxelizeResult {
   int n = 0;
   int subdiv = 16;
   int fineN = 0;
-  float voxelSize = 0.35f;
+  float voxelSize = 1.6f;
   glm::vec3 bmin{0.0f};
   std::vector<uint32_t> material;  // coarse occupancy (1 = solid)
   std::vector<uint32_t> fineBits;

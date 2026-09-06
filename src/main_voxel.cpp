@@ -48,9 +48,10 @@ struct Options {
   int height = 1440;
   bool color = false;  // Match the scene's default import, not Solid Color output.
   VoxelRenderer::BenchmarkSettings renderer{};
-  // stampMeshIntoWorld centers the hut in X/Z, with its base at 2.5 * 0.35 m.
-  // Camera yaw 0 looks along -Z; positive pitch looks down. Angles are radians.
-  std::array<float, 5> camera{4.0f, 3.0f, 5.0f, 0.67474094f, 0.0f};
+  // stampMeshIntoWorld centers the hut in X/Z, with its base at 2.5 * coarse voxelSize
+  // (4.0 m at the default of 1.6 m coarse / 0.1 m fine). Ground top is 3.2 m.
+  // Camera is in world meters. Yaw 0 looks along -Z; positive pitch looks down.
+  std::array<float, 5> camera{4.0f, 5.0f, 6.0f, 0.67474094f, 0.0f};
   std::string capture;
   std::string csv;
 };
@@ -266,6 +267,8 @@ void runBenchmark(const Options& options, Window& window, GfxDevice& gfx, VoxelS
             << " padding=" << config.padding << " color=" << options.color
             << " conservative=" << config.conservative << '\n'
             << "Scene grid=" << scene.gridSize() << " voxel_size=" << scene.voxelSize()
+            << " gameplay_voxel=" << scene.gameplayVoxelSize()
+            << " fine_voxel=" << scene.fineVoxelSize()
             << " objects=" << scene.objectCount() << " occupied_coarse=" << scene.occupiedCount()
             << '/' << scene.voxelCount() << " occupied_micro=" << scene.occupiedMicroCount()
             << " occupied_fine=" << scene.occupiedFineCount()
@@ -422,7 +425,7 @@ int main(int argc, char** argv) {
                    "  --width N --height N  Exact framebuffer pixels (default 2560 1440)\n"
                    "  --beam 0/1 --brick-skip 0/1 --dir-brick 0/1 --dir-coarse 0/1 (default all 1)\n"
                    "  --color 0/1      Sample imported mesh color (default 0; shading/AO stay on)\n"
-                    "  --camera x y z yaw pitch  Fixed pose, radians (default 4 3 5 0.67474094 0)\n"
+                    "  --camera x y z yaw pitch  Fixed pose, radians (default 4 5 6 0.67474094 0)\n"
                    "  --stage N        0=full (default); 1..5=diagnostic, NOT full-quality performance\n"
                    "  --capture PATH   P6 PPM from pre-UI RGBA8 output (RGB only, after timing)\n"
                    "  --csv PATH       Raw frame rows plus median/p95 rows, with run metadata\n"

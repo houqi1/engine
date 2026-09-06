@@ -1269,7 +1269,10 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
 
   bool rebuild = false;
   rebuild |= ImGui::SliderInt("Grid Size", &scene.gridSize(), 8, 64);
-  rebuild |= ImGui::DragFloat("Voxel Size", &scene.voxelSize(), 0.01f, 0.05f, 2.0f);
+  rebuild |= ImGui::DragFloat("Coarse Voxel (m)", &scene.voxelSize(), 0.01f, 0.05f, 2.0f);
+  ImGui::TextDisabled("Fine (gameplay) %.3f m   Micro %.3f m   World %.1f m",
+                      scene.fineVoxelSize(), scene.microVoxelSize(),
+                      static_cast<float>(scene.gridSize()) * scene.voxelSize());
   ImGui::DragFloat3("Light Dir", &scene.lightDir().x, 0.01f);
   ImGui::SliderFloat("Ambient", &scene.ambient(), 0.0f, 1.0f);
   ImGui::SliderFloat("AO Strength", &scene.aoStrength(), 0.0f, 1.0f);

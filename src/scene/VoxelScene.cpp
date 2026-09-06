@@ -59,6 +59,7 @@ constexpr uint32_t kSolidBrickWords[16] = {
 constexpr uint32_t kEmptyBrickWords[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 
 static_assert(VoxelScene::kBrickPageWords == 16 + 128 + 4096, "brick page layout vs shader");
+static_assert(VoxelScene::kDefaultVoxelSize == 1.6f, "coarse = 16 * 0.1 m Teardown fine");
 
 uint32_t packRgb888a(uint32_t rgb888) {
   return 0xFF000000u | (rgb888 & 0x00FFFFFFu);
@@ -78,8 +79,9 @@ glm::mat4 VoxelObject::worldToObject() const {
 }
 
 void VoxelScene::init(GfxDevice& gfx) {
-  camera_.setOrbitTarget(glm::vec3(0.0f, 0.4f, 0.0f));
-  camera_.setOrbitDistance(22.0f);
+  // Ground top is 2 coarse cells (3.2 m at default). Orbit from about eye height above it.
+  camera_.setOrbitTarget(glm::vec3(0.0f, 4.0f, 0.0f));
+  camera_.setOrbitDistance(24.0f);
   camera_.setYawPitch(0.75f, 0.55f);
 
   const std::string skyPath = std::string(VE_ASSETS_DIR) + "/sky/autumn_field_puresky_2k.hdr";
