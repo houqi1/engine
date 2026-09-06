@@ -81,9 +81,11 @@ void solveContacts(std::vector<RigidBody>& bodies, std::vector<Contact>& contact
     }
     // If already separating, don't fight vn; only push out leftover penetration.
     const float vnCorr = (vn > 0.0f) ? 0.0f : vn;
-    float lam = -(vnCorr + bias) / k;
-    lam = std::max(lam, 0.0f);
-    applyImpulse(A, B, c.rA, c.rB, lam * c.n);
+    float dLam = -(vnCorr + bias) / k;
+    const float lambdaN = std::max(0.0f, c.lambdaN + dLam);
+    dLam = lambdaN - c.lambdaN;
+    c.lambdaN = lambdaN;
+    applyImpulse(A, B, c.rA, c.rB, dLam * c.n);
 
     const glm::vec3 vA2 = A.v + glm::cross(A.w, c.rA);
     const glm::vec3 vB2 = B.v + glm::cross(B.w, c.rB);
@@ -98,10 +100,12 @@ void solveContacts(std::vector<RigidBody>& bodies, std::vector<Contact>& contact
     if (kt <= 1e-8f) {
       continue;
     }
-    float lamT = -glm::dot(vt, t) / kt;
-    const float maxF = kFriction * lam;
-    lamT = std::clamp(lamT, -maxF, maxF);
-    applyImpulse(A, B, c.rA, c.rB, lamT * t);
+    float dLamT = -glm::dot(vt, t) / kt;
+    const float maxF = kFriction * c.lambdaN;
+    const float lambdaT = std::clamp(c.lambdaT + dLamT, -maxF, maxF);
+    dLamT = lambdaT - c.lambdaT;
+    c.lambdaT = lambdaT;
+    applyImpulse(A, B, c.rA, c.rB, dLamT * t);
   }
   }
 }

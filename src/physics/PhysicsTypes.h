@@ -20,7 +20,6 @@ constexpr float kSlop = 0.01f;
 constexpr float kBaumgarte = 0.2f;
 constexpr float kRestitution = 0.0f;
 constexpr float kFriction = 0.5f;
-constexpr int kMaxContactsPerPair = 16;
 // One TGS substep still needs several SI passes so 4 simultaneous
 // corners can share the impact (Catto). Collision is still rebuilt each hSub.
 constexpr int kContactIters = 8;
@@ -41,6 +40,11 @@ struct Contact {
   glm::vec3 rA{0.0f};
   glm::vec3 rB{0.0f};
   float d = 0.0f;
+  int nFace = 2;
+  uint32_t fineA = 0;
+  uint32_t fineB = 0;
+  float lambdaN = 0.0f;
+  float lambdaT = 0.0f;
 };
 
 struct ShapeClass {
