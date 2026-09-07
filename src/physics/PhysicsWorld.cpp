@@ -6,8 +6,18 @@
 #include "scene/VoxelScene.h"
 
 #include <algorithm>
+#include <glm/glm.hpp>
+#include <glm/gtc/quaternion.hpp>
 
 namespace physics {
+
+namespace {
+
+glm::vec3 gridCenterLocal(const VoxelObject& o) {
+  return 0.5f * static_cast<float>(o.gridSize) * o.voxelSize * glm::vec3(1.0f);
+}
+
+}  // namespace
 
 void PhysicsWorld::attach(VoxelScene& scene) { scene_ = &scene; }
 
@@ -32,6 +42,7 @@ void PhysicsWorld::rebuildFromScene() {
     classes_[static_cast<size_t>(i)].dirty = true;
   }
   rebuildDirty();
+  syncTransformsToScene();
   accumulator_ = 0.0f;
 }
 
@@ -39,6 +50,44 @@ void PhysicsWorld::markDirty(int objectIndex) {
   if (objectIndex >= 0 && objectIndex < static_cast<int>(classes_.size())) {
     classes_[static_cast<size_t>(objectIndex)].dirty = true;
   }
+}
+
+void PhysicsWorld::onSplit(int srcIndex, int dstIndex, const glm::vec3& /*newCenterWorld*/) {
+  if (!scene_ || srcIndex < 0 || dstIndex < 0) {
+    return;
+  }
+  const int n = scene_->cpuObjectCount();
+  if (dstIndex >= n || srcIndex >= n) {
+    return;
+  }
+  while (static_cast<int>(bodies_.size()) < n) {
+    bodies_.push_back(RigidBody{});
+    classes_.push_back(ShapeClass{});
+    classes_.back().dirty = true;
+  }
+  RigidBody srcCopy{};
+  if (srcIndex < static_cast<int>(bodies_.size())) {
+    srcCopy = bodies_[static_cast<size_t>(srcIndex)];
+  }
+  RigidBody& dst = bodies_[static_cast<size_t>(dstIndex)];
+  dst.shapeIndex = dstIndex;
+  dst.x = scene_->cpuObject(dstIndex).position;
+  dst.q = scene_->cpuObject(dstIndex).rotation;
+  dst.comLocal = gridCenterLocal(scene_->cpuObject(dstIndex));
+  dst.dynamic = (dstIndex != 0) || srcCopy.dynamic;
+  dst.awake = dst.dynamic;
+  dst.sleepTimer = 0.0f;
+  dst.invM = 0.0f;
+  dst.v = glm::vec3(0.0f);
+  dst.w = srcCopy.w;
+  classes_[static_cast<size_t>(srcIndex)].dirty = true;
+  classes_[static_cast<size_t>(dstIndex)].dirty = true;
+  rebuildDirty();
+  // v_point = v_com + w × (p - com). src.x is the pre-split COM.
+  dst.v = srcCopy.v + glm::cross(srcCopy.w, dst.x - srcCopy.x);
+  dst.w = srcCopy.w;
+  dst.awake = dst.dynamic;
+  syncTransformsToScene();
 }
 
 void PhysicsWorld::rebuildDirty() {
@@ -142,6 +191,7 @@ void PhysicsWorld::step(float frameDt) {
     rebuildFromScene();
   }
   rebuildDirty();
+  syncTransformsToScene();
   accumulator_ =
       std::min(accumulator_ + std::max(frameDt, 0.0f), kDt * static_cast<float>(kMaxStepsPerFrame));
   int guard = 0;
@@ -164,8 +214,8 @@ void PhysicsWorld::syncTransformsToScene() {
       continue;
     }
     VoxelObject& o = scene_->cpuObject(b.shapeIndex);
-    o.position = b.x;
     o.rotation = b.q;
+    o.position = b.x + b.q * (gridCenterLocal(o) - b.comLocal);
   }
 }
 

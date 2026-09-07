@@ -39,10 +39,10 @@ struct GpuVoxelObject {
   float _pad0[3];
   uint32_t gridSize[3];
   uint32_t flags;  // bit0 nestedMicro, bit1 enabled, bit2 import color, bit3 nestedFine
-  uint32_t voxelOffset;  // grids[] texture index (0 = world, 1 = spinner)
+  uint32_t voxelOffset;  // coarsePool cell index (start of this object's N³)
   uint32_t occMipOffset;  // 4^3 coarse tiles: two uints (64 Morton bits) each
   uint32_t occMipWords;   // tile count * 2
-  uint32_t _pad1;
+  uint32_t cpuIndex;
   float occMin[3];  // coarse inclusive
   float _padOccMin;
   float occMax[3];  // coarse exclusive
@@ -74,15 +74,24 @@ struct VoxelObject {
   bool useImportPalette = false;
 
   std::vector<CoarseCell> cells;
-  uint32_t voxelOffset = 0;  // grids[] texture index (0 = world, 1 = spinner)
+  uint32_t voxelOffset = 0;  // coarsePool cell index (start of this object's N³)
   uint32_t occMipOffset = 0;
   uint32_t occMipWords = 0;
   glm::vec3 occMin{0.0f};
   glm::vec3 occMax{0.0f};
+  // Packed coarse cells (x | y<<10 | z<<20) for vis raster. Occupancy AABB is too loose
+  // after a cut: the box covers holes, vis commits this id, DDA misses, sky leaks.
+  std::vector<uint32_t> occupiedCoarses;
 
   glm::mat4 objectToWorld() const;
   glm::mat4 worldToObject() const;
 };
+
+struct VisCoarseInstance {
+  uint32_t gpuIndex = 0;
+  uint32_t packedCoarse = 0;
+};
+static_assert(sizeof(VisCoarseInstance) == 8, "VisCoarseInstance vertex stride");
 
 class VoxelScene {
 public:
@@ -110,8 +119,7 @@ public:
       kPagesPerSlab * static_cast<uint32_t>(kBrickPageWords);
   static constexpr int kOccMipRes = 4;
   static constexpr int kOccMipShift = 2;
-  static constexpr uint32_t kGridTexCount = 2;
-  static constexpr VkFormat kGridFormat = VK_FORMAT_R32G32_UINT;
+  static constexpr uint32_t kMaxShapes = 256;
 
   void init(GfxDevice& gfx);
   void cleanup(GfxDevice& gfx);
@@ -135,13 +143,12 @@ public:
   Camera& camera() { return camera_; }
   const Camera& camera() const { return camera_; }
 
-  const AllocatedImage& gridImage(uint32_t i) const {
-    return i < kGridTexCount ? grid3D_[i] : dummyGrid3D_;
-  }
-  const AllocatedImage& dummyGridImage() const { return dummyGrid3D_; }
-  VkSampler gridSampler() const { return gridSampler_; }
   const AllocatedBuffer& dummyBrickSlabBuffer() const { return dummyBrickSlabBuffer_; }
   const AllocatedBuffer& objectBuffer() const { return objectBuffer_; }
+  const AllocatedBuffer& visInstanceBuffer() const { return visInstanceBuffer_; }
+  uint32_t visInstanceCount() const { return static_cast<uint32_t>(uploadedVisInstances_.size()); }
+  const AllocatedBuffer& coarsePoolBuffer() const { return coarsePoolBuffer_; }
+  VkDeviceSize coarsePoolBytes() const { return coarsePoolBuffer_.size; }
   uint32_t brickSlabCount() const { return static_cast<uint32_t>(slabs_.size()); }
   const AllocatedBuffer& brickSlabBuffer(uint32_t i) const { return slabs_[i].gpu; }
   uint32_t objectCount() const { return static_cast<uint32_t>(objectsGpu_.size()); }
@@ -185,6 +192,8 @@ public:
   bool& collapseFullBricks() { return collapseFullBricks_; }
   float& spinSpeed() { return spinSpeed_; }
   bool& spinnerEnabled() { return spinnerEnabled_; }
+  int debrisCount() const { return debrisCount_; }
+  void setDebrisCount(GfxDevice& gfx, int count);
 
   bool simulate() const { return simulate_; }
   void setSimulate(GfxDevice& gfx, bool on);
@@ -239,7 +248,9 @@ private:
   void buildGroundObject(VoxelObject& o);
   void buildSpinnerObject(VoxelObject& o);
   void buildTestBoxObject(VoxelObject& o);
+  void buildDebrisObject(VoxelObject& o, int debrisIndex, int debrisTotal);
   void clearObjectPages(VoxelObject& o);
+  void spawnDebrisObjects();
   uint32_t stampMeshIntoWorld(const MeshVoxelizeResult& r, bool sampleColor);
   void uploadWorldAndObjects(GfxDevice& gfx);
   void packObjectPool();
@@ -255,19 +266,24 @@ private:
   void writeFineRgb(uint32_t page, uint32_t colorIndex, uint32_t rgb888);
   void ensureSlabCpu(uint32_t slabIndex);
   void ensureGpuBuffers(GfxDevice& gfx);
-  void ensureCoarseGridFormat(GfxDevice& gfx);
-  void ensureGridImages(GfxDevice& gfx);
-  void uploadGridImage(GfxDevice& gfx, uint32_t objectIndex);
-  void destroyGridImages(GfxDevice& gfx);
+  void uploadCoarsePool(GfxDevice& gfx);
+  void uploadVisInstances(GfxDevice& gfx);
   void flushObject(GfxDevice& gfx, int objectIndex);
   void flushDirtyPages(GfxDevice& gfx);
+  bool maybeFracture(int objectIndex, const std::vector<glm::ivec3>& deletedAbsFines);
+  bool solidAbsFine(const VoxelObject& o, const glm::ivec3& absFine) const;
+  void emitFracturePiece(int srcIndex, const std::vector<uint32_t>& packedFines);
+  void clearPackedFines(VoxelObject& o, const std::vector<uint32_t>& packedFines);
 
   int applyCoarseSphereBrush(VoxelObject& o, const glm::ivec3& center, float radius,
-                             uint32_t material, bool placeOnlyEmpty);
+                             uint32_t material, bool placeOnlyEmpty,
+                             std::vector<glm::ivec3>* deletedAbsFines = nullptr);
   int applyMicroSphereBrush(VoxelObject& o, const glm::ivec3& coarse, const glm::ivec3& micro,
-                            float radius, bool solid, uint32_t placeMaterial);
+                            float radius, bool solid, uint32_t placeMaterial,
+                            std::vector<glm::ivec3>* deletedAbsFines = nullptr);
   int applyFineSphereBrush(VoxelObject& o, const glm::ivec3& coarse, const glm::ivec3& micro,
-                           const glm::ivec3& fine, float radius, bool solid, uint32_t placeMaterial);
+                           const glm::ivec3& fine, float radius, bool solid, uint32_t placeMaterial,
+                           std::vector<glm::ivec3>* deletedAbsFines = nullptr);
 
   struct PickResult {
     VoxelHit hit{};
@@ -282,12 +298,11 @@ private:
     AllocatedBuffer gpu{};
   };
   Camera camera_;
-  std::array<AllocatedImage, kGridTexCount> grid3D_{};
-  AllocatedImage dummyGrid3D_{};
-  VkSampler gridSampler_ = VK_NULL_HANDLE;
-  bool gridFormatChecked_ = false;
   AllocatedBuffer dummyBrickSlabBuffer_{};
   AllocatedBuffer objectBuffer_{};
+  AllocatedBuffer visInstanceBuffer_{};
+  AllocatedBuffer coarsePoolBuffer_{};
+  std::vector<CoarseCell> coarsePoolCpu_{};
   AllocatedBuffer paletteBuffer_{};
   AllocatedBuffer occMipBuffer_{};
   MeshVoxelizerGpu voxelizeGpu_{};
@@ -303,6 +318,8 @@ private:
   std::vector<VoxelObject> objects_;
   std::vector<GpuVoxelObject> objectsGpu_;
   std::vector<GpuVoxelObject> uploadedObjectsGpu_;
+  std::vector<VisCoarseInstance> visInstancesCpu_;
+  std::vector<VisCoarseInstance> uploadedVisInstances_;
   std::vector<uint32_t> occMipCpu_;
   std::vector<BrickSlab> slabs_;
   std::vector<uint32_t> freePages_;
@@ -337,6 +354,7 @@ private:
   float spinSpeed_ = 0.8f;
   bool spinnerEnabled_ = false;
   bool simulate_ = false;
+  int debrisCount_ = 8;
   physics::PhysicsWorld physics_;
 
   bool prevLmb_ = false;

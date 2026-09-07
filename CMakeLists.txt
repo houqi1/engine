@@ -76,6 +76,7 @@ set(VE_VOXEL_SOURCES
   src/physics/VoxelCollide.cpp
   src/physics/Solver.cpp
   src/physics/PhysicsWorld.cpp
+  src/physics/Fracture.cpp
 )
 
 function(ve_configure_target target_name)
@@ -156,6 +157,8 @@ set(VE_SHADER_SOURCES
   voxel_dda.comp
   voxel_dda_coarse.comp
   voxelize_surface.comp
+  object_obb.vert
+  object_obb.frag
 )
 
 set(VE_SPV_FILES "")

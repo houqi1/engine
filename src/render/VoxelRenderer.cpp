@@ -1,5 +1,7 @@
 #include "render/VoxelRenderer.h"
 
+#include "gfx/PipelineBuilder.h"
+
 #include <imgui.h>
 #include <imgui_impl_glfw.h>
 #include <imgui_impl_vulkan.h>
@@ -245,10 +247,17 @@ VoxelRenderer::~VoxelRenderer() {
   if (beamPipeline_) {
     vkDestroyPipeline(gfx_.device(), beamPipeline_, nullptr);
   }
+  if (visPipeline_) {
+    vkDestroyPipeline(gfx_.device(), visPipeline_, nullptr);
+  }
+  if (visPipelineLayout_) {
+    vkDestroyPipelineLayout(gfx_.device(), visPipelineLayout_, nullptr);
+  }
   if (pipelineLayout_) {
     vkDestroyPipelineLayout(gfx_.device(), pipelineLayout_, nullptr);
   }
   gfx_.destroyImage(dummyBeamImage_);
+  gfx_.destroyImage(dummyVisImage_);
   for (auto& frame : frames_) {
     gfx_.destroyBuffer(frame.frameUBO);
   }
@@ -263,6 +272,8 @@ VoxelRenderer::~VoxelRenderer() {
 void VoxelRenderer::init(VoxelScene& scene) {
   dummyBeamImage_ = gfx_.createImage({1, 1, 1}, kBeamFormat, VK_IMAGE_USAGE_STORAGE_BIT,
                                      VK_IMAGE_ASPECT_COLOR_BIT, true);
+  dummyVisImage_ = gfx_.createImage({1, 1, 1}, kVisFormat, VK_IMAGE_USAGE_STORAGE_BIT,
+                                    VK_IMAGE_ASPECT_COLOR_BIT, true);
   createDescriptors();
   createOutputImage();
   createTimestampPool();
@@ -462,27 +473,28 @@ void VoxelRenderer::resize() {
   destroyOutputImage();
   createOutputImage();
   // Force descriptor refresh so storage-image views stay valid.
-  boundGridViews_.fill(VK_NULL_HANDLE);
-  boundGridSampler_ = VK_NULL_HANDLE;
   boundBrickSlabs_.fill(VK_NULL_HANDLE);
   boundBrickSlabCount_ = 0;
   boundObjectBuffer_ = VK_NULL_HANDLE;
+  boundCoarsePoolBuffer_ = VK_NULL_HANDLE;
   boundPaletteBuffer_ = VK_NULL_HANDLE;
   boundOccMipBuffer_ = VK_NULL_HANDLE;
   boundSkyView_ = VK_NULL_HANDLE;
   boundBeamView_ = VK_NULL_HANDLE;
+  boundVisViews_.fill(VK_NULL_HANDLE);
 }
 
 void VoxelRenderer::createDescriptors() {
-  VkDescriptorSetLayoutBinding bindings[9]{};
+  VkDescriptorSetLayoutBinding bindings[10]{};
   bindings[0].binding = 0;
   bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
   bindings[0].descriptorCount = 1;
-  bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  bindings[0].stageFlags =
+      VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
 
   bindings[1].binding = 1;
-  bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-  bindings[1].descriptorCount = VoxelScene::kGridTexCount;
+  bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  bindings[1].descriptorCount = 1;
   bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
   bindings[2].binding = 2;
@@ -503,7 +515,8 @@ void VoxelRenderer::createDescriptors() {
   bindings[5].binding = 5;
   bindings[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   bindings[5].descriptorCount = 1;
-  bindings[5].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  bindings[5].stageFlags =
+      VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
 
   bindings[6].binding = 6;
   bindings[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -520,9 +533,14 @@ void VoxelRenderer::createDescriptors() {
   bindings[8].descriptorCount = 1;
   bindings[8].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
+  bindings[9].binding = 9;
+  bindings[9].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+  bindings[9].descriptorCount = 1;
+  bindings[9].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
   VkDescriptorSetLayoutCreateInfo layoutInfo{};
   layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-  layoutInfo.bindingCount = 9;
+  layoutInfo.bindingCount = 10;
   layoutInfo.pBindings = bindings;
   if (vkCreateDescriptorSetLayout(gfx_.device(), &layoutInfo, nullptr, &frameLayout_) !=
       VK_SUCCESS) {
@@ -532,10 +550,9 @@ void VoxelRenderer::createDescriptors() {
   VkDescriptorPoolSize poolSizes[] = {
       {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, GfxDevice::kFramesInFlight},
       {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-       GfxDevice::kFramesInFlight * (3u + VoxelScene::kMaxBrickSlabs)},
-      {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, GfxDevice::kFramesInFlight * 2u},
-      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-       GfxDevice::kFramesInFlight * (1u + VoxelScene::kGridTexCount)},
+       GfxDevice::kFramesInFlight * (4u + VoxelScene::kMaxBrickSlabs)},
+      {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, GfxDevice::kFramesInFlight * 3u},
+      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, GfxDevice::kFramesInFlight},
   };
   VkDescriptorPoolCreateInfo poolInfo{};
   poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -559,11 +576,27 @@ void VoxelRenderer::createOutputImage() {
   const uint32_t beamH = std::max(1u, (ext.height + 7u) / 8u);
   beamImage_ = gfx_.createImage({beamW, beamH, 1}, kBeamFormat, VK_IMAGE_USAGE_STORAGE_BIT,
                                 VK_IMAGE_ASPECT_COLOR_BIT, true);
+  for (uint32_t i = 0; i < GfxDevice::kFramesInFlight; ++i) {
+    visImages_[i] = gfx_.createImage(
+        {ext.width, ext.height, 1}, kVisFormat,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+            VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        VK_IMAGE_ASPECT_COLOR_BIT, true);
+    visDepths_[i] = gfx_.createImage({ext.width, ext.height, 1}, kVisDepthFormat,
+                                     VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+                                     VK_IMAGE_ASPECT_DEPTH_BIT, true);
+  }
 }
 
 void VoxelRenderer::destroyOutputImage() {
   gfx_.destroyImage(outImage_);
   gfx_.destroyImage(beamImage_);
+  for (AllocatedImage& img : visImages_) {
+    gfx_.destroyImage(img);
+  }
+  for (AllocatedImage& img : visDepths_) {
+    gfx_.destroyImage(img);
+  }
 }
 
 VkPipeline VoxelRenderer::createComputePipeline(VkShaderModule shader, DdaSpec spec,
@@ -677,16 +710,146 @@ void VoxelRenderer::createPipelines() {
     vkDestroyShaderModule(gfx_.device(), coarseMod, nullptr);
   }
   vkDestroyShaderModule(gfx_.device(), comp, nullptr);
+
+  VkPushConstantRange visPush{};
+  visPush.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+  visPush.offset = 0;
+  visPush.size = 128;
+  VkPipelineLayoutCreateInfo visLayoutInfo{};
+  visLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+  visLayoutInfo.setLayoutCount = 1;
+  visLayoutInfo.pSetLayouts = &frameLayout_;
+  visLayoutInfo.pushConstantRangeCount = 1;
+  visLayoutInfo.pPushConstantRanges = &visPush;
+  if (vkCreatePipelineLayout(gfx_.device(), &visLayoutInfo, nullptr, &visPipelineLayout_) !=
+      VK_SUCCESS) {
+    throw std::runtime_error("Failed to create vis pipeline layout");
+  }
+
+  VkShaderModule visVert = gfx_.loadShaderModule(shaderDir + "/object_obb.vert.spv");
+  VkShaderModule visFrag = gfx_.loadShaderModule(shaderDir + "/object_obb.frag.spv");
+  VkVertexInputBindingDescription visBind{};
+  visBind.binding = 0;
+  visBind.stride = static_cast<uint32_t>(sizeof(VisCoarseInstance));
+  visBind.inputRate = VK_VERTEX_INPUT_RATE_INSTANCE;
+  VkVertexInputAttributeDescription visAttrs[2]{};
+  visAttrs[0].location = 0;
+  visAttrs[0].binding = 0;
+  visAttrs[0].format = VK_FORMAT_R32_UINT;
+  visAttrs[0].offset = offsetof(VisCoarseInstance, gpuIndex);
+  visAttrs[1].location = 1;
+  visAttrs[1].binding = 0;
+  visAttrs[1].format = VK_FORMAT_R32_UINT;
+  visAttrs[1].offset = offsetof(VisCoarseInstance, packedCoarse);
+  visPipeline_ = PipelineBuilder()
+                     .setShaders(visVert, visFrag)
+                     .setVertexInput(visBind, {visAttrs[0], visAttrs[1]})
+                     .setTopology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
+                     .setCullMode(VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE)
+                     .setMultisampling(VK_SAMPLE_COUNT_1_BIT)
+                     .setDepthTest(true, true, VK_COMPARE_OP_GREATER_OR_EQUAL)
+                     .setColorFormat(kVisFormat)
+                     .setColorBlend(false)
+                     .setDepthFormat(kVisDepthFormat)
+                     .setLayout(visPipelineLayout_)
+                     .build(gfx_.device());
+  vkDestroyShaderModule(gfx_.device(), visVert, nullptr);
+  vkDestroyShaderModule(gfx_.device(), visFrag, nullptr);
+}
+
+void VoxelRenderer::recordVisPass(VkCommandBuffer cmd, VoxelScene& scene, VkExtent2D extent,
+                                 VkDescriptorSet frameSet, uint32_t frameIndex) {
+  AllocatedImage& vis = visImages_[frameIndex];
+  AllocatedImage& depth = visDepths_[frameIndex];
+  gfx_.transitionImage(cmd, vis.image, vis.layout, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                       vis.layout == VK_IMAGE_LAYOUT_UNDEFINED
+                           ? VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT
+                           : VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                       vis.layout == VK_IMAGE_LAYOUT_UNDEFINED ? 0 : VK_ACCESS_2_SHADER_READ_BIT,
+                       VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                       VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+  gfx_.transitionImage(cmd, depth.image, depth.layout, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                       depth.layout == VK_IMAGE_LAYOUT_UNDEFINED
+                           ? VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT
+                           : VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                       depth.layout == VK_IMAGE_LAYOUT_UNDEFINED
+                           ? 0
+                           : VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                       VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                           VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                       VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                           VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT,
+                       VK_IMAGE_ASPECT_DEPTH_BIT);
+
+  VkClearValue colorClear{};
+  colorClear.color.float32[0] = 0.0f;
+  colorClear.color.float32[1] = 0.0f;
+  colorClear.color.float32[2] = 0.0f;
+  colorClear.color.float32[3] = 1.0f;
+  VkClearValue depthClear{};
+  depthClear.depthStencil.depth = 0.0f;
+
+  VkRenderingAttachmentInfo colorAtt{};
+  colorAtt.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+  colorAtt.imageView = vis.view;
+  colorAtt.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+  colorAtt.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+  colorAtt.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  colorAtt.clearValue = colorClear;
+
+  VkRenderingAttachmentInfo depthAtt{};
+  depthAtt.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+  depthAtt.imageView = depth.view;
+  depthAtt.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+  depthAtt.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+  depthAtt.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+  depthAtt.clearValue = depthClear;
+
+  VkRenderingInfo info{};
+  info.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+  info.renderArea.extent = extent;
+  info.layerCount = 1;
+  info.colorAttachmentCount = 1;
+  info.pColorAttachments = &colorAtt;
+  info.pDepthAttachment = &depthAtt;
+  vkCmdBeginRendering(cmd, &info);
+
+  VkViewport vp{0.0f, 0.0f, static_cast<float>(extent.width), static_cast<float>(extent.height),
+                0.0f, 1.0f};
+  VkRect2D scissor{{0, 0}, extent};
+  vkCmdSetViewport(cmd, 0, 1, &vp);
+  vkCmdSetScissor(cmd, 0, 1, &scissor);
+  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, visPipeline_);
+  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, visPipelineLayout_, 0, 1,
+                          &frameSet, 0, nullptr);
+  float push[32];
+  writeMat4(push, scene.camera().view());
+  writeMat4(push + 16, scene.camera().proj());
+  vkCmdPushConstants(cmd, visPipelineLayout_,
+                     VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 128, push);
+  if (scene.visInstanceCount() > 0 && scene.visInstanceBuffer().buffer != VK_NULL_HANDLE) {
+    VkBuffer vb = scene.visInstanceBuffer().buffer;
+    VkDeviceSize off = 0;
+    vkCmdBindVertexBuffers(cmd, 0, 1, &vb, &off);
+    vkCmdDraw(cmd, 36, scene.visInstanceCount(), 0, 0);
+  }
+  vkCmdEndRendering(cmd);
+
+  gfx_.transitionImage(cmd, vis.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                       VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                       VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                       VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT);
+  vis.layout = VK_IMAGE_LAYOUT_GENERAL;
+  depth.layout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
 }
 
 void VoxelRenderer::updateDescriptors(VoxelScene& scene) {
-  if (outImage_.view == VK_NULL_HANDLE || scene.gridSampler() == VK_NULL_HANDLE ||
-      scene.dummyGridImage().view == VK_NULL_HANDLE ||
-      scene.dummyBrickSlabBuffer().buffer == VK_NULL_HANDLE ||
+  if (outImage_.view == VK_NULL_HANDLE || scene.dummyBrickSlabBuffer().buffer == VK_NULL_HANDLE ||
       scene.objectBuffer().buffer == VK_NULL_HANDLE ||
+      scene.coarsePoolBuffer().buffer == VK_NULL_HANDLE ||
       scene.paletteBuffer().buffer == VK_NULL_HANDLE ||
       scene.occMipBuffer().buffer == VK_NULL_HANDLE || !scene.hasSky() ||
-      dummyBeamImage_.view == VK_NULL_HANDLE) {
+      dummyBeamImage_.view == VK_NULL_HANDLE || dummyVisImage_.view == VK_NULL_HANDLE) {
     return;
   }
 
@@ -697,14 +860,9 @@ void VoxelRenderer::updateDescriptors(VoxelScene& scene) {
     uboInfo.buffer = frame.frameUBO.buffer;
     uboInfo.range = sizeof(VoxelDdaUBO);
 
-    VkDescriptorImageInfo gridInfos[VoxelScene::kGridTexCount]{};
-    for (uint32_t i = 0; i < VoxelScene::kGridTexCount; ++i) {
-      const AllocatedImage& img = scene.gridImage(i);
-      const VkImageView view = img.view != VK_NULL_HANDLE ? img.view : scene.dummyGridImage().view;
-      gridInfos[i].sampler = scene.gridSampler();
-      gridInfos[i].imageView = view;
-      gridInfos[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    }
+    VkDescriptorBufferInfo poolInfo{};
+    poolInfo.buffer = scene.coarsePoolBuffer().buffer;
+    poolInfo.range = scene.coarsePoolBuffer().size;
 
     VkDescriptorImageInfo imageInfo{};
     imageInfo.imageView = outImage_.view;
@@ -743,7 +901,13 @@ void VoxelRenderer::updateDescriptors(VoxelScene& scene) {
         beamImage_.view != VK_NULL_HANDLE ? beamImage_.view : dummyBeamImage_.view;
     beamInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
-    VkWriteDescriptorSet writes[9]{};
+    VkDescriptorImageInfo visInfo{};
+    const uint32_t fi = static_cast<uint32_t>(&frame - frames_.data());
+    visInfo.imageView =
+        visImages_[fi].view != VK_NULL_HANDLE ? visImages_[fi].view : dummyVisImage_.view;
+    visInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+    VkWriteDescriptorSet writes[10]{};
     writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[0].dstSet = frame.frameSet;
     writes[0].dstBinding = 0;
@@ -754,9 +918,9 @@ void VoxelRenderer::updateDescriptors(VoxelScene& scene) {
     writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[1].dstSet = frame.frameSet;
     writes[1].dstBinding = 1;
-    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    writes[1].descriptorCount = VoxelScene::kGridTexCount;
-    writes[1].pImageInfo = gridInfos;
+    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[1].descriptorCount = 1;
+    writes[1].pBufferInfo = &poolInfo;
 
     writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[2].dstSet = frame.frameSet;
@@ -807,25 +971,31 @@ void VoxelRenderer::updateDescriptors(VoxelScene& scene) {
     writes[8].descriptorCount = 1;
     writes[8].pImageInfo = &beamInfo;
 
-    vkUpdateDescriptorSets(gfx_.device(), 9, writes, 0, nullptr);
+    writes[9].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[9].dstSet = frame.frameSet;
+    writes[9].dstBinding = 9;
+    writes[9].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    writes[9].descriptorCount = 1;
+    writes[9].pImageInfo = &visInfo;
+
+    vkUpdateDescriptorSets(gfx_.device(), 10, writes, 0, nullptr);
   }
 
-  boundGridSampler_ = scene.gridSampler();
-  boundGridViews_.fill(VK_NULL_HANDLE);
-  for (uint32_t i = 0; i < VoxelScene::kGridTexCount; ++i) {
-    const AllocatedImage& img = scene.gridImage(i);
-    boundGridViews_[i] = img.view != VK_NULL_HANDLE ? img.view : scene.dummyGridImage().view;
-  }
   boundBrickSlabCount_ = scene.brickSlabCount();
   boundBrickSlabs_.fill(VK_NULL_HANDLE);
   for (uint32_t i = 0; i < boundBrickSlabCount_; ++i) {
     boundBrickSlabs_[i] = scene.brickSlabBuffer(i).buffer;
   }
   boundObjectBuffer_ = scene.objectBuffer().buffer;
+  boundCoarsePoolBuffer_ = scene.coarsePoolBuffer().buffer;
   boundPaletteBuffer_ = scene.paletteBuffer().buffer;
   boundOccMipBuffer_ = scene.occMipBuffer().buffer;
   boundSkyView_ = scene.sky().image.view;
   boundBeamView_ = beamImage_.view != VK_NULL_HANDLE ? beamImage_.view : dummyBeamImage_.view;
+  for (uint32_t i = 0; i < GfxDevice::kFramesInFlight; ++i) {
+    boundVisViews_[i] =
+        visImages_[i].view != VK_NULL_HANDLE ? visImages_[i].view : dummyVisImage_.view;
+  }
 }
 
 void VoxelRenderer::updateFrameUBO(VoxelScene& scene, uint32_t frameIndex) {
@@ -858,7 +1028,7 @@ void VoxelRenderer::updateFrameUBO(VoxelScene& scene, uint32_t frameIndex) {
   ubo.beamMargin = std::max(0.0f, beamMargin_);
   ubo.dirMaskBrick = dirMaskBrick_ ? 1u : 0u;
   writeVec3(ubo.solidRgb, scene.solidColor());
-  ubo.padSolidEnd = 0.0f;
+  ubo.useVis = visSelect_ ? 1u : 0u;
 
   void* mapped = frames_[frameIndex].frameUBO.info.pMappedData;
   if (!mapped) {
@@ -875,7 +1045,8 @@ bool VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
   displayFps_ = displayFps;
 
   // UI requests must not destroy resources referenced by an unsubmitted command buffer.
-  if (importRequested_ || removeImportRequested_ || rebuildRequested_) {
+  if (importRequested_ || removeImportRequested_ || rebuildRequested_ || simulateRequested_ ||
+      debrisPending_ >= 0) {
     gfx_.waitIdle();
     if (importRequested_) {
       MeshVoxelizeConfig cfg;
@@ -893,8 +1064,16 @@ bool VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
     if (rebuildRequested_) {
       scene.rebuildVoxels(gfx_);
     }
+    if (simulateRequested_) {
+      scene.setSimulate(gfx_, simulateValue_);
+    }
+    if (debrisPending_ >= 0) {
+      scene.setDebrisCount(gfx_, debrisPending_);
+    }
     importRequested_ = removeImportRequested_ = rebuildRequested_ = false;
-    boundGridSampler_ = VK_NULL_HANDLE;
+    simulateRequested_ = false;
+    debrisPending_ = -1;
+    boundCoarsePoolBuffer_ = VK_NULL_HANDLE;
   }
 
   if (gfx_.swapchainWasRecreated()) {
@@ -910,19 +1089,14 @@ bool VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
   for (uint32_t i = 0; i < scene.brickSlabCount() && !brickSlabsChanged; ++i) {
     brickSlabsChanged = scene.brickSlabBuffer(i).buffer != boundBrickSlabs_[i];
   }
-  bool gridsChanged = scene.gridSampler() != boundGridSampler_;
-  for (uint32_t i = 0; i < VoxelScene::kGridTexCount && !gridsChanged; ++i) {
-    const AllocatedImage& img = scene.gridImage(i);
-    const VkImageView view = img.view != VK_NULL_HANDLE ? img.view : scene.dummyGridImage().view;
-    gridsChanged = view != boundGridViews_[i];
-  }
-  if (gridsChanged || brickSlabsChanged ||
-      scene.objectBuffer().buffer != boundObjectBuffer_ ||
+  if (brickSlabsChanged || scene.objectBuffer().buffer != boundObjectBuffer_ ||
+      scene.coarsePoolBuffer().buffer != boundCoarsePoolBuffer_ ||
       scene.paletteBuffer().buffer != boundPaletteBuffer_ ||
       scene.occMipBuffer().buffer != boundOccMipBuffer_ ||
       scene.sky().image.view != boundSkyView_ || outImage_.view == VK_NULL_HANDLE ||
       (beamImage_.view != VK_NULL_HANDLE ? beamImage_.view : dummyBeamImage_.view) !=
-          boundBeamView_) {
+          boundBeamView_ ||
+      visImages_[0].view != boundVisViews_[0] || visImages_[1].view != boundVisViews_[1]) {
     updateDescriptors(scene);
   }
 
@@ -931,9 +1105,8 @@ bool VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
     return false;
   }
 
-  if (outImage_.image == VK_NULL_HANDLE || scene.gridSampler() == VK_NULL_HANDLE ||
-      scene.gridImage(0).view == VK_NULL_HANDLE ||
-      scene.objectBuffer().buffer == VK_NULL_HANDLE) {
+  if (outImage_.image == VK_NULL_HANDLE || scene.objectBuffer().buffer == VK_NULL_HANDLE ||
+      scene.coarsePoolBuffer().buffer == VK_NULL_HANDLE) {
     gfx_.endFrame(frame);
     return false;
   }
@@ -970,6 +1143,11 @@ bool VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
 
   vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_, 0, 1,
                           &frameSet, 0, nullptr);
+
+  if (visSelect_ && visPipeline_ && visImages_[frame.frameIndex].image &&
+      visDepths_[frame.frameIndex].image && scene.objectCount() > 0) {
+    recordVisPass(frame.cmd, scene, frame.extent, frameSet, frame.frameIndex);
+  }
 
   if (beamSkip_ && traceStage_ < kStageCoarse && scene.nestedMicroVoxels() &&
       beamPipeline_ && beamImage_.image != VK_NULL_HANDLE) {
@@ -1236,7 +1414,17 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
   if (gfx_.vsyncEnabled()) {
     ImGui::TextDisabled("VSync present mode; Display FPS is refresh-capped.");
   }
-  ImGui::Text("Objects: %u", scene.objectCount());
+  ImGui::Text("Objects: %u  (CPU %d)  vis coarses: %u", scene.objectCount(),
+              scene.cpuObjectCount(), scene.visInstanceCount());
+  ImGui::Checkbox("OBB vis-buffer", &visSelect_);
+  ImGui::TextDisabled("On: rasterize occupied coarses, DDA that id (miss falls back). Off: loop all.");
+  {
+    int debris = debrisPending_ >= 0 ? debrisPending_ : scene.debrisCount();
+    if (ImGui::SliderInt("Debris objects", &debris, 0, 30)) {
+      debrisPending_ = debris;
+    }
+    ImGui::TextDisabled("Extra 8^3 boxes. Simulate on: they fall. Off: they spin in place.");
+  }
   ImGui::Text("Occupied coarse: %u / %u", scene.occupiedCount(), scene.voxelCount());
   ImGui::Text("Brick pages: %u  slabs: %u  pool: %.1f KB", scene.allocatedBrickPages(),
               scene.brickSlabCount(), static_cast<float>(scene.brickPoolBytes()) / 1024.0f);
@@ -1277,9 +1465,10 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
     ImGui::TextDisabled("Editing whole coarse cells (each owns an 8^3 brick)");
   }
   {
-    bool sim = scene.simulate();
+    bool sim = simulateRequested_ ? simulateValue_ : scene.simulate();
     if (ImGui::Checkbox("Simulate", &sim)) {
-      scene.setSimulate(gfx_, sim);
+      simulateRequested_ = true;
+      simulateValue_ = sim;
     }
     ImGui::TextDisabled("On = solid test box falls on 3.2 m ground. Off = spinner.");
     if (scene.simulate()) {

@@ -46,7 +46,7 @@ layout(set = 0, binding = 0, std140) uniform VoxelDdaUBO {
     float beamMargin;    // world-space safety margin for DDA entry bias
     uint dirMaskBrick;   // 1 = 4^3 direction AND skip inside 8^3 octants
     vec3 solidRgb;
-    float _padSolidEnd;
+    uint useVis;
 } ubo;
 
 #define RENDER_MODE (kShadedOnly != 0u ? 0u : ubo.renderMode)
@@ -58,7 +58,9 @@ struct CoarseCell {
     uint brickPage;  // 0xFFFFFFFFu = none
 };
 
-layout(set = 0, binding = 1) uniform usampler3D grids[2];
+layout(set = 0, binding = 1, std430) readonly buffer CoarsePool {
+    uvec2 cells[];
+};
 
 layout(set = 0, binding = 2, rgba8) writeonly uniform image2D outImage;
 
@@ -78,10 +80,10 @@ struct GpuVoxelObject {
     float _pad2;
     uvec3 gridSize;
     uint flags;  // bit0 nestedMicro, bit1 enabled, bit2 import color, bit3 nestedFine
-    uint voxelOffset;  // grids[] texture index (0 = world, 1 = spinner)
+    uint voxelOffset;  // coarsePool cell index (start of this object's N³)
     uint occMipOffset;  // 4^3 coarse tiles only: two uints (64 Morton bits) each
     uint occMipWords;   // tile count * 2
-    uint _pad4;
+    uint cpuIndex;
     vec3 occMin;  // coarse inclusive
     float _padOccMin;
     vec3 occMax;  // coarse exclusive
@@ -101,6 +103,9 @@ layout(set = 0, binding = 7, std430) readonly buffer OccupancyMip {
 };
 
 layout(set = 0, binding = 8, r32f) uniform image2D beamDepth;
+layout(set = 0, binding = 9, r32f) readonly uniform image2D visImage;
+
+const uint VIS_MISS = 0xFFFFFFFFu;
 
 const uint MODE_SHADED = 0u;
 const uint MODE_ALBEDO = 1u;
@@ -164,14 +169,9 @@ bool insideOcc(GpuVoxelObject o, ivec3 p) {
 }
 
 CoarseCell readCell(GpuVoxelObject o, ivec3 p) {
-    uvec2 packed;
-    // Unroll: MoltenVK has been unreliable with nonuniform array indexing
-    // (same reason brick slabs are unrolled).
-    if (o.voxelOffset == 0u) {
-        packed = texelFetch(grids[0], p, 0).xy;
-    } else {
-        packed = texelFetch(grids[1], p, 0).xy;
-    }
+    uint n = o.gridSize.x;
+    uint idx = o.voxelOffset + uint(p.x) + uint(p.y) * n + uint(p.z) * n * n;
+    uvec2 packed = cells[idx];
     CoarseCell c;
     c.material = packed.x;
     c.brickPage = packed.y;
@@ -906,13 +906,41 @@ void main() {
     uint bestSteps = 0u;
     bool anyHit = false;
 
-    for (uint i = 0u; i < ubo.objectCount; ++i) {
-        ObjectHit h = traverseObject(objects[i], ubo.cameraPos, dir, t0, t1);
-        bestSteps = max(bestSteps, h.steps);
-        if (h.hit && h.tWorld < bestT) {
-            bestT = h.tWorld;
-            color = h.color;
-            anyHit = true;
+    if (ubo.useVis != 0u) {
+        float visPacked = imageLoad(visImage, pixel).r;
+        uint visId = visPacked >= 0.5 ? uint(visPacked + 0.5) - 1u : VIS_MISS;
+        if (visId != VIS_MISS && visId < ubo.objectCount) {
+            ObjectHit h = traverseObject(objects[visId], ubo.cameraPos, dir, t0, t1);
+            bestSteps = h.steps;
+            if (h.hit) {
+                bestT = h.tWorld;
+                color = h.color;
+                anyHit = true;
+            } else {
+                // Occupancy AABB can cover holes after a cut. Keep searching.
+                for (uint i = 0u; i < ubo.objectCount; ++i) {
+                    if (i == visId) {
+                        continue;
+                    }
+                    ObjectHit h2 = traverseObject(objects[i], ubo.cameraPos, dir, t0, t1);
+                    bestSteps = max(bestSteps, h2.steps);
+                    if (h2.hit && h2.tWorld < bestT) {
+                        bestT = h2.tWorld;
+                        color = h2.color;
+                        anyHit = true;
+                    }
+                }
+            }
+        }
+    } else {
+        for (uint i = 0u; i < ubo.objectCount; ++i) {
+            ObjectHit h = traverseObject(objects[i], ubo.cameraPos, dir, t0, t1);
+            bestSteps = max(bestSteps, h.steps);
+            if (h.hit && h.tWorld < bestT) {
+                bestT = h.tWorld;
+                color = h.color;
+                anyHit = true;
+            }
         }
     }
     if (RENDER_MODE == MODE_STEPS) {

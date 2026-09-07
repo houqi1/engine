@@ -78,6 +78,11 @@ PipelineBuilder& PipelineBuilder::setColorBlend(bool enableAlphaBlend) {
   return *this;
 }
 
+PipelineBuilder& PipelineBuilder::setColorWriteMask(VkColorComponentFlags mask) {
+  colorWriteMask_ = mask;
+  return *this;
+}
+
 PipelineBuilder& PipelineBuilder::setColorFormat(VkFormat format) {
   colorFormat_ = format;
   colorFormats_ = {format};
@@ -157,9 +162,8 @@ VkPipeline PipelineBuilder::build(VkDevice device) const {
   colorAttaches.resize(std::max(colorCount, minMaxBlendCount_));
   for (uint32_t i = 0; i < colorAttaches.size(); ++i) {
     VkPipelineColorBlendAttachmentState& att = colorAttaches[i];
-    att.colorWriteMask = colorWrite_ ? (VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                                        VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT)
-                                     : 0;
+    att.blendEnable = VK_FALSE;
+    att.colorWriteMask = colorWrite_ ? colorWriteMask_ : 0;
     if (minMaxBlendCount_ > 0 && i < minMaxBlendCount_) {
       att.blendEnable = VK_TRUE;
       att.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;

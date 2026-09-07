@@ -66,6 +66,11 @@ uint32_t packRgb888a(uint32_t rgb888) {
   return 0xFF000000u | (rgb888 & 0x00FFFFFFu);
 }
 
+uint32_t packOccupiedCoarse(int x, int y, int z) {
+  return static_cast<uint32_t>(x) | (static_cast<uint32_t>(y) << 10) |
+         (static_cast<uint32_t>(z) << 20);
+}
+
 }  // namespace
 
 glm::mat4 VoxelObject::objectToWorld() const {
@@ -106,9 +111,10 @@ void VoxelScene::init(GfxDevice& gfx) {
 
 void VoxelScene::cleanup(GfxDevice& gfx) {
   voxelizeGpu_.destroy(gfx);
-  destroyGridImages(gfx);
   gfx.destroyBuffer(dummyBrickSlabBuffer_);
   gfx.destroyBuffer(objectBuffer_);
+  gfx.destroyBuffer(visInstanceBuffer_);
+  gfx.destroyBuffer(coarsePoolBuffer_);
   gfx.destroyBuffer(paletteBuffer_);
   gfx.destroyBuffer(occMipBuffer_);
   for (BrickSlab& s : slabs_) {
@@ -118,6 +124,9 @@ void VoxelScene::cleanup(GfxDevice& gfx) {
   objects_.clear();
   objectsGpu_.clear();
   uploadedObjectsGpu_.clear();
+  visInstancesCpu_.clear();
+  uploadedVisInstances_.clear();
+  coarsePoolCpu_.clear();
   occMipCpu_.clear();
   slabs_.clear();
   freePages_.clear();
@@ -139,11 +148,21 @@ void VoxelScene::update(float dt) {
     if (objects_.size() >= 2) {
       objects_[1].enabled = true;
     }
+    for (size_t i = 2; i < objects_.size(); ++i) {
+      objects_[i].enabled = true;
+    }
     physics_.step(dt);
     physics_.syncTransformsToScene();
-  } else if (objects_.size() >= 2) {
-    objects_[1].enabled = spinnerEnabled_;
-    objects_[1].rotation = glm::angleAxis(time_ * spinSpeed_, glm::vec3(0.0f, 1.0f, 0.0f));
+  } else {
+    if (objects_.size() >= 2) {
+      objects_[1].enabled = spinnerEnabled_;
+      objects_[1].rotation = glm::angleAxis(time_ * spinSpeed_, glm::vec3(0.0f, 1.0f, 0.0f));
+    }
+    for (size_t i = 2; i < objects_.size(); ++i) {
+      objects_[i].enabled = true;
+      const float speed = spinSpeed_ * (0.35f + 0.13f * static_cast<float>(i));
+      objects_[i].rotation = glm::angleAxis(time_ * speed, glm::vec3(0.0f, 1.0f, 0.0f));
+    }
   }
   fillGpuObjectRecords();
   lastHit_ = pickCenterRay();
@@ -638,6 +657,7 @@ void VoxelScene::fillCoarseDirTiles() {
     o.occMipOffset = static_cast<uint32_t>(occMipCpu_.size());
     o.occMin = glm::vec3(0.0f);
     o.occMax = glm::vec3(0.0f);
+    o.occupiedCoarses.clear();
     const int n = o.gridSize;
     const int tileN = (n + 3) / 4;
     glm::ivec3 occMn(n);
@@ -665,6 +685,7 @@ void VoxelScene::fillCoarseDirTiles() {
                 }
                 occMn = glm::min(occMn, glm::ivec3(x, y, z));
                 occMx = glm::max(occMx, glm::ivec3(x, y, z));
+                o.occupiedCoarses.push_back(packOccupiedCoarse(x, y, z));
                 const uint32_t bit = microBitIndex(glm::ivec3(lx, ly, lz));
                 if (bit < 32u) {
                   lo |= 1u << bit;
@@ -689,9 +710,10 @@ void VoxelScene::fillCoarseDirTiles() {
 
 void VoxelScene::packObjectPool() {
   occupiedCount_ = 0;
-  for (size_t i = 0; i < objects_.size(); ++i) {
-    VoxelObject& o = objects_[i];
-    o.voxelOffset = static_cast<uint32_t>(i);
+  coarsePoolCpu_.clear();
+  for (VoxelObject& o : objects_) {
+    o.voxelOffset = static_cast<uint32_t>(coarsePoolCpu_.size());
+    coarsePoolCpu_.insert(coarsePoolCpu_.end(), o.cells.begin(), o.cells.end());
     for (const CoarseCell& c : o.cells) {
       if (c.material != 0u) {
         ++occupiedCount_;
@@ -718,6 +740,7 @@ void VoxelScene::uploadOccMip(GfxDevice& gfx) {
 void VoxelScene::fillGpuObjectRecords() {
   objectsGpu_.clear();
   objectsGpu_.reserve(objects_.size());
+  visInstancesCpu_.clear();
   for (const VoxelObject& o : objects_) {
     if (!o.enabled) {
       continue;
@@ -744,7 +767,7 @@ void VoxelScene::fillGpuObjectRecords() {
     g.voxelOffset = o.voxelOffset;
     g.occMipOffset = o.occMipOffset;
     g.occMipWords = o.occMipWords;
-    g._pad1 = 0;
+    g.cpuIndex = static_cast<uint32_t>(&o - objects_.data());
     g.occMin[0] = o.occMin.x;
     g.occMin[1] = o.occMin.y;
     g.occMin[2] = o.occMin.z;
@@ -753,84 +776,29 @@ void VoxelScene::fillGpuObjectRecords() {
     g.occMax[1] = o.occMax.y;
     g.occMax[2] = o.occMax.z;
     g._padOccMax = 0.0f;
+    const uint32_t gpuIndex = static_cast<uint32_t>(objectsGpu_.size());
     objectsGpu_.push_back(g);
+    visInstancesCpu_.reserve(visInstancesCpu_.size() + o.occupiedCoarses.size());
+    for (uint32_t packed : o.occupiedCoarses) {
+      visInstancesCpu_.push_back(VisCoarseInstance{gpuIndex, packed});
+    }
   }
 }
 
-void VoxelScene::ensureCoarseGridFormat(GfxDevice& gfx) {
-  if (gridFormatChecked_) {
+void VoxelScene::uploadCoarsePool(GfxDevice& gfx) {
+  if (coarsePoolBuffer_.buffer == VK_NULL_HANDLE) {
     return;
   }
-  VkFormatProperties props{};
-  vkGetPhysicalDeviceFormatProperties(gfx.physicalDevice(), kGridFormat, &props);
-  const VkFormatFeatureFlags need =
-      VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
-  if ((props.optimalTilingFeatures & need) != need) {
-    throw std::runtime_error("VK_FORMAT_R32G32_UINT sampled+transferDst is not supported");
-  }
-  gridFormatChecked_ = true;
-}
-
-void VoxelScene::destroyGridImages(GfxDevice& gfx) {
-  for (AllocatedImage& img : grid3D_) {
-    gfx.destroyImage(img);
-  }
-  gfx.destroyImage(dummyGrid3D_);
-  if (gridSampler_) {
-    gfx.destroySampler(gridSampler_);
-    gridSampler_ = VK_NULL_HANDLE;
-  }
-}
-
-void VoxelScene::ensureGridImages(GfxDevice& gfx) {
-  ensureCoarseGridFormat(gfx);
-  if (gridSampler_ == VK_NULL_HANDLE) {
-    gridSampler_ = gfx.createSampler(VK_FILTER_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, false,
-                                     1, 0.0f, VK_SAMPLER_MIPMAP_MODE_NEAREST);
-  }
-  if (dummyGrid3D_.image == VK_NULL_HANDLE) {
-    dummyGrid3D_ = gfx.createImage3D({1, 1, 1}, kGridFormat,
-                                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                                     VK_IMAGE_ASPECT_COLOR_BIT);
+  if (coarsePoolCpu_.empty()) {
     const CoarseCell air{};
-    gfx.uploadToImage3D(dummyGrid3D_, &air, sizeof(air), {1, 1, 1});
-  }
-  for (uint32_t i = 0; i < kGridTexCount; ++i) {
-    uint32_t n = 1;
-    if (i < objects_.size() && objects_[i].gridSize > 0) {
-      n = static_cast<uint32_t>(objects_[i].gridSize);
-    }
-    AllocatedImage& img = grid3D_[i];
-    if (img.image != VK_NULL_HANDLE && img.extent.width == n && img.extent.height == n &&
-        img.extent.depth == n && img.mipLevels == 1) {
-      continue;
-    }
-    gfx.destroyImage(img);
-    img = gfx.createImage3D({n, n, n}, kGridFormat,
-                            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                            VK_IMAGE_ASPECT_COLOR_BIT);
-  }
-}
-
-void VoxelScene::uploadGridImage(GfxDevice& gfx, uint32_t objectIndex) {
-  if (objectIndex >= kGridTexCount || objectIndex >= objects_.size()) {
+    gfx.uploadToBuffer(coarsePoolBuffer_, &air, sizeof(air));
     return;
   }
-  const VoxelObject& o = objects_[objectIndex];
-  AllocatedImage& img = grid3D_[objectIndex];
-  if (img.image == VK_NULL_HANDLE || o.cells.empty() || o.gridSize <= 0) {
-    return;
-  }
-  const uint32_t n = static_cast<uint32_t>(o.gridSize);
-  const size_t expected = static_cast<size_t>(n) * static_cast<size_t>(n) * static_cast<size_t>(n);
-  if (o.cells.size() != expected) {
-    return;
-  }
-  gfx.uploadToImage3D(img, o.cells.data(), sizeof(CoarseCell) * o.cells.size(), {n, n, n});
+  gfx.uploadToBuffer(coarsePoolBuffer_, coarsePoolCpu_.data(),
+                     sizeof(CoarseCell) * coarsePoolCpu_.size());
 }
 
 void VoxelScene::ensureGpuBuffers(GfxDevice& gfx) {
-  ensureGridImages(gfx);
   const VkDeviceSize slabBytes = sizeof(uint32_t) * kWordsPerSlab;
   const VkDeviceSize objectBytes =
       sizeof(GpuVoxelObject) * std::max<size_t>(std::max(objectsGpu_.size(), objects_.size()), 1);
@@ -853,13 +821,21 @@ void VoxelScene::ensureGpuBuffers(GfxDevice& gfx) {
   }
   if (objectBuffer_.buffer == VK_NULL_HANDLE || objectBuffer_.size < objectBytes) {
     uploadedObjectsGpu_.clear();
-    if (objectBuffer_.buffer != VK_NULL_HANDLE) {
-      gfx.waitIdle();
-    }
+    gfx.waitIdle();
     gfx.destroyBuffer(objectBuffer_);
     objectBuffer_ = gfx.createBuffer(objectBytes,
                                      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                                      VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+  }
+  const VkDeviceSize visBytes =
+      sizeof(VisCoarseInstance) * std::max<size_t>(visInstancesCpu_.size(), 1);
+  if (visInstanceBuffer_.buffer == VK_NULL_HANDLE || visInstanceBuffer_.size < visBytes) {
+    uploadedVisInstances_.clear();
+    gfx.waitIdle();
+    gfx.destroyBuffer(visInstanceBuffer_);
+    visInstanceBuffer_ = gfx.createBuffer(
+        visBytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
   }
   const VkDeviceSize paletteBytes = sizeof(glm::vec4) * 256;
   if (paletteBuffer_.buffer == VK_NULL_HANDLE || paletteBuffer_.size < paletteBytes) {
@@ -871,9 +847,21 @@ void VoxelScene::ensureGpuBuffers(GfxDevice& gfx) {
   }
   const VkDeviceSize mipBytes = sizeof(uint32_t) * std::max<size_t>(occMipCpu_.size(), 1);
   if (occMipBuffer_.buffer == VK_NULL_HANDLE || occMipBuffer_.size < mipBytes) {
+    gfx.waitIdle();
     gfx.destroyBuffer(occMipBuffer_);
     occMipBuffer_ = gfx.createBuffer(
         mipBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+  }
+  const VkDeviceSize poolBytes =
+      sizeof(CoarseCell) * std::max<size_t>(coarsePoolCpu_.size(), 1);
+  if (coarsePoolBuffer_.buffer == VK_NULL_HANDLE || coarsePoolBuffer_.size < poolBytes) {
+    if (coarsePoolBuffer_.buffer != VK_NULL_HANDLE) {
+      gfx.waitIdle();
+    }
+    gfx.destroyBuffer(coarsePoolBuffer_);
+    coarsePoolBuffer_ = gfx.createBuffer(
+        poolBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
   }
 }
@@ -904,25 +892,48 @@ void VoxelScene::flushObject(GfxDevice& gfx, int objectIndex) {
   if (objectIndex < 0 || objectIndex >= static_cast<int>(objects_.size())) {
     return;
   }
-  fillCoarseDirTiles();
+  gfx.waitIdle();
+  packObjectPool();
   fillGpuObjectRecords();
   ensureGpuBuffers(gfx);
-  uploadGridImage(gfx, static_cast<uint32_t>(objectIndex));
+  uploadCoarsePool(gfx);
   flushDirtyPages(gfx);
   uploadOccMip(gfx);
+  uploadedObjectsGpu_.clear();
+  uploadedVisInstances_.clear();
   uploadObjectTransforms(gfx);
+}
+
+void VoxelScene::uploadVisInstances(GfxDevice& gfx) {
+  if (visInstancesCpu_.empty()) {
+    uploadedVisInstances_.clear();
+    return;
+  }
+  const size_t visBytes = sizeof(VisCoarseInstance) * visInstancesCpu_.size();
+  if (visInstanceBuffer_.buffer != VK_NULL_HANDLE &&
+      uploadedVisInstances_.size() == visInstancesCpu_.size() &&
+      std::memcmp(uploadedVisInstances_.data(), visInstancesCpu_.data(), visBytes) == 0) {
+    return;
+  }
+  uploadedVisInstances_.clear();
+  gfx.waitIdle();
+  ensureGpuBuffers(gfx);
+  gfx.uploadToBuffer(visInstanceBuffer_, visInstancesCpu_.data(), visBytes);
+  uploadedVisInstances_ = visInstancesCpu_;
 }
 
 void VoxelScene::uploadObjectTransforms(GfxDevice& gfx) {
   fillGpuObjectRecords();
   if (objectsGpu_.empty()) {
     uploadedObjectsGpu_.clear();
+    uploadedVisInstances_.clear();
     return;
   }
   const size_t objectBytes = sizeof(GpuVoxelObject) * objectsGpu_.size();
   if (objectBuffer_.buffer != VK_NULL_HANDLE &&
       uploadedObjectsGpu_.size() == objectsGpu_.size() &&
       std::memcmp(uploadedObjectsGpu_.data(), objectsGpu_.data(), objectBytes) == 0) {
+    uploadVisInstances(gfx);
     return;
   }
 
@@ -932,6 +943,7 @@ void VoxelScene::uploadObjectTransforms(GfxDevice& gfx) {
   ensureGpuBuffers(gfx);
   gfx.uploadToBuffer(objectBuffer_, objectsGpu_.data(), objectBytes);
   uploadedObjectsGpu_ = objectsGpu_;
+  uploadVisInstances(gfx);
 }
 
 void VoxelScene::buildGroundObject(VoxelObject& o) {
@@ -1040,10 +1052,55 @@ void VoxelScene::buildTestBoxObject(VoxelObject& o) {
   }
 }
 
+void VoxelScene::buildDebrisObject(VoxelObject& o, int debrisIndex, int debrisTotal) {
+  buildTestBoxObject(o);
+  const int n = std::max(1, debrisTotal);
+  const float tau = 6.2831853f;
+  const float ang = tau * (static_cast<float>(debrisIndex) + 0.5f) / static_cast<float>(n);
+  const float radius = 10.0f;
+  o.position = glm::vec3(std::cos(ang) * radius, 7.0f + static_cast<float>(debrisIndex % 3) * 1.2f,
+                         std::sin(ang) * radius);
+  o.rotation = glm::angleAxis(ang * 0.35f, glm::vec3(0.0f, 1.0f, 0.0f));
+}
+
+void VoxelScene::spawnDebrisObjects() {
+  const int n = std::clamp(debrisCount_, 0, static_cast<int>(kMaxShapes) - 2);
+  debrisCount_ = n;
+  objects_.reserve(static_cast<size_t>(2 + n));
+  for (int i = 0; i < n; ++i) {
+    objects_.emplace_back();
+    buildDebrisObject(objects_.back(), i, n);
+  }
+}
+
+void VoxelScene::setDebrisCount(GfxDevice& gfx, int count) {
+  const int n = std::clamp(count, 0, static_cast<int>(kMaxShapes) - 2);
+  if (objects_.size() < 2) {
+    return;
+  }
+  if (n == debrisCount_ && static_cast<int>(objects_.size()) == 2 + n) {
+    return;
+  }
+  gfx.waitIdle();
+  while (static_cast<int>(objects_.size()) > 2) {
+    clearObjectPages(objects_.back());
+    objects_.pop_back();
+  }
+  debrisCount_ = n;
+  spawnDebrisObjects();
+  packObjectPool();
+  fillGpuObjectRecords();
+  ensureGpuBuffers(gfx);
+  uploadWorldAndObjects(gfx);
+  physics_.attach(*this);
+  physics_.rebuildFromScene();
+}
+
 void VoxelScene::setSimulate(GfxDevice& gfx, bool on) {
   if (simulate_ == on) {
     return;
   }
+  gfx.waitIdle();
   simulate_ = on;
   if (objects_.size() < 2) {
     return;
@@ -1057,7 +1114,9 @@ void VoxelScene::setSimulate(GfxDevice& gfx, bool on) {
     objects_[1].enabled = spinnerEnabled_;
   }
   packObjectPool();
-  flushObject(gfx, 1);
+  fillGpuObjectRecords();
+  ensureGpuBuffers(gfx);
+  uploadWorldAndObjects(gfx);
   physics_.attach(*this);
   physics_.rebuildFromScene();
 }
@@ -1168,6 +1227,7 @@ void VoxelScene::rebuildVoxels(GfxDevice& gfx) {
   // Static frames no longer drain the queue through an object upload.
   gfx.waitIdle();
   uploadedObjectsGpu_.clear();
+  uploadedVisInstances_.clear();
   const int n = std::clamp(gridSize_, 8, 64);
   gridSize_ = n;
   maxSteps_ = static_cast<uint32_t>(std::max(16, n * 3));
@@ -1190,6 +1250,7 @@ void VoxelScene::rebuildVoxels(GfxDevice& gfx) {
   } else {
     buildSpinnerObject(objects_[1]);
   }
+  spawnDebrisObjects();
 
   packObjectPool();
   fillGpuObjectRecords();
@@ -1210,10 +1271,8 @@ void VoxelScene::rebuildVoxels(GfxDevice& gfx) {
 }
 
 void VoxelScene::uploadWorldAndObjects(GfxDevice& gfx) {
-  ensureGridImages(gfx);
-  for (uint32_t i = 0; i < kGridTexCount; ++i) {
-    uploadGridImage(gfx, i);
-  }
+  ensureGpuBuffers(gfx);
+  uploadCoarsePool(gfx);
   uploadOccMip(gfx);
   uploadObjectTransforms(gfx);
 }
@@ -1419,7 +1478,8 @@ void VoxelScene::removeImportedMesh(GfxDevice& gfx) {
 }
 
 int VoxelScene::applyCoarseSphereBrush(VoxelObject& o, const glm::ivec3& center, float radius,
-                                       uint32_t material, bool placeOnlyEmpty) {
+                                       uint32_t material, bool placeOnlyEmpty,
+                                       std::vector<glm::ivec3>* deletedAbsFines) {
   const float r = std::max(0.0f, radius);
   const int extent = static_cast<int>(std::ceil(r));
   const float r2 = r * r;
@@ -1444,6 +1504,18 @@ int VoxelScene::applyCoarseSphereBrush(VoxelObject& o, const glm::ivec3& center,
         }
         if (setVoxelCpu(o, p, material)) {
           ++changed;
+          if (deletedAbsFines && material == 0u) {
+            const glm::ivec3 base = p * kFinePerCoarse;
+            deletedAbsFines->reserve(deletedAbsFines->size() +
+                                     static_cast<size_t>(kFinePerBrick));
+            for (int z = 0; z < kFinePerCoarse; ++z) {
+              for (int y = 0; y < kFinePerCoarse; ++y) {
+                for (int x = 0; x < kFinePerCoarse; ++x) {
+                  deletedAbsFines->push_back(base + glm::ivec3(x, y, z));
+                }
+              }
+            }
+          }
         }
       }
     }
@@ -1453,7 +1525,8 @@ int VoxelScene::applyCoarseSphereBrush(VoxelObject& o, const glm::ivec3& center,
 
 int VoxelScene::applyMicroSphereBrush(VoxelObject& o, const glm::ivec3& coarse,
                                       const glm::ivec3& micro, float radius, bool solid,
-                                      uint32_t placeMaterial) {
+                                      uint32_t placeMaterial,
+                                      std::vector<glm::ivec3>* deletedAbsFines) {
   const float r = std::max(0.0f, radius);
   const int extent = static_cast<int>(std::ceil(r));
   const float r2 = r * r;
@@ -1499,6 +1572,16 @@ int VoxelScene::applyMicroSphereBrush(VoxelObject& o, const glm::ivec3& coarse,
           }
           if (setMicroCpu(o, c, m, false)) {
             ++changed;
+            if (deletedAbsFines) {
+              const glm::ivec3 base = c * kFinePerCoarse + m * kFineRes;
+              for (int z = 0; z < kFineRes; ++z) {
+                for (int y = 0; y < kFineRes; ++y) {
+                  for (int x = 0; x < kFineRes; ++x) {
+                    deletedAbsFines->push_back(base + glm::ivec3(x, y, z));
+                  }
+                }
+              }
+            }
           }
         }
       }
@@ -1509,7 +1592,8 @@ int VoxelScene::applyMicroSphereBrush(VoxelObject& o, const glm::ivec3& coarse,
 
 int VoxelScene::applyFineSphereBrush(VoxelObject& o, const glm::ivec3& coarse,
                                      const glm::ivec3& micro, const glm::ivec3& fine, float radius,
-                                     bool solid, uint32_t placeMaterial) {
+                                     bool solid, uint32_t placeMaterial,
+                                     std::vector<glm::ivec3>* deletedAbsFines) {
   const float r = std::max(0.0f, radius);
   const int extent = static_cast<int>(std::ceil(r));
   const float r2 = r * r;
@@ -1561,6 +1645,9 @@ int VoxelScene::applyFineSphereBrush(VoxelObject& o, const glm::ivec3& coarse,
           }
           if (setFineCpu(o, c, m, f, false)) {
             ++changed;
+            if (deletedAbsFines) {
+              deletedAbsFines->push_back(absFine);
+            }
           }
         }
       }
@@ -1825,12 +1912,13 @@ void VoxelScene::handleEditInput(GLFWwindow* window, GfxDevice& gfx) {
   const uint32_t mat = static_cast<uint32_t>(std::clamp(brushMaterial_, 1, 255));
 
   int changed = 0;
+  std::vector<glm::ivec3> deletedFines;
   if (nestedMicroVoxels_ && nestedFineVoxels_ && (hit->hasFine || hit->hasMicro)) {
     glm::ivec3 fine = hit->fine;
     glm::ivec3 micro = hit->micro;
     glm::ivec3 coarse = hit->cell;
     if (removeEdge) {
-      changed = applyFineSphereBrush(o, coarse, micro, fine, radius, false, mat);
+      changed = applyFineSphereBrush(o, coarse, micro, fine, radius, false, mat, &deletedFines);
     } else if (placeEdge) {
       glm::ivec3 placeFine = fine + hit->normal;
       glm::ivec3 placeMicro = micro;
@@ -1859,7 +1947,7 @@ void VoxelScene::handleEditInput(GLFWwindow* window, GfxDevice& gfx) {
     glm::ivec3 micro = hit->micro;
     glm::ivec3 coarse = hit->cell;
     if (removeEdge) {
-      changed = applyMicroSphereBrush(o, coarse, micro, radius, false, mat);
+      changed = applyMicroSphereBrush(o, coarse, micro, radius, false, mat, &deletedFines);
     } else if (placeEdge) {
       glm::ivec3 placeMicro = micro + hit->normal;
       glm::ivec3 placeCoarse = coarse;
@@ -1878,17 +1966,25 @@ void VoxelScene::handleEditInput(GLFWwindow* window, GfxDevice& gfx) {
     }
   } else {
     if (removeEdge) {
-      changed = applyCoarseSphereBrush(o, hit->cell, radius, 0, false);
+      changed = applyCoarseSphereBrush(o, hit->cell, radius, 0, false, &deletedFines);
     } else if (placeEdge) {
       changed = applyCoarseSphereBrush(o, hit->cell + hit->normal, radius, mat, true);
     }
   }
 
   if (changed > 0) {
+    const int nBefore = static_cast<int>(objects_.size());
+    if (!deletedFines.empty()) {
+      maybeFracture(objIndex, deletedFines);
+    }
     recountOccupiedMicro();
     recountOccupiedFine();
     flushObject(gfx, objIndex);
     notifyOccupancyChanged(objIndex);
+    for (int i = nBefore; i < static_cast<int>(objects_.size()); ++i) {
+      notifyOccupancyChanged(i);
+    }
+    physics_.rebuildDirty();
   }
   lastHit_ = pickCenterRay();
 }

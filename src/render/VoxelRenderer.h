@@ -71,7 +71,7 @@ private:
     float beamMargin;
     uint32_t dirMaskBrick;
     float solidRgb[3];
-    float padSolidEnd;
+    uint32_t useVis;
   };
   static_assert(sizeof(VoxelDdaUBO) == 256, "VoxelDdaUBO std140 size mismatch");
 
@@ -115,6 +115,8 @@ private:
                                   bool useSpec = true) const;
   void createOutputImage();
   void destroyOutputImage();
+  void recordVisPass(VkCommandBuffer cmd, VoxelScene& scene, VkExtent2D extent,
+                     VkDescriptorSet frameSet, uint32_t frameIndex);
   void updateDescriptors(VoxelScene& scene);
   void updateFrameUBO(VoxelScene& scene, uint32_t frameIndex);
   void createTimestampPool();
@@ -132,6 +134,8 @@ private:
   VkDescriptorPool imguiPool_ = VK_NULL_HANDLE;
 
   VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
+  VkPipelineLayout visPipelineLayout_ = VK_NULL_HANDLE;
+  VkPipeline visPipeline_ = VK_NULL_HANDLE;
   VkPipeline computePipeline_ = VK_NULL_HANDLE;
   VkPipeline specializedFullPipeline_ = VK_NULL_HANDLE;
   VkPipeline specializedSinglePipeline_ = VK_NULL_HANDLE;
@@ -145,23 +149,33 @@ private:
   AllocatedImage outImage_{};
   AllocatedImage beamImage_{};
   AllocatedImage dummyBeamImage_{};
+  std::array<AllocatedImage, GfxDevice::kFramesInFlight> visImages_{};
+  std::array<AllocatedImage, GfxDevice::kFramesInFlight> visDepths_{};
+  AllocatedImage dummyVisImage_{};
   static constexpr VkFormat kOutFormat = VK_FORMAT_R8G8B8A8_UNORM;
   static constexpr VkFormat kBeamFormat = VK_FORMAT_R32_SFLOAT;
+  static constexpr VkFormat kVisFormat = VK_FORMAT_R32_SFLOAT;
+  static constexpr VkFormat kVisDepthFormat = VK_FORMAT_D32_SFLOAT;
+  static constexpr uint32_t kVisMiss = 0xFFFFFFFFu;
 
   std::array<FrameResources, GfxDevice::kFramesInFlight> frames_{};
-  std::array<VkImageView, VoxelScene::kGridTexCount> boundGridViews_{};
-  VkSampler boundGridSampler_ = VK_NULL_HANDLE;
   std::array<VkBuffer, VoxelScene::kMaxBrickSlabs> boundBrickSlabs_{};
   uint32_t boundBrickSlabCount_ = 0;
   VkBuffer boundObjectBuffer_ = VK_NULL_HANDLE;
+  VkBuffer boundCoarsePoolBuffer_ = VK_NULL_HANDLE;
   VkBuffer boundPaletteBuffer_ = VK_NULL_HANDLE;
   VkBuffer boundOccMipBuffer_ = VK_NULL_HANDLE;
   VkImageView boundSkyView_ = VK_NULL_HANDLE;
   VkImageView boundBeamView_ = VK_NULL_HANDLE;
+  std::array<VkImageView, GfxDevice::kFramesInFlight> boundVisViews_{};
+  bool visSelect_ = true;
   bool imguiReady_ = false;
   bool importRequested_ = false;
   bool removeImportRequested_ = false;
   bool rebuildRequested_ = false;
+  bool simulateRequested_ = false;
+  bool simulateValue_ = false;
+  int debrisPending_ = -1;
   float displayFps_ = 0.0f;
   int traceStage_ = 0;
   bool brickBitSkip_ = true;

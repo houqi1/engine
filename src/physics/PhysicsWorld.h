@@ -14,6 +14,9 @@ public:
   void attach(VoxelScene& scene);
   void rebuildFromScene();
   void markDirty(int objectIndex);
+  // src stays; dst is a newly appended CPU object. Copies velocity and adds w × r.
+  void onSplit(int srcIndex, int dstIndex, const glm::vec3& newCenterWorld);
+  void rebuildDirty();
   void step(float frameDt);
   void syncTransformsToScene();
 
@@ -21,7 +24,6 @@ public:
   DebugSolve debugSolve() const { return debug_; }
 
 private:
-  void rebuildDirty();
   void substep();
   void updateSleep(float h);
 

@@ -19,6 +19,7 @@ public:
   PipelineBuilder& setDepthTest(bool enable, bool write, VkCompareOp compare);
   PipelineBuilder& setDepthClamp(bool enable);
   PipelineBuilder& setColorBlend(bool enableAlphaBlend);
+  PipelineBuilder& setColorWriteMask(VkColorComponentFlags mask);
   PipelineBuilder& setColorFormat(VkFormat format);
   PipelineBuilder& setColorFormats(const std::vector<VkFormat>& formats);
   // Dual/triple attachments: [0]=MIN, [1]=MAX, optional [2]=MIN (no depth, factors ignored).
@@ -48,6 +49,8 @@ private:
 
   bool blend_ = false;
   bool colorWrite_ = true;
+  VkColorComponentFlags colorWriteMask_ = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                          VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
   uint32_t minMaxBlendCount_ = 0;
 
   VkFormat colorFormat_ = VK_FORMAT_UNDEFINED;

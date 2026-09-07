@@ -225,12 +225,14 @@ void computeMassProperties(VoxelScene& scene, int objectIndex, RigidBody& body) 
   body.occupiedFine = count;
   if (mass <= 1e-8 || !body.dynamic) {
     body.invM = 0.0f;
+    body.comLocal = gridCenter;
     body.Iloc = glm::mat3(1.0f);
     body.IinvW = glm::mat3(0.0f);
     return;
   }
 
   const glm::dvec3 com = moment / mass;
+  body.comLocal = glm::vec3(com);
   glm::dmat3 I(0.0);
   const double a = static_cast<double>(o.voxelSize);
   const double a2 = a * a;
@@ -282,17 +284,11 @@ void computeMassProperties(VoxelScene& scene, int objectIndex, RigidBody& body) 
     }
   }
 
-  const glm::dvec3 d = com - glm::dvec3(gridCenter);
-  const double d2 = glm::dot(d, d);
-  I[0][0] += mass * (d2 - d.x * d.x);
-  I[1][1] += mass * (d2 - d.y * d.y);
-  I[2][2] += mass * (d2 - d.z * d.z);
-  I[0][1] -= mass * d.x * d.y;
-  I[1][0] -= mass * d.x * d.y;
-  I[0][2] -= mass * d.x * d.z;
-  I[2][0] -= mass * d.x * d.z;
-  I[1][2] -= mass * d.y * d.z;
-  I[2][1] -= mass * d.y * d.z;
+  const glm::vec3 newComW = glm::vec3(o.objectToWorld() * glm::vec4(body.comLocal, 1.0f));
+  if (body.invM > 0.0f) {
+    body.v += glm::cross(body.w, newComW - body.x);
+  }
+  body.x = newComW;
 
   body.invM = static_cast<float>(1.0 / mass);
   for (int i = 0; i < 3; ++i) {

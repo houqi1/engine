@@ -7,8 +7,8 @@ Status: **方案，未实现。** 碰撞从第一版就用角/棱分类，不做
 Related shipped code:
 
 - `src/scene/VoxelScene.h` / `.cpp` — `VoxelObject`、coarse 页表、全局 brick pool、`getFine` / `setFineCpu`、`flushDirtyPages`
-- `shaders/voxel_dda.comp` — 物体循环 + coarse DDA + 8³ + 2³；`usampler3D grids[2]`
-- `src/render/VoxelRenderer.cpp` — hull + compute DDA
+- `shaders/voxel_dda.comp` — vis-buffer objectId + coarse DDA + 8³ + 2³；`coarsePool` SSBO
+- `src/render/VoxelRenderer.cpp` — OBB vis-buffer + compute DDA
 - `docs/nested-brick-voxels.md` — 空 brick 不租页（已上）
 - `docs/object-order-ess.md` — occupancy hull（已上，多物体可见性要接到这里）
 
@@ -104,7 +104,7 @@ Teardown 公开技术说明：两个多面体碰到，一定经过角或棱；�
 
 连通只认 **六面**。角碰、棱碰不算连；那种结构一损坏或变成动态就会散。
 
-每个 Shape 在编辑前视为单连通。挖完从被删格的邻居出发，看还能不能走回主体。没断：**O(1) 离开**，不 flood 整块。
+每个 Shape 在编辑前视为单连通。挖完从被删格的邻居做多种子 BFS + 并查集：种子汇合则没断、立刻返回；小岛队列清空则剥走，不灌主体。实现：`src/physics/Fracture.cpp`（`VoxelScene::maybeFracture`）。
 
 断了：
 
@@ -151,25 +151,21 @@ hSub = h / nSub
 
 ## 7. 画面能画第 3 块（砸开的硬前置）
 
-`grids[2]` 只能画地 + 一个动态物。物理可以有 100 个 Body，看不见也对不了。
+**存储：** 所有 Shape 的 coarse 页表进一份 `coarsePool` SSBO。世界也进 pool，没有 `grids[2]`。
 
 ```text
-coarsePool SSBO：所有 Shape 的页表紧排
-GpuVoxelObject.voxelOffset = 该 Shape 在 pool 的起点
+coarsePool[]              uvec2 {material, brickPage} 紧排
+GpuVoxelObject.voxelOffset = 该 Shape 在 pool 的起点（格子下标）
+GpuVoxelObject.cpuIndex    = CPU objects_ 下标
 gridSize 可变（地 64，碎块 8/16）
 brick slabs 不动，全局 page 索引
 ```
 
-Shader `readCell`：
+`readCell`：`coarsePool[voxelOffset + x + yN + zN²]`。不要 `grids[非均匀下标]`（MoltenVK）。
 
-- 世界可暂时留 `grids[0]`：`是世界` → `texelFetch`
-- 其它：`coarsePool[offset + x + yN + zN²]`
+**可见性：** 光栅每个物体的 OBB（12 三角，无剔除），片元写 `objectId` + 入口深度（reverse-Z）。compute 只 `traverseObject(objects[id])`。miss = 天空。调试可关 vis 回到物体循环。
 
-不要 `grids[非均匀下标]`（MoltenVK）。最终态：世界也进 `coarsePool`，去掉特权 3D 图。
-
-物体数组先按 **256** 开，满了拒绝 new、删最小渣。
-
-像素不要 `for objectCount`。hull 带物体编号，compute 只 traverse 命中的 id（接 `object-order-ess.md`）。碎块经常 >200 再做深度 bin。
+物体数组先按 **256** 开，满了拒绝 new、删最小渣。碎块经常 >200 再做深度 bin。
 
 ---
 
@@ -238,12 +234,12 @@ Shader `readCell`：
 改：
 
 - `VoxelScene` — `coarsePool` CPU + GPU；`packObjectPool` 按物体拼接 `cells[]`
-- `GpuVoxelObject.voxelOffset` — 页表起点，不是 `grids[]` 下标
-- `voxel_dda.comp` / `voxel_dda_coarse.comp` — `readCell` 两路
-- `VoxelRenderer.cpp` — descriptor、物体数 ≠ 2
-- hull 带 `objectId`；DDA 去掉全物体循环
+- `GpuVoxelObject.voxelOffset` — 页表起点；`cpuIndex` — CPU 下标
+- `voxel_dda.comp` / `voxel_dda_coarse.comp` — `readCell` 走 pool
+- `object_obb.vert` / `.frag` — OBB vis-buffer
+- `VoxelRenderer.cpp` — binding 1 = coarsePool；光栅 OBB → compute 只 traverse id
 
-验收：不跑物理，CPU spawn 30 个小 `VoxelObject`（grid 8），各自转，格子不错位；关掉能回收。
+验收：Debris slider 0–30 个 `gridSize=8`，各自转，格子不错位；关掉能回收。Simulate 开时碎块落地。
 
 ### 提交 C — 砸开（依赖 B）
 
@@ -273,8 +269,8 @@ Shader `readCell`：
 | 占用 | 已有 `getFine` / `setFineCpu`，物理只用它们 |
 | 脏页 | 已有 `flushDirtyPages` |
 | 变换 | 已有 `uploadObjectTransforms` |
-| 两物体上限 | `kGridTexCount`、`grids[2]`、`readCell` |
-| 每像素扫全体 | `voxel_dda.comp` 的 `for objectCount` |
+| 两物体上限 | 已换成 `coarsePool` + vis-buffer |
+| 每像素扫全体 | 产品路径是 OBB vis；循环仅调试开关 |
 | spinner 空转 | `VoxelScene::update` 里 `angleAxis(time * spinSpeed)` |
 | 刷子 | `handleEditInput` → 改格后接 `maybeFracture` |
 | brick 布局 | **不重写** |
@@ -287,7 +283,7 @@ Shader `readCell`：
 
 写进文档是为了钉死，不是已经拍板：
 
-1. **世界 coarse 最终是否也进 `coarsePool`，去掉 `grids[0]`。** 第一版可混合；最终更干净。
+1. **世界 coarse 已进 `coarsePool`，`grids[]` 已删除。**
 2. **Body 原点：** 网格中心 vs 质心。第一版建议网格中心，惯量绕它算，少一套偏移。
 3. **静→动：** 完全脱离地面/世界才 dynamic（Teardown 玩法），还是一断开就掉。建议前者。
 4. **`nSub = 6`、休眠 0.05 m/s / 0.5 s、残渣 8 fine、每法线组最多 4 个接触（Box3D 缩减）** — 都是经验值，用验收调，改了要写回本节。
