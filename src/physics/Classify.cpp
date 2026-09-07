@@ -140,6 +140,15 @@ void rebuildShapeClass(VoxelScene& scene, int objectIndex, ShapeClass& out) {
   out.occFineMx = (mx + 1) * Fcls - glm::ivec3(1);
   out.occValid = true;
 
+  // Static world: collidePair probes occupancy, it never iterates these lists.
+  // Classifying 64×2×64 ground cubes here made every split O(ground).
+  if (objectIndex == 0) {
+    out.corners.clear();
+    out.edges.clear();
+    out.dirty = false;
+    return;
+  }
+
   bool solidBox = !anyBrick;
   if (solidBox) {
     for (int z = mn.z; z <= mx.z && solidBox; ++z) {

@@ -1,63 +1,53 @@
 #include "physics/Island.h"
 
-#include <algorithm>
-
 namespace physics {
 
 void IslandSet::clear() { islands_.clear(); }
 
-Island& IslandSet::ensureForShape(int shapeIndex) {
-  for (Island& is : islands_) {
-    if (is.shapeIndex == shapeIndex) {
-      return is;
-    }
-  }
+Island& IslandSet::add(int shapeIndex) {
   Island is;
   is.id = static_cast<int>(islands_.size());
   is.shapeIndex = shapeIndex;
-  is.asleep = false;
+  is.asleep = true;
   is.needsSplit = false;
   is.sleepTimer = 0.0f;
-  is.settleLeft = 12;
+  is.settleLeft = 0;
+  is.brokenThisDt = 0;
+  is.vmax = 0.0f;
   islands_.push_back(is);
   return islands_.back();
 }
 
-Island* IslandSet::findByShape(int shapeIndex) {
-  for (Island& is : islands_) {
-    if (is.shapeIndex == shapeIndex) {
-      return &is;
-    }
+Island* IslandSet::byId(int id) {
+  if (id < 0 || id >= static_cast<int>(islands_.size())) {
+    return nullptr;
   }
-  return nullptr;
+  return &islands_[static_cast<size_t>(id)];
 }
 
-const Island* IslandSet::findByShape(int shapeIndex) const {
-  for (const Island& is : islands_) {
-    if (is.shapeIndex == shapeIndex) {
-      return &is;
-    }
+const Island* IslandSet::byId(int id) const {
+  if (id < 0 || id >= static_cast<int>(islands_.size())) {
+    return nullptr;
   }
-  return nullptr;
+  return &islands_[static_cast<size_t>(id)];
 }
 
-void IslandSet::wakeShape(int shapeIndex) {
-  Island* is = findByShape(shapeIndex);
+void IslandSet::wake(int islandId) {
+  Island* is = byId(islandId);
   if (!is) {
     return;
   }
   is->asleep = false;
   is->sleepTimer = 0.0f;
-  is->settleLeft = std::max(is->settleLeft, 6);
 }
 
-bool IslandSet::consumeSplit(int shapeIndex) {
-  Island* is = findByShape(shapeIndex);
-  if (!is || !is->needsSplit) {
-    return false;
+int IslandSet::firstNeedsSplit() const {
+  for (const Island& is : islands_) {
+    if (is.needsSplit && !is.nodes.empty()) {
+      return is.id;
+    }
   }
-  is->needsSplit = false;
-  return true;
+  return -1;
 }
 
 }  // namespace physics

@@ -157,12 +157,6 @@ int nextGridN(int coarseExtent) {
   return 64;
 }
 
-constexpr int kGroundCoarseY = 2;
-
-bool isStaticGroundFine(int objectIndex, const glm::ivec3& absFine) {
-  return objectIndex == 0 && (absFine.y / kFinePerCoarse) < kGroundCoarseY;
-}
-
 }  // namespace
 
 bool VoxelScene::solidAbsFine(const VoxelObject& o, const glm::ivec3& absFine) const {
@@ -179,8 +173,12 @@ bool VoxelScene::solidAbsFine(const VoxelObject& o, const glm::ivec3& absFine) c
 }
 
 void VoxelScene::clearPackedFines(VoxelObject& o, const std::vector<uint32_t>& packedFines) {
+  const int srcIndex = static_cast<int>(&o - objects_.data());
   for (uint32_t p : packedFines) {
     const glm::ivec3 abs = unpackFine(p);
+    if (srcIndex >= 0 && isTerrainFine(srcIndex, abs)) {
+      continue;
+    }
     const glm::ivec3 c = abs / kFinePerCoarse;
     const glm::ivec3 rem = abs - c * kFinePerCoarse;
     const glm::ivec3 m = rem / kFineRes;
@@ -197,15 +195,23 @@ void VoxelScene::emitFracturePiece(int srcIndex, const std::vector<uint32_t>& pa
     // Cap is full: leave the island on the source. Deleting it made the world vanish.
     return;
   }
-  if (packedFines.size() < physics::kResidualFineLimit) {
-    clearPackedFines(objects_[static_cast<size_t>(srcIndex)], packedFines);
+
+  std::vector<uint32_t> houseFines;
+  houseFines.reserve(packedFines.size());
+  for (uint32_t p : packedFines) {
+    if (!isTerrainFine(srcIndex, unpackFine(p))) {
+      houseFines.push_back(p);
+    }
+  }
+  if (houseFines.size() < physics::kResidualFineLimit) {
+    clearPackedFines(objects_[static_cast<size_t>(srcIndex)], houseFines);
     return;
   }
 
   VoxelObject& src = objects_[static_cast<size_t>(srcIndex)];
   glm::ivec3 mn(1024);
   glm::ivec3 mx(-1);
-  for (uint32_t p : packedFines) {
+  for (uint32_t p : houseFines) {
     const glm::ivec3 abs = unpackFine(p);
     mn = glm::min(mn, abs);
     mx = glm::max(mx, abs);
@@ -236,7 +242,7 @@ void VoxelScene::emitFracturePiece(int srcIndex, const std::vector<uint32_t>& pa
     uint32_t count = 0;
   };
   std::vector<CoarseBucket> buckets;
-  buckets.reserve(packedFines.size() / 16 + 1);
+  buckets.reserve(houseFines.size() / 16 + 1);
   auto bucketOf = [&](const glm::ivec3& oldC) -> CoarseBucket& {
     for (CoarseBucket& b : buckets) {
       if (b.oldC == oldC) {
@@ -246,8 +252,12 @@ void VoxelScene::emitFracturePiece(int srcIndex, const std::vector<uint32_t>& pa
     buckets.push_back(CoarseBucket{oldC, 0});
     return buckets.back();
   };
-  for (uint32_t p : packedFines) {
-    ++bucketOf(unpackFine(p) / kFinePerCoarse).count;
+  for (uint32_t p : houseFines) {
+    const glm::ivec3 oldC = unpackFine(p) / kFinePerCoarse;
+    if (isTerrainCoarse(srcIndex, oldC)) {
+      continue;
+    }
+    ++bucketOf(oldC).count;
   }
 
   auto solidInCoarse = [&](const VoxelObject& o, const glm::ivec3& c) -> uint32_t {
@@ -270,6 +280,9 @@ void VoxelScene::emitFracturePiece(int srcIndex, const std::vector<uint32_t>& pa
   };
 
   for (const CoarseBucket& b : buckets) {
+    if (isTerrainCoarse(srcIndex, b.oldC) || !inBounds(src, b.oldC)) {
+      continue;
+    }
     const glm::ivec3 nc = b.oldC - c0;
     if (nc.x < 0 || nc.y < 0 || nc.z < 0 || nc.x >= newN || nc.y >= newN || nc.z >= newN) {
       continue;
@@ -293,9 +306,15 @@ void VoxelScene::emitFracturePiece(int srcIndex, const std::vector<uint32_t>& pa
     }
   }
 
-  for (uint32_t p : packedFines) {
+  for (uint32_t p : houseFines) {
     const glm::ivec3 abs = unpackFine(p);
+    if (isTerrainFine(srcIndex, abs)) {
+      continue;
+    }
     const glm::ivec3 oldC = abs / kFinePerCoarse;
+    if (isTerrainCoarse(srcIndex, oldC) || !inBounds(src, oldC)) {
+      continue;
+    }
     const glm::ivec3 rem = abs - oldC * kFinePerCoarse;
     const glm::ivec3 m = rem / kFineRes;
     const glm::ivec3 f = rem - m * kFineRes;
@@ -328,8 +347,14 @@ void VoxelScene::emitFracturePiece(int srcIndex, const std::vector<uint32_t>& pa
 }
 
 bool VoxelScene::maybeFracture(int objectIndex, const std::vector<glm::ivec3>& deletedAbsFines) {
-  if (objectIndex < 0 || objectIndex >= static_cast<int>(objects_.size()) ||
-      deletedAbsFines.empty()) {
+  if (objectIndex == 0) {
+    return peelUnsupportedIslands(objectIndex);
+  }
+  return splitDetachedFromCuts(objectIndex, deletedAbsFines);
+}
+
+bool VoxelScene::peelUnsupportedIslands(int objectIndex) {
+  if (objectIndex != 0 || objectIndex >= static_cast<int>(objects_.size())) {
     return false;
   }
   VoxelObject& o = objects_[static_cast<size_t>(objectIndex)];
@@ -341,6 +366,254 @@ bool VoxelScene::maybeFracture(int objectIndex, const std::vector<glm::ivec3>& d
     return false;
   }
 
+  std::vector<glm::ivec3> occupied;
+  if (!o.occupiedCoarses.empty()) {
+    occupied.reserve(o.occupiedCoarses.size());
+    for (uint32_t packed : o.occupiedCoarses) {
+      occupied.emplace_back(static_cast<int>(packed & 1023u),
+                            static_cast<int>((packed >> 10) & 1023u),
+                            static_cast<int>((packed >> 20) & 1023u));
+    }
+  } else {
+    occupied.reserve(static_cast<size_t>(o.gridSize) * 4u);
+    for (int z = 0; z < o.gridSize; ++z) {
+      for (int y = 0; y < o.gridSize; ++y) {
+        for (int x = 0; x < o.gridSize; ++x) {
+          const glm::ivec3 c(x, y, z);
+          if (occupancyMaterial(objectIndex, c) != 0u) {
+            occupied.push_back(c);
+          }
+        }
+      }
+    }
+  }
+
+  FineVisit visit;
+  visit.reset(256);
+  std::vector<uint32_t> q;
+  q.reserve(4096);
+  std::vector<uint8_t> coarseJumped(o.cells.size(), 0);
+
+  auto tryQueue = [&](const glm::ivec3& fp) {
+    if (!solidAbsFine(o, fp) || isTerrainFine(objectIndex, fp)) {
+      return;
+    }
+    int lab = 0;
+    if (visit.insertOrGet(packFine(fp.x, fp.y, fp.z), 0, &lab)) {
+      q.push_back(packFine(fp.x, fp.y, fp.z));
+    }
+  };
+
+  auto expand = [&](const glm::ivec3& p) {
+    const glm::ivec3 c = p / kFinePerCoarse;
+    if (!inBounds(o, c)) {
+      return;
+    }
+    const uint32_t cidx = indexOf(o, c);
+    const CoarseCell& cell = cellAt(o, cidx);
+    if (cell.material != 0u && cell.brickPage == kInvalidBrickPage &&
+        coarseJumped[cidx] == 0 && !isTerrainCoarse(objectIndex, c)) {
+      coarseJumped[cidx] = 1;
+      const glm::ivec3 base = c * kFinePerCoarse;
+      for (int z = 0; z < kFinePerCoarse; ++z) {
+        for (int y = 0; y < kFinePerCoarse; ++y) {
+          for (int x = 0; x < kFinePerCoarse; ++x) {
+            const glm::ivec3 fp = base + glm::ivec3(x, y, z);
+            int lab = 0;
+            visit.insertOrGet(packFine(fp.x, fp.y, fp.z), 0, &lab);
+          }
+        }
+      }
+      for (const glm::ivec3& d : kFace) {
+        for (int u = 0; u < kFinePerCoarse; ++u) {
+          for (int v = 0; v < kFinePerCoarse; ++v) {
+            glm::ivec3 fp = base;
+            if (d.x == 1) {
+              fp.x += kFinePerCoarse - 1;
+              fp.y += u;
+              fp.z += v;
+            } else if (d.x == -1) {
+              fp.y += u;
+              fp.z += v;
+            } else if (d.y == 1) {
+              fp.y += kFinePerCoarse - 1;
+              fp.x += u;
+              fp.z += v;
+            } else if (d.y == -1) {
+              fp.x += u;
+              fp.z += v;
+            } else if (d.z == 1) {
+              fp.z += kFinePerCoarse - 1;
+              fp.x += u;
+              fp.y += v;
+            } else {
+              fp.x += u;
+              fp.y += v;
+            }
+            tryQueue(fp + d);
+          }
+        }
+      }
+      return;
+    }
+    for (const glm::ivec3& d : kFace) {
+      tryQueue(p + d);
+    }
+  };
+
+  std::vector<glm::ivec3> fines;
+  fines.reserve(64);
+  for (const glm::ivec3& c : occupied) {
+    if (!isSupportRootCoarse(objectIndex, c)) {
+      continue;
+    }
+    collectOccupiedFines(objectIndex, c, fines);
+    for (const glm::ivec3& f : fines) {
+      tryQueue(f);
+    }
+  }
+
+  size_t head = 0;
+  while (head < q.size()) {
+    expand(unpackFine(q[head]));
+    ++head;
+  }
+
+  std::vector<std::vector<uint32_t>> pieces;
+  for (const glm::ivec3& c : occupied) {
+    if (isTerrainCoarse(objectIndex, c) || isSupportRootCoarse(objectIndex, c)) {
+      continue;
+    }
+    if (!inBounds(o, c) || occupancyMaterial(objectIndex, c) == 0u) {
+      continue;
+    }
+    collectOccupiedFines(objectIndex, c, fines);
+    for (const glm::ivec3& seed : fines) {
+      int lab = 0;
+      const uint32_t seedPk = packFine(seed.x, seed.y, seed.z);
+      if (!visit.insertOrGet(seedPk, 1, &lab)) {
+        continue;
+      }
+      std::vector<uint32_t> piece;
+      std::vector<uint32_t> cq;
+      piece.reserve(64);
+      cq.reserve(64);
+      piece.push_back(seedPk);
+      cq.push_back(seedPk);
+      size_t ch = 0;
+      while (ch < cq.size()) {
+        const glm::ivec3 p = unpackFine(cq[ch]);
+        ++ch;
+        const glm::ivec3 cc = p / kFinePerCoarse;
+        if (inBounds(o, cc)) {
+          const uint32_t cidx = indexOf(o, cc);
+          const CoarseCell& cell = cellAt(o, cidx);
+          if (cell.material != 0u && cell.brickPage == kInvalidBrickPage &&
+              coarseJumped[cidx] == 0 && !isTerrainCoarse(objectIndex, cc) &&
+              !isSupportRootCoarse(objectIndex, cc)) {
+            coarseJumped[cidx] = 1;
+            const glm::ivec3 base = cc * kFinePerCoarse;
+            for (int z = 0; z < kFinePerCoarse; ++z) {
+              for (int y = 0; y < kFinePerCoarse; ++y) {
+                for (int x = 0; x < kFinePerCoarse; ++x) {
+                  const glm::ivec3 fp = base + glm::ivec3(x, y, z);
+                  int existing = 0;
+                  const uint32_t pk = packFine(fp.x, fp.y, fp.z);
+                  if (visit.insertOrGet(pk, 1, &existing)) {
+                    piece.push_back(pk);
+                    cq.push_back(pk);
+                  }
+                }
+              }
+            }
+            for (const glm::ivec3& d : kFace) {
+              for (int u = 0; u < kFinePerCoarse; ++u) {
+                for (int v = 0; v < kFinePerCoarse; ++v) {
+                  glm::ivec3 fp = base;
+                  if (d.x == 1) {
+                    fp.x += kFinePerCoarse - 1;
+                    fp.y += u;
+                    fp.z += v;
+                  } else if (d.x == -1) {
+                    fp.y += u;
+                    fp.z += v;
+                  } else if (d.y == 1) {
+                    fp.y += kFinePerCoarse - 1;
+                    fp.x += u;
+                    fp.z += v;
+                  } else if (d.y == -1) {
+                    fp.x += u;
+                    fp.z += v;
+                  } else if (d.z == 1) {
+                    fp.z += kFinePerCoarse - 1;
+                    fp.x += u;
+                    fp.y += v;
+                  } else {
+                    fp.x += u;
+                    fp.y += v;
+                  }
+                  const glm::ivec3 nb = fp + d;
+                  if (!solidAbsFine(o, nb) || isTerrainFine(objectIndex, nb) ||
+                      isSupportRootCoarse(objectIndex, nb / kFinePerCoarse)) {
+                    continue;
+                  }
+                  int existing = 0;
+                  const uint32_t pk = packFine(nb.x, nb.y, nb.z);
+                  if (visit.insertOrGet(pk, 1, &existing)) {
+                    piece.push_back(pk);
+                    cq.push_back(pk);
+                  }
+                }
+              }
+            }
+            continue;
+          }
+        }
+        for (const glm::ivec3& d : kFace) {
+          const glm::ivec3 n = p + d;
+          if (!solidAbsFine(o, n) || isTerrainFine(objectIndex, n)) {
+            continue;
+          }
+          int existing = 0;
+          const uint32_t pk = packFine(n.x, n.y, n.z);
+          if (visit.insertOrGet(pk, 1, &existing)) {
+            piece.push_back(pk);
+            cq.push_back(pk);
+          }
+        }
+      }
+      pieces.push_back(std::move(piece));
+    }
+  }
+
+  bool changed = false;
+  for (std::vector<uint32_t>& piece : pieces) {
+    if (piece.size() < physics::kResidualFineLimit) {
+      clearPackedFines(objects_[static_cast<size_t>(objectIndex)], piece);
+    } else {
+      emitFracturePiece(objectIndex, piece);
+    }
+    changed = true;
+  }
+  return changed;
+}
+
+bool VoxelScene::splitDetachedFromCuts(int objectIndex, const std::vector<glm::ivec3>& deletedAbsFines) {
+  if (objectIndex < 0 || objectIndex >= static_cast<int>(objects_.size()) ||
+      deletedAbsFines.empty()) {
+    return false;
+  }
+  VoxelObject& o = objects_[static_cast<size_t>(objectIndex)];
+  if (!o.enabled || o.cells.empty() || o.gridSize <= 0) {
+    return false;
+  }
+  const int nFine = o.gridSize * kFinePerCoarse;
+  // packFine uses 10 bits/axis (0..1023). 64 coarse * 16 fine = 1024 is the
+  // imported house; refusing that made a second cut silently no-op on N=64.
+  if (nFine > 1024) {
+    return false;
+  }
+
   FineVisit visit;
   visit.reset(64);
   std::vector<uint32_t> seeds;
@@ -348,7 +621,7 @@ bool VoxelScene::maybeFracture(int objectIndex, const std::vector<glm::ivec3>& d
   for (const glm::ivec3& d : deletedAbsFines) {
     for (const glm::ivec3& dir : kFace) {
       const glm::ivec3 n = d + dir;
-      if (!solidAbsFine(o, n) || isStaticGroundFine(objectIndex, n)) {
+      if (!solidAbsFine(o, n) || isTerrainFine(objectIndex, n)) {
         continue;
       }
       const uint32_t packed = packFine(n.x, n.y, n.z);
@@ -384,7 +657,7 @@ bool VoxelScene::maybeFracture(int objectIndex, const std::vector<glm::ivec3>& d
 
   auto enqueue = [&](uint32_t packed, int lab) {
     lab = uf.find(lab);
-    if (isStaticGroundFine(objectIndex, unpackFine(packed))) {
+    if (isTerrainFine(objectIndex, unpackFine(packed))) {
       uf.unite(lab, groundId);
       return;
     }
@@ -416,7 +689,7 @@ bool VoxelScene::maybeFracture(int objectIndex, const std::vector<glm::ivec3>& d
     if (inBounds(o, c)) {
       const uint32_t cidx = indexOf(o, c);
       const CoarseCell& cell = cellAt(o, cidx);
-      if (isStaticGroundFine(objectIndex, p) || (objectIndex == 0 && c.y < kGroundCoarseY)) {
+      if (isTerrainFine(objectIndex, p) || isTerrainCoarse(objectIndex, c)) {
         uf.unite(lab, groundId);
       } else if (cell.material != 0u && cell.brickPage == kInvalidBrickPage &&
           coarseJumped[cidx] == 0) {
@@ -546,6 +819,11 @@ bool VoxelScene::maybeFracture(int objectIndex, const std::vector<glm::ivec3>& d
     }
     std::sort(piece.begin(), piece.end());
     piece.erase(std::unique(piece.begin(), piece.end()), piece.end());
+    piece.erase(std::remove_if(piece.begin(), piece.end(),
+                               [objectIndex](uint32_t pk) {
+                                 return VoxelScene::isTerrainFine(objectIndex, unpackFine(pk));
+                               }),
+                piece.end());
     if (piece.empty()) {
       continue;
     }

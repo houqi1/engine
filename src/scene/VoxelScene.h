@@ -120,6 +120,22 @@ public:
   static constexpr int kOccMipRes = 4;
   static constexpr int kOccMipShift = 2;
   static constexpr uint32_t kMaxShapes = 256;
+  // World slab is coarses y=0,1 (3.2 m). Structure may found the layer at y==2,
+  // but occupancy there is house, not terrain — never steal y<2 into debris.
+  static constexpr int kGroundCoarseY = 2;
+  static bool isTerrainCoarse(int objectIndex, const glm::ivec3& c) {
+    return objectIndex == 0 && c.y < kGroundCoarseY;
+  }
+  static bool isTerrainFine(int objectIndex, const glm::ivec3& absFine) {
+    return isTerrainCoarse(objectIndex, glm::ivec3(absFine.x / kFinePerCoarse,
+                                                  absFine.y / kFinePerCoarse,
+                                                  absFine.z / kFinePerCoarse));
+  }
+  // House platform sitting on the 3.2 m ground. Flood starts here so occupancy
+  // that still reaches this layer stays on the static world; the rest falls.
+  static bool isSupportRootCoarse(int objectIndex, const glm::ivec3& c) {
+    return objectIndex == 0 && c.y == kGroundCoarseY;
+  }
 
   void init(GfxDevice& gfx);
   void cleanup(GfxDevice& gfx);
@@ -200,6 +216,8 @@ public:
 
   bool simulate() const { return simulate_; }
   void setSimulate(GfxDevice& gfx, bool on);
+  bool spawnSimulateBox() const { return spawnSimulateBox_; }
+  void setSpawnSimulateBox(GfxDevice& gfx, bool on);
   int cpuObjectCount() const { return static_cast<int>(objects_.size()); }
   const VoxelObject& cpuObject(int i) const { return objects_.at(static_cast<size_t>(i)); }
   VoxelObject& cpuObject(int i) { return objects_.at(static_cast<size_t>(i)); }
@@ -210,7 +228,10 @@ public:
   void collectOccupiedFines(int objectIndex, const glm::ivec3& coarse,
                             std::vector<glm::ivec3>& out) const;
   uint32_t occupiedFineCount(int objectIndex, const glm::ivec3& coarse) const;
+  // Solid-solid fine pairs across the shared face of `lower` and `lower+axis`.
+  uint32_t countSharedFaceFines(int objectIndex, const glm::ivec3& lower, int axis) const;
   void notifyOccupancyChanged(int objectIndex);
+  void notifyOccupancyChanged(int objectIndex, const std::vector<glm::ivec3>& coarses);
   bool fractureFromCuts(int objectIndex, const std::vector<glm::ivec3>& deletedAbsFines);
   int cutCoarseInterface(int objectIndex, const glm::ivec3& coarseA, const glm::ivec3& coarseB,
                          std::vector<glm::ivec3>* deletedOut);
@@ -259,6 +280,8 @@ private:
   void buildGroundObject(VoxelObject& o);
   void buildSpinnerObject(VoxelObject& o);
   void buildTestBoxObject(VoxelObject& o);
+  void buildEmptyObject(VoxelObject& o);
+  void fillSecondaryObject(VoxelObject& o);
   void buildDebrisObject(VoxelObject& o, int debrisIndex, int debrisTotal);
   void clearObjectPages(VoxelObject& o);
   void spawnDebrisObjects();
@@ -267,6 +290,7 @@ private:
   void packObjectPool();
   void fillCoarseDirTiles();
   void fillGpuObjectRecords();
+  void refreshGpuTransforms();
   void uploadOccMip(GfxDevice& gfx);
   void uploadPalette(GfxDevice& gfx);
   uint32_t* brickPageWords(uint32_t page);
@@ -282,6 +306,8 @@ private:
   void flushObject(GfxDevice& gfx, int objectIndex);
   void flushDirtyPages(GfxDevice& gfx);
   bool maybeFracture(int objectIndex, const std::vector<glm::ivec3>& deletedAbsFines);
+  bool peelUnsupportedIslands(int objectIndex);
+  bool splitDetachedFromCuts(int objectIndex, const std::vector<glm::ivec3>& deletedAbsFines);
   bool solidAbsFine(const VoxelObject& o, const glm::ivec3& absFine) const;
   void emitFracturePiece(int srcIndex, const std::vector<uint32_t>& packedFines);
   void clearPackedFines(VoxelObject& o, const std::vector<uint32_t>& packedFines);
@@ -367,6 +393,7 @@ private:
   float spinSpeed_ = 0.8f;
   bool spinnerEnabled_ = false;
   bool simulate_ = false;
+  bool spawnSimulateBox_ = true;
   int debrisCount_ = 8;
   physics::PhysicsWorld physics_;
 

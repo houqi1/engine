@@ -4,16 +4,16 @@
 
 #include <algorithm>
 #include <cmath>
-#include <queue>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace physics {
 namespace {
 
-constexpr int kGroundCoarseY = 2;
 constexpr float kShearAlpha = 1.2f;
 constexpr float kBondBeta = 0.12f;
 constexpr float kBondCfm = 0.05f;
-constexpr float kGhostDamp = 0.82f;
+
 
 glm::vec3 axisUnit(int axis) {
   glm::vec3 n(0.0f);
@@ -56,22 +56,34 @@ void StructureWorld::rebuildAll() {
   for (int i = 0; i < scene_->cpuObjectCount(); ++i) {
     rebuildShape(i);
   }
-  rebuildGraphColors();
+  rebuildIslands();
   snapshotDebug();
 }
 
 void StructureWorld::markDirty(int shapeIndex) {
+  dirtyFull_.insert(shapeIndex);
+  const auto snap = snapshotIslandSleep();
   rebuildShape(shapeIndex);
-  rebuildGraphColors();
-  islands_.wakeShape(shapeIndex);
+  rebuildIslands(&snap);
+  snapshotDebug();
+}
+
+void StructureWorld::markDirtyCells(int shapeIndex, const std::vector<glm::ivec3>& coarses) {
+  if (coarses.empty() || dirtyFull_.count(shapeIndex) != 0) {
+    if (coarses.empty()) {
+      markDirty(shapeIndex);
+    }
+    return;
+  }
+  rebuildNeighborhood(shapeIndex, coarses);
   snapshotDebug();
 }
 
 void StructureWorld::onSplit(int srcIndex, int dstIndex) {
+  const auto snap = snapshotIslandSleep();
   rebuildShape(srcIndex);
   rebuildShape(dstIndex);
-  rebuildGraphColors();
-  islands_.wakeShape(srcIndex);
+  rebuildIslands(&snap);
   snapshotDebug();
   (void)dstIndex;
 }
@@ -79,20 +91,57 @@ void StructureWorld::onSplit(int srcIndex, int dstIndex) {
 void StructureWorld::beginDt() {
   splitConsumedThisDt_ = false;
   brokenThisDt_ = 0;
+  for (Island& is : islands_.all()) {
+    is.brokenThisDt = 0;
+  }
+  splitOneIslandIfNeeded();
 }
 
-void StructureWorld::wakeShape(int shapeIndex) { islands_.wakeShape(shapeIndex); }
+void StructureWorld::wakeShape(int shapeIndex) {
+  for (Island& is : islands_.all()) {
+    if (is.shapeIndex == shapeIndex) {
+      islands_.wake(is.id);
+    }
+  }
+}
 
-void StructureWorld::wakeFromContacts(const std::vector<Contact>& contacts) {
-  if (!scene_) {
+void StructureWorld::wakeFromContacts(const std::vector<Contact>& contacts,
+                                      const std::vector<RigidBody>& bodies) {
+  if (!scene_ || contacts.empty()) {
     return;
   }
-  for (const Contact& c : contacts) {
-    if (c.a >= 0) {
-      islands_.wakeShape(c.a);
+  auto speed = [&](int shape) -> float {
+    if (shape < 0 || shape >= static_cast<int>(bodies.size())) {
+      return 0.0f;
     }
-    if (c.b >= 0) {
-      islands_.wakeShape(c.b);
+    const RigidBody& b = bodies[static_cast<size_t>(shape)];
+    return glm::length(b.v) + glm::length(b.w) * 0.5f;
+  };
+  auto hitsStructure = [&](int shape, uint32_t packedFine) -> bool {
+    if (shape != 0 || shape >= scene_->cpuObjectCount()) {
+      return false;
+    }
+    const VoxelObject& o = scene_->cpuObject(shape);
+    const int n = o.gridSize * VoxelScene::kFinePerCoarse;
+    if (n <= 0) {
+      return false;
+    }
+    const glm::ivec3 p = unpackFine(packedFine, n);
+    return (p.y / VoxelScene::kFinePerCoarse) > VoxelScene::kGroundCoarseY;
+  };
+  for (const Contact& c : contacts) {
+    if (speed(c.a) < kImpactSpeed && speed(c.b) < kImpactSpeed) {
+      continue;
+    }
+    if (hitsStructure(c.a, c.fineA)) {
+      const VoxelObject& o = scene_->cpuObject(c.a);
+      const int n = o.gridSize * VoxelScene::kFinePerCoarse;
+      wakeIslandOfCoarse(c.a, unpackFine(c.fineA, n) / VoxelScene::kFinePerCoarse);
+    }
+    if (hitsStructure(c.b, c.fineB)) {
+      const VoxelObject& o = scene_->cpuObject(c.b);
+      const int n = o.gridSize * VoxelScene::kFinePerCoarse;
+      wakeIslandOfCoarse(c.b, unpackFine(c.fineB, n) / VoxelScene::kFinePerCoarse);
     }
   }
 }
@@ -102,6 +151,13 @@ uint64_t StructureWorld::nodeKey(int shapeIndex, const glm::ivec3& c) const {
          (static_cast<uint32_t>(c.x) & 1023u) |
          ((static_cast<uint32_t>(c.y) & 1023u) << 10) |
          ((static_cast<uint32_t>(c.z) & 1023u) << 20);
+}
+
+uint64_t StructureWorld::bondKey(const glm::ivec3& lower, int axis) const {
+  return (static_cast<uint64_t>(static_cast<uint32_t>(lower.x) & 1023u)) |
+         (static_cast<uint64_t>(static_cast<uint32_t>(lower.y) & 1023u) << 10) |
+         (static_cast<uint64_t>(static_cast<uint32_t>(lower.z) & 1023u) << 20) |
+         (static_cast<uint64_t>(axis & 3) << 30);
 }
 
 int StructureWorld::findNode(int shapeIndex, const glm::ivec3& c) const {
@@ -121,21 +177,196 @@ BondStrength StructureWorld::strengthForMaterial(uint32_t mat) const {
     s.sigmaC = 8.0e6f;
     s.tauU = 1.2e6f;
     s.density = kDensityStone;
+    s.jBreak = 120.0f;
   }
   return s;
 }
 
-void StructureWorld::rebuildShape(int shapeIndex) {
-  if (!scene_ || shapeIndex < 0 || shapeIndex >= scene_->cpuObjectCount()) {
+bool StructureWorld::isStructural(int shapeIndex) const {
+  return shapeIndex == 0;
+}
+
+std::unordered_map<uint64_t, bool> StructureWorld::snapshotIslandSleep() const {
+  std::unordered_map<uint64_t, bool> snap;
+  snap.reserve(nodes_.size());
+  for (const Island& is : islands_.all()) {
+    for (int ni : is.nodes) {
+      if (ni < 0 || ni >= static_cast<int>(nodes_.size())) {
+        continue;
+      }
+      const BondNode& n = nodes_[static_cast<size_t>(ni)];
+      snap[nodeKey(n.shapeIndex, n.coarse)] = is.asleep;
+    }
+  }
+  return snap;
+}
+
+bool StructureWorld::islandAwake(int islandId) const {
+  const Island* is = islands_.byId(islandId);
+  return is != nullptr && !is->asleep;
+}
+
+void StructureWorld::wakeIslandOfCoarse(int shapeIndex, const glm::ivec3& c) {
+  const int ni = findNode(shapeIndex, c);
+  if (ni < 0) {
     return;
   }
-  // Drop existing nodes/bonds for this shape.
+  islands_.wake(nodes_[static_cast<size_t>(ni)].islandId);
+}
+
+void StructureWorld::rebuildIslands(const std::unordered_map<uint64_t, bool>* prevSleep) {
+  std::unordered_map<uint64_t, bool> owned;
+  if (prevSleep == nullptr) {
+    owned = snapshotIslandSleep();
+    prevSleep = &owned;
+  }
+  const bool hadSnap = !prevSleep->empty();
+  std::unordered_set<uint64_t> prevKeys;
+  prevKeys.reserve(prevSleep->size());
+  for (const auto& kv : *prevSleep) {
+    prevKeys.insert(kv.first);
+  }
+
+  islands_.clear();
+  for (BondNode& n : nodes_) {
+    n.islandId = -1;
+  }
+  for (Bond& b : bonds_) {
+    b.islandId = -1;
+  }
+
+  std::vector<int> unanchored;
+  unanchored.reserve(nodes_.size());
+  std::vector<int> local(nodes_.size(), -1);
+  for (int i = 0; i < static_cast<int>(nodes_.size()); ++i) {
+    if (nodes_[static_cast<size_t>(i)].anchored) {
+      continue;
+    }
+    local[static_cast<size_t>(i)] = static_cast<int>(unanchored.size());
+    unanchored.push_back(i);
+  }
+  if (unanchored.empty()) {
+    rebuildGraphColors();
+    return;
+  }
+
+  std::vector<int> parent(unanchored.size());
+  for (int i = 0; i < static_cast<int>(parent.size()); ++i) {
+    parent[static_cast<size_t>(i)] = i;
+  }
+  auto find = [&](int x) {
+    while (parent[static_cast<size_t>(x)] != x) {
+      parent[static_cast<size_t>(x)] = parent[static_cast<size_t>(parent[static_cast<size_t>(x)])];
+      x = parent[static_cast<size_t>(x)];
+    }
+    return x;
+  };
+  auto unite = [&](int a, int b) {
+    a = find(a);
+    b = find(b);
+    if (a != b) {
+      parent[static_cast<size_t>(b)] = a;
+    }
+  };
+  for (const Bond& b : bonds_) {
+    if (!b.alive || b.a < 0 || b.b < 0 || b.a >= static_cast<int>(local.size()) ||
+        b.b >= static_cast<int>(local.size())) {
+      continue;
+    }
+    const int la = local[static_cast<size_t>(b.a)];
+    const int lb = local[static_cast<size_t>(b.b)];
+    if (la >= 0 && lb >= 0) {
+      unite(la, lb);
+    }
+  }
+
+  std::unordered_map<int, int> rootToIsland;
+  for (int li = 0; li < static_cast<int>(unanchored.size()); ++li) {
+    const int r = find(li);
+    auto it = rootToIsland.find(r);
+    if (it == rootToIsland.end()) {
+      Island& created = islands_.add(nodes_[static_cast<size_t>(unanchored[static_cast<size_t>(li)])].shapeIndex);
+      it = rootToIsland.emplace(r, created.id).first;
+    }
+    Island* is = islands_.byId(it->second);
+    const int ni = unanchored[static_cast<size_t>(li)];
+    nodes_[static_cast<size_t>(ni)].islandId = is->id;
+    is->nodes.push_back(ni);
+  }
+
+  const glm::ivec3 face[6] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
+  for (Island& is : islands_.all()) {
+    bool allAsleep = hadSnap;
+    bool lostNeighbor = false;
+    for (int ni : is.nodes) {
+      const BondNode& n = nodes_[static_cast<size_t>(ni)];
+      const uint64_t key = nodeKey(n.shapeIndex, n.coarse);
+      const auto it = prevSleep->find(key);
+      if (it == prevSleep->end() || !it->second) {
+        allAsleep = false;
+      }
+      for (const glm::ivec3& d : face) {
+        const uint64_t nk = nodeKey(n.shapeIndex, n.coarse + d);
+        if (prevKeys.count(nk) != 0 && findNode(n.shapeIndex, n.coarse + d) < 0) {
+          lostNeighbor = true;
+        }
+      }
+    }
+    if (!hadSnap) {
+      is.asleep = true;
+      is.settleLeft = 0;
+      is.sleepTimer = kSleepTime;
+    } else if (allAsleep && !lostNeighbor) {
+      is.asleep = true;
+      is.settleLeft = 0;
+      is.sleepTimer = kSleepTime;
+    } else {
+      is.asleep = false;
+      is.settleLeft = kBondSettleSteps;
+      is.sleepTimer = 0.0f;
+    }
+    is.needsSplit = false;
+    is.brokenThisDt = 0;
+    is.vmax = 0.0f;
+  }
+
+  for (int bi = 0; bi < static_cast<int>(bonds_.size()); ++bi) {
+    Bond& b = bonds_[static_cast<size_t>(bi)];
+    if (!b.alive || b.a < 0 || b.b < 0) {
+      continue;
+    }
+    const int ia = nodes_[static_cast<size_t>(b.a)].islandId;
+    const int ib = nodes_[static_cast<size_t>(b.b)].islandId;
+    const int id = ia >= 0 ? ia : ib;
+    b.islandId = id;
+    if (id >= 0) {
+      if (Island* is = islands_.byId(id)) {
+        is->bonds.push_back(bi);
+      }
+    }
+  }
+  rebuildGraphColors();
+}
+
+void StructureWorld::splitOneIslandIfNeeded() {
+  if (splitConsumedThisDt_ || islands_.firstNeedsSplit() < 0) {
+    return;
+  }
+  const auto snap = snapshotIslandSleep();
+  rebuildIslands(&snap);
+  splitConsumedThisDt_ = true;
+}
+
+void StructureWorld::dropShapeRegion(int shapeIndex, const std::unordered_set<uint64_t>* dropKeys) {
   std::vector<BondNode> keptNodes;
   std::unordered_map<uint64_t, int> keptIndex;
   keptNodes.reserve(nodes_.size());
   for (const BondNode& n : nodes_) {
     if (n.shapeIndex == shapeIndex) {
-      continue;
+      const uint64_t key = nodeKey(n.shapeIndex, n.coarse);
+      if (dropKeys == nullptr || dropKeys->count(key) != 0) {
+        continue;
+      }
     }
     keptIndex[nodeKey(n.shapeIndex, n.coarse)] = static_cast<int>(keptNodes.size());
     keptNodes.push_back(n);
@@ -147,9 +378,6 @@ void StructureWorld::rebuildShape(int shapeIndex) {
       return -1;
     }
     const BondNode& n = nodes_[static_cast<size_t>(oldIdx)];
-    if (n.shapeIndex == shapeIndex) {
-      return -1;
-    }
     const auto it = keptIndex.find(nodeKey(n.shapeIndex, n.coarse));
     return it == keptIndex.end() ? -1 : it->second;
   };
@@ -166,108 +394,277 @@ void StructureWorld::rebuildShape(int shapeIndex) {
   nodes_.swap(keptNodes);
   bonds_.swap(keptBonds);
   nodeIndex_.swap(keptIndex);
+}
 
-  const VoxelObject& o = scene_->cpuObject(shapeIndex);
-  const bool staticShape = shapeIndex == 0;
-  if (!staticShape || !o.enabled || o.cells.empty() || o.gridSize <= 0) {
-    Island* is = islands_.findByShape(shapeIndex);
-    if (is) {
-      is->nodes.clear();
-    }
-    return;
+bool StructureWorld::addNode(int shapeIndex, const glm::ivec3& c, const BondNode* prev) {
+  if (!scene_ || findNode(shapeIndex, c) >= 0) {
+    return false;
   }
-
-  Island& island = islands_.ensureForShape(shapeIndex);
-  island.nodes.clear();
-  island.asleep = false;
-  island.sleepTimer = 0.0f;
-  island.settleLeft = std::max(island.settleLeft, 6);
-
-  const glm::mat4 o2w = o.objectToWorld();
+  if (VoxelScene::isTerrainCoarse(shapeIndex, c)) {
+    return false;
+  }
+  const uint32_t mat = scene_->occupancyMaterial(shapeIndex, c);
+  if (mat == 0u) {
+    return false;
+  }
+  const uint32_t nFine = scene_->occupiedFineCount(shapeIndex, c);
+  if (nFine == 0u) {
+    return false;
+  }
+  const VoxelObject& o = scene_->cpuObject(shapeIndex);
   const float a = o.voxelSize;
   const float fineV = kVoxel * kVoxel * kVoxel;
-
-  auto addNode = [&](const glm::ivec3& c) {
-    const uint32_t mat = scene_->occupancyMaterial(shapeIndex, c);
-    if (mat == 0u) {
-      return;
-    }
-    const uint32_t nFine = scene_->occupiedFineCount(shapeIndex, c);
-    if (nFine == 0u) {
-      return;
-    }
-    const BondStrength st = strengthForMaterial(mat);
-    BondNode node;
-    node.shapeIndex = shapeIndex;
-    node.coarse = c;
-    node.mass = std::max(1e-3f, st.density * fineV * static_cast<float>(nFine));
-    const float ii = node.mass * a * a / 6.0f;
-    node.Idiag = glm::vec3(std::max(ii, 1e-4f));
-    const glm::vec3 local = (glm::vec3(c) + glm::vec3(0.5f)) * a;
-    node.rest = glm::vec3(o2w * glm::vec4(local, 1.0f));
-    node.anchored = (shapeIndex == 0 && c.y < kGroundCoarseY);
+  const BondStrength st = strengthForMaterial(mat);
+  BondNode node;
+  node.shapeIndex = shapeIndex;
+  node.coarse = c;
+  node.mass = std::max(1e-3f, st.density * fineV * static_cast<float>(nFine));
+  const float ii = node.mass * a * a / 6.0f;
+  node.Idiag = glm::vec3(std::max(ii, 1e-4f));
+  const glm::vec3 local = (glm::vec3(c) + glm::vec3(0.5f)) * a;
+  node.rest = glm::vec3(o.objectToWorld() * glm::vec4(local, 1.0f));
+  node.anchored = (shapeIndex == 0 && c.y <= VoxelScene::kGroundCoarseY);
+  if (prev != nullptr) {
+    node.u = prev->u;
+    node.theta = prev->theta;
+    node.v = prev->v;
+    node.w = prev->w;
+  } else {
     node.u = glm::vec3(0.0f);
     node.theta = glm::vec3(0.0f);
     node.v = glm::vec3(0.0f);
     node.w = glm::vec3(0.0f);
-    const int idx = static_cast<int>(nodes_.size());
-    nodeIndex_[nodeKey(shapeIndex, c)] = idx;
-    nodes_.push_back(node);
-    island.nodes.push_back(idx);
+  }
+  if (node.anchored) {
+    node.u = glm::vec3(0.0f);
+    node.theta = glm::vec3(0.0f);
+    node.v = glm::vec3(0.0f);
+    node.w = glm::vec3(0.0f);
+  }
+  const int idx = static_cast<int>(nodes_.size());
+  nodeIndex_[nodeKey(shapeIndex, c)] = idx;
+  nodes_.push_back(node);
+  return true;
+}
+
+void StructureWorld::addBondIfMissing(int shapeIndex, const glm::ivec3& lower, int axis,
+                                      const std::unordered_map<uint64_t, Bond>* warm,
+                                      std::unordered_set<uint64_t>* createdKeys) {
+  glm::ivec3 upper = lower;
+  upper[axis] += 1;
+  const int i = findNode(shapeIndex, lower);
+  const int j = findNode(shapeIndex, upper);
+  if (i < 0 || j < 0) {
+    return;
+  }
+  const uint64_t key = bondKey(lower, axis);
+  if (createdKeys != nullptr && !createdKeys->insert(key).second) {
+    return;
+  }
+  if (createdKeys == nullptr) {
+    for (const Bond& existing : bonds_) {
+      if (existing.alive && existing.a == i && existing.b == j && existing.axis == axis) {
+        return;
+      }
+    }
+  }
+  const BondNode& na = nodes_[static_cast<size_t>(i)];
+  const BondNode& nb = nodes_[static_cast<size_t>(j)];
+  if (na.anchored && nb.anchored) {
+    return;
+  }
+  const VoxelObject& o = scene_->cpuObject(shapeIndex);
+  const float a = o.voxelSize;
+  const uint32_t matA = scene_->occupancyMaterial(shapeIndex, lower);
+  const uint32_t matB = scene_->occupancyMaterial(shapeIndex, upper);
+  const BondStrength st = strengthForMaterial(std::min(matA, matB));
+  const uint32_t nFace = scene_->countSharedFaceFines(shapeIndex, lower, axis);
+  if (nFace == 0u) {
+    return;
+  }
+  const float aFine = kVoxel * kVoxel;
+  const float iFine = aFine * aFine / 12.0f;
+  Bond bond;
+  bond.a = i;
+  bond.b = j;
+  bond.axis = axis;
+  bond.L = a;
+  bond.A = std::max(1e-6f, aFine * static_cast<float>(nFace));
+  bond.I = std::max(1e-12f, iFine * static_cast<float>(nFace));
+  bond.J = 2.0f * bond.I;
+  bond.kn = st.E * bond.A / bond.L;
+  bond.kv = st.G * bond.A / (kShearAlpha * bond.L);
+  bond.kt = st.G * bond.J / bond.L;
+  bond.km = st.E * bond.I / bond.L;
+  bond.strength = st;
+  bond.alive = true;
+  if (warm != nullptr) {
+    const auto it = warm->find(bondKey(lower, axis));
+    if (it != warm->end() && it->second.alive) {
+      for (int k = 0; k < 6; ++k) {
+        bond.lambda[k] = it->second.lambda[k];
+      }
+      bond.phi = it->second.phi;
+    }
+  }
+  bonds_.push_back(bond);
+}
+
+void StructureWorld::rebuildShape(int shapeIndex) {
+  if (!scene_ || shapeIndex < 0 || shapeIndex >= scene_->cpuObjectCount()) {
+    return;
+  }
+  std::unordered_map<uint64_t, Bond> warm;
+  std::unordered_map<uint64_t, BondNode> prevNodes;
+  warm.reserve(bonds_.size());
+  for (const Bond& b : bonds_) {
+    if (b.a < 0 || b.b < 0 || b.a >= static_cast<int>(nodes_.size()) ||
+        b.b >= static_cast<int>(nodes_.size())) {
+      continue;
+    }
+    const BondNode& na = nodes_[static_cast<size_t>(b.a)];
+    if (na.shapeIndex != shapeIndex) {
+      continue;
+    }
+    warm[bondKey(na.coarse, b.axis)] = b;
+  }
+  for (const BondNode& n : nodes_) {
+    if (n.shapeIndex == shapeIndex) {
+      prevNodes[nodeKey(n.shapeIndex, n.coarse)] = n;
+    }
+  }
+
+  dropShapeRegion(shapeIndex, nullptr);
+
+  const VoxelObject& o = scene_->cpuObject(shapeIndex);
+  if (!isStructural(shapeIndex) || !o.enabled || o.cells.empty() || o.gridSize <= 0) {
+    return;
+  }
+
+  auto prevOf = [&](const glm::ivec3& c) -> const BondNode* {
+    const auto it = prevNodes.find(nodeKey(shapeIndex, c));
+    return it == prevNodes.end() ? nullptr : &it->second;
   };
 
   if (!o.occupiedCoarses.empty()) {
     for (uint32_t packed : o.occupiedCoarses) {
-      addNode(glm::ivec3(static_cast<int>(packed & 1023u),
+      const glm::ivec3 c(static_cast<int>(packed & 1023u),
                          static_cast<int>((packed >> 10) & 1023u),
-                         static_cast<int>((packed >> 20) & 1023u)));
+                         static_cast<int>((packed >> 20) & 1023u));
+      addNode(shapeIndex, c, prevOf(c));
     }
   } else {
     for (int z = 0; z < o.gridSize; ++z) {
       for (int y = 0; y < o.gridSize; ++y) {
         for (int x = 0; x < o.gridSize; ++x) {
-          addNode(glm::ivec3(x, y, z));
+          const glm::ivec3 c(x, y, z);
+          addNode(shapeIndex, c, prevOf(c));
         }
       }
     }
   }
 
-  auto solidFrac = [&](const glm::ivec3& c) -> float {
-    return static_cast<float>(scene_->occupiedFineCount(shapeIndex, c)) /
-           static_cast<float>(VoxelScene::kFinePerBrick);
-  };
-
-  for (int i : island.nodes) {
-    const BondNode& na = nodes_[static_cast<size_t>(i)];
-    for (int axis = 0; axis < 3; ++axis) {
-      glm::ivec3 nbC = na.coarse;
-      nbC[axis] += 1;
-      const int j = findNode(shapeIndex, nbC);
-      if (j < 0) {
-        continue;
-      }
-      const BondNode& nb = nodes_[static_cast<size_t>(j)];
-      const uint32_t matA = scene_->occupancyMaterial(shapeIndex, na.coarse);
-      const uint32_t matB = scene_->occupancyMaterial(shapeIndex, nb.coarse);
-      const BondStrength st = strengthForMaterial(std::min(matA, matB));
-      const float fill = std::min(solidFrac(na.coarse), solidFrac(nb.coarse));
-      Bond bond;
-      bond.a = i;
-      bond.b = j;
-      bond.axis = axis;
-      bond.L = a;
-      bond.A = std::max(1e-4f, a * a * std::max(fill, 1.0f / 16.0f));
-      bond.I = bond.A * bond.A / 12.0f;
-      bond.J = bond.A * bond.A / 6.0f;
-      bond.kn = st.E * bond.A / bond.L;
-      bond.kv = st.G * bond.A / (kShearAlpha * bond.L);
-      bond.kt = st.G * bond.J / bond.L;
-      bond.km = st.E * bond.I / bond.L;
-      bond.strength = st;
-      bond.alive = true;
-      bonds_.push_back(bond);
-      (void)nb;
+  std::unordered_set<uint64_t> created;
+  created.reserve(nodes_.size() * 3u);
+  for (int i = 0; i < static_cast<int>(nodes_.size()); ++i) {
+    if (nodes_[static_cast<size_t>(i)].shapeIndex != shapeIndex) {
+      continue;
     }
+    for (int axis = 0; axis < 3; ++axis) {
+      addBondIfMissing(shapeIndex, nodes_[static_cast<size_t>(i)].coarse, axis, &warm, &created);
+    }
+  }
+}
+
+void StructureWorld::rebuildNeighborhood(int shapeIndex, const std::vector<glm::ivec3>& seeds) {
+  if (!scene_ || !isStructural(shapeIndex) || seeds.empty()) {
+    return;
+  }
+  const VoxelObject& o = scene_->cpuObject(shapeIndex);
+  if (!o.enabled || o.cells.empty()) {
+    return;
+  }
+  const auto snap = snapshotIslandSleep();
+
+  std::unordered_set<uint64_t> dropKeys;
+  std::vector<glm::ivec3> region;
+  region.reserve(seeds.size() * 7);
+  auto consider = [&](glm::ivec3 c) {
+    if (c.x < 0 || c.y < 0 || c.z < 0 || c.x >= o.gridSize || c.y >= o.gridSize ||
+        c.z >= o.gridSize) {
+      return;
+    }
+    const uint64_t key = nodeKey(shapeIndex, c);
+    if (dropKeys.insert(key).second) {
+      region.push_back(c);
+    }
+  };
+  const glm::ivec3 face[6] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
+  for (const glm::ivec3& s : seeds) {
+    consider(s);
+    for (const glm::ivec3& d : face) {
+      consider(s + d);
+    }
+  }
+  if (region.size() * 4u > nodes_.size() && nodes_.size() > 64) {
+    const auto snap = snapshotIslandSleep();
+    rebuildShape(shapeIndex);
+    rebuildIslands(&snap);
+    for (const glm::ivec3& s : seeds) {
+      wakeIslandOfCoarse(shapeIndex, s);
+    }
+    return;
+  }
+
+  std::unordered_map<uint64_t, Bond> warm;
+  std::unordered_map<uint64_t, BondNode> prevNodes;
+  for (const Bond& b : bonds_) {
+    if (b.a < 0 || b.b < 0 || b.a >= static_cast<int>(nodes_.size()) ||
+        b.b >= static_cast<int>(nodes_.size())) {
+      continue;
+    }
+    const BondNode& na = nodes_[static_cast<size_t>(b.a)];
+    if (na.shapeIndex != shapeIndex) {
+      continue;
+    }
+    if (dropKeys.count(nodeKey(shapeIndex, na.coarse)) != 0 ||
+        dropKeys.count(nodeKey(shapeIndex, nodes_[static_cast<size_t>(b.b)].coarse)) != 0) {
+      warm[bondKey(na.coarse, b.axis)] = b;
+    }
+  }
+  for (const BondNode& n : nodes_) {
+    if (n.shapeIndex == shapeIndex && dropKeys.count(nodeKey(shapeIndex, n.coarse)) != 0) {
+      prevNodes[nodeKey(shapeIndex, n.coarse)] = n;
+    }
+  }
+
+  dropShapeRegion(shapeIndex, &dropKeys);
+
+  for (const glm::ivec3& c : region) {
+    const auto it = prevNodes.find(nodeKey(shapeIndex, c));
+    addNode(shapeIndex, c, it == prevNodes.end() ? nullptr : &it->second);
+  }
+  std::unordered_set<uint64_t> created;
+  created.reserve(region.size() * 6u);
+  for (const Bond& b : bonds_) {
+    if (b.alive && b.a >= 0 && b.a < static_cast<int>(nodes_.size())) {
+      const BondNode& na = nodes_[static_cast<size_t>(b.a)];
+      if (na.shapeIndex == shapeIndex) {
+        created.insert(bondKey(na.coarse, b.axis));
+      }
+    }
+  }
+  for (const glm::ivec3& c : region) {
+    for (int axis = 0; axis < 3; ++axis) {
+      addBondIfMissing(shapeIndex, c, axis, &warm, &created);
+      glm::ivec3 lower = c;
+      lower[axis] -= 1;
+      addBondIfMissing(shapeIndex, lower, axis, &warm, &created);
+    }
+  }
+  rebuildIslands(&snap);
+  for (const glm::ivec3& s : seeds) {
+    wakeIslandOfCoarse(shapeIndex, s);
   }
 }
 
@@ -289,13 +686,33 @@ void StructureWorld::rebuildGraphColors() {
 }
 
 void StructureWorld::applyGhostGravity() {
+  // Quasi-static: kinetic energy is not state. Each substep applies a fresh
+  // gravity impulse onto v=0; TGS turns it into λ. Sleeping islands are not
+  // in the solver (Box3D).
   for (BondNode& n : nodes_) {
     if (n.anchored) {
+      n.u = glm::vec3(0.0f);
+      n.theta = glm::vec3(0.0f);
       n.v = glm::vec3(0.0f);
       n.w = glm::vec3(0.0f);
+    }
+  }
+  for (const Island& is : islands_.all()) {
+    if (is.asleep) {
       continue;
     }
-    n.v += kGravity * kSubDt;
+    for (int ni : is.nodes) {
+      if (ni < 0 || ni >= static_cast<int>(nodes_.size())) {
+        continue;
+      }
+      BondNode& n = nodes_[static_cast<size_t>(ni)];
+      n.v = glm::vec3(0.0f);
+      n.w = glm::vec3(0.0f);
+      if (n.anchored) {
+        continue;
+      }
+      n.v += kGravity * kSubDt;
+    }
   }
 }
 
@@ -369,6 +786,15 @@ void StructureWorld::solveBond(Bond& bond, float h) {
   }
 }
 
+void StructureWorld::clampBondLambda(Bond& bond, float h) const {
+  if (!bond.alive || h <= 1e-12f) {
+    return;
+  }
+  const float lamT = bond.A * bond.strength.sigmaT * h;
+  const float lamC = bond.A * bond.strength.sigmaC * h;
+  bond.lambda[0] = std::clamp(bond.lambda[0], -lamC, lamT);
+}
+
 void StructureWorld::solveBonds() {
   for (int iter = 0; iter < kBondIters; ++iter) {
     for (int c = 0; c < kGraphBucketCount; ++c) {
@@ -376,7 +802,11 @@ void StructureWorld::solveBonds() {
         if (bi < 0 || bi >= static_cast<int>(bonds_.size())) {
           continue;
         }
-        solveBond(bonds_[static_cast<size_t>(bi)], kSubDt);
+        Bond& bond = bonds_[static_cast<size_t>(bi)];
+        if (!islandAwake(bond.islandId)) {
+          continue;
+        }
+        solveBond(bond, kSubDt);
       }
     }
   }
@@ -393,183 +823,236 @@ float StructureWorld::bondPhi(const Bond& bond, float h) const {
   }
   const float N = bond.lambda[0] / h;
   const float V = std::sqrt(bond.lambda[1] * bond.lambda[1] + bond.lambda[2] * bond.lambda[2]) / h;
+  const float T = std::abs(bond.lambda[3]) / h;
   const float M = std::sqrt(bond.lambda[4] * bond.lambda[4] + bond.lambda[5] * bond.lambda[5]) / h;
   const float Mu = std::max(bond.strength.sigmaT * bond.I / std::max(0.5f * bond.L, 1e-4f), 1e-4f);
+  const float Tu = std::max(bond.strength.tauU * bond.J / std::max(0.5f * bond.L, 1e-4f), 1e-4f);
   float phiNm = 0.0f;
   if (N > 0.0f) {
     phiNm = N / std::max(bond.A * bond.strength.sigmaT, 1e-4f) + std::abs(M) / Mu;
   } else {
     phiNm = std::abs(N) / std::max(bond.A * bond.strength.sigmaC, 1e-4f) + std::abs(M) / Mu;
   }
+  (void)T;
+  (void)Tu;
   return phiNm + std::abs(V) / std::max(bond.A * bond.strength.tauU, 1e-4f);
 }
 
 int StructureWorld::breakOverstressed() {
   maxPhi_ = 0.0f;
   newlyBroken_.clear();
-  bool settling = false;
-  float ghostSpeed = 0.0f;
-  for (const Island& is : islands_.all()) {
-    if (is.settleLeft > 0) {
-      settling = true;
-    }
-  }
-  for (const BondNode& n : nodes_) {
-    if (!n.anchored) {
-      ghostSpeed = std::max(ghostSpeed, glm::length(n.v));
-    }
-  }
   std::vector<int> over;
   over.reserve(16);
-  for (int i = 0; i < static_cast<int>(bonds_.size()); ++i) {
-    Bond& b = bonds_[static_cast<size_t>(i)];
-    if (!b.alive) {
+  for (Island& is : islands_.all()) {
+    if (is.asleep) {
       continue;
     }
-    b.phi = bondPhi(b, kSubDt);
-    maxPhi_ = std::max(maxPhi_, b.phi);
-    const BondNode& na = nodes_[static_cast<size_t>(b.a)];
-    const BondNode& nb = nodes_[static_cast<size_t>(b.b)];
-    if (na.anchored && nb.anchored) {
-      continue;
-    }
-    if (!settling && ghostSpeed < 0.4f && b.phi >= 1.0f) {
-      over.push_back(i);
+    const bool settling = is.settleLeft > 0;
+    for (int bi : is.bonds) {
+      if (bi < 0 || bi >= static_cast<int>(bonds_.size())) {
+        continue;
+      }
+      Bond& b = bonds_[static_cast<size_t>(bi)];
+      if (!b.alive) {
+        continue;
+      }
+      b.phi = bondPhi(b, kSubDt);
+      maxPhi_ = std::max(maxPhi_, b.phi);
+      const BondNode& na = nodes_[static_cast<size_t>(b.a)];
+      const BondNode& nb = nodes_[static_cast<size_t>(b.b)];
+      if (na.anchored && nb.anchored) {
+        continue;
+      }
+      if (!settling && b.phi >= 1.0f) {
+        over.push_back(bi);
+      }
     }
   }
   std::sort(over.begin(), over.end(), [&](int i, int j) {
     return bonds_[static_cast<size_t>(i)].phi > bonds_[static_cast<size_t>(j)].phi;
   });
   int n = 0;
+  const int dtLeft = std::max(0, kMaxBrokenBondsPerDt - brokenThisDt_);
+  const int cap = std::min(kMaxBrokenBondsPerSubstep, dtLeft);
   for (int i : over) {
-    if (n >= kMaxBrokenBondsPerSubstep) {
+    if (n >= cap) {
       break;
     }
-    bonds_[static_cast<size_t>(i)].alive = false;
+    Bond& b = bonds_[static_cast<size_t>(i)];
+    b.alive = false;
     newlyBroken_.push_back(i);
+    if (Island* is = islands_.byId(b.islandId)) {
+      is->needsSplit = true;
+      ++is->brokenThisDt;
+    }
     ++n;
+  }
+  for (Bond& b : bonds_) {
+    if (b.alive && islandAwake(b.islandId)) {
+      clampBondLambda(b, kSubDt);
+    }
   }
   return n;
 }
 
-void StructureWorld::cutBrokenBonds() {
-  if (newlyBroken_.empty()) {
+void StructureWorld::fractureDeadBonds() {
+  if (!scene_ || newlyBroken_.empty() || splitConsumedThisDt_) {
     return;
   }
+  int shape = -1;
+  std::vector<glm::ivec3> cuts;
+  cuts.reserve(newlyBroken_.size() * 16);
   for (int bi : newlyBroken_) {
     if (bi < 0 || bi >= static_cast<int>(bonds_.size())) {
       continue;
     }
     const Bond& b = bonds_[static_cast<size_t>(bi)];
-    if (b.a < 0 || b.b < 0) {
+    if (b.a < 0 || b.b < 0 || b.a >= static_cast<int>(nodes_.size()) ||
+        b.b >= static_cast<int>(nodes_.size())) {
       continue;
     }
     const BondNode& na = nodes_[static_cast<size_t>(b.a)];
-    Island* is = islands_.findByShape(na.shapeIndex);
-    if (is) {
-      is->needsSplit = true;
+    const BondNode& nb = nodes_[static_cast<size_t>(b.b)];
+    if (shape < 0) {
+      shape = na.shapeIndex;
     }
+    if (na.shapeIndex != shape || nb.shapeIndex != shape) {
+      continue;
+    }
+    if (VoxelScene::isTerrainCoarse(shape, na.coarse) &&
+        VoxelScene::isTerrainCoarse(shape, nb.coarse)) {
+      continue;
+    }
+    scene_->cutCoarseInterface(shape, na.coarse, nb.coarse, &cuts);
+  }
+  if (shape < 0 || cuts.empty()) {
+    return;
+  }
+  const bool split = scene_->fractureFromCuts(shape, cuts);
+  scene_->noteOccupancyGpuDirty();
+  std::vector<glm::ivec3> dirty;
+  dirty.reserve(newlyBroken_.size() * 2);
+  for (int bi : newlyBroken_) {
+    if (bi < 0 || bi >= static_cast<int>(bonds_.size())) {
+      continue;
+    }
+    const Bond& b = bonds_[static_cast<size_t>(bi)];
+    if (b.a < 0 || b.b < 0 || b.a >= static_cast<int>(nodes_.size()) ||
+        b.b >= static_cast<int>(nodes_.size())) {
+      continue;
+    }
+    dirty.push_back(nodes_[static_cast<size_t>(b.a)].coarse);
+    dirty.push_back(nodes_[static_cast<size_t>(b.b)].coarse);
+  }
+  if (split) {
+    splitConsumedThisDt_ = true;
+    markDirty(shape);
+  } else {
+    rebuildNeighborhood(shape, dirty);
   }
 }
 
-void StructureWorld::peelUnanchored() {
-  if (!scene_ || splitConsumedThisDt_) {
+void StructureWorld::applyContactImpulses(const std::vector<Contact>& contacts,
+                                          const std::vector<RigidBody>& bodies) {
+  if (!scene_ || contacts.empty() || splitConsumedThisDt_) {
     return;
   }
-  for (Island& island : islands_.all()) {
-    if (island.shapeIndex < 0 || island.nodes.empty()) {
-      continue;
+  newlyBroken_.clear();
+  auto bodySpeed = [&](int shape) -> float {
+    if (shape < 0 || shape >= static_cast<int>(bodies.size())) {
+      return 0.0f;
     }
-    if (!islands_.consumeSplit(island.shapeIndex) && brokenThisStep_ == 0) {
-      continue;
-    }
-    splitConsumedThisDt_ = true;
-
-    std::unordered_map<int, int> local;
-    std::vector<int> ids;
-    ids.reserve(island.nodes.size());
-    for (int ni : island.nodes) {
-      if (ni < 0 || ni >= static_cast<int>(nodes_.size())) {
-        continue;
-      }
-      if (nodes_[static_cast<size_t>(ni)].shapeIndex != island.shapeIndex) {
-        continue;
-      }
-      local[ni] = static_cast<int>(ids.size());
-      ids.push_back(ni);
-    }
-    if (ids.empty()) {
+    const RigidBody& b = bodies[static_cast<size_t>(shape)];
+    return glm::length(b.v) + glm::length(b.w) * 0.5f;
+  };
+  auto consider = [&](int shape, uint32_t packedFine, float impulse, float impactSpeed) {
+    if (shape != 0 || impulse < 0.0f || shape >= scene_->cpuObjectCount()) {
       return;
     }
-    std::vector<int> parent(ids.size());
-    for (int i = 0; i < static_cast<int>(ids.size()); ++i) {
-      parent[static_cast<size_t>(i)] = i;
+    if (impactSpeed < kImpactSpeed) {
+      return;
     }
-    auto find = [&](int x) {
-      while (parent[static_cast<size_t>(x)] != x) {
-        parent[static_cast<size_t>(x)] = parent[static_cast<size_t>(parent[static_cast<size_t>(x)])];
-        x = parent[static_cast<size_t>(x)];
-      }
-      return x;
-    };
-    auto unite = [&](int a, int b) {
-      a = find(a);
-      b = find(b);
-      if (a != b) {
-        parent[static_cast<size_t>(b)] = a;
-      }
-    };
-    for (const Bond& b : bonds_) {
-      if (!b.alive) {
+    const VoxelObject& o = scene_->cpuObject(shape);
+    const int n = o.gridSize * VoxelScene::kFinePerCoarse;
+    if (n <= 0) {
+      return;
+    }
+    const glm::ivec3 p = unpackFine(packedFine, n);
+    const int F = VoxelScene::kFinePerCoarse;
+    const glm::ivec3 c(p.x / F, p.y / F, p.z / F);
+    if (c.y < VoxelScene::kGroundCoarseY) {
+      return;
+    }
+    const uint32_t mat = scene_->occupancyMaterial(shape, c);
+    if (mat == 0u) {
+      return;
+    }
+    const BondStrength st = strengthForMaterial(mat);
+    if (impulse < st.jBreak) {
+      return;
+    }
+    const int ni = findNode(shape, c);
+    if (ni < 0) {
+      return;
+    }
+    for (int bi = 0; bi < static_cast<int>(bonds_.size()); ++bi) {
+      Bond& b = bonds_[static_cast<size_t>(bi)];
+      if (!b.alive || (b.a != ni && b.b != ni)) {
         continue;
       }
-      const auto ia = local.find(b.a);
-      const auto ib = local.find(b.b);
-      if (ia == local.end() || ib == local.end()) {
+      b.alive = false;
+      newlyBroken_.push_back(bi);
+    }
+  };
+  for (const Contact& c : contacts) {
+    const float sp = std::max(bodySpeed(c.a), bodySpeed(c.b));
+    consider(c.a, c.fineA, c.lambdaN, sp);
+    consider(c.b, c.fineB, c.lambdaN, sp);
+  }
+  if (!newlyBroken_.empty()) {
+    for (int bi : newlyBroken_) {
+      if (bi < 0 || bi >= static_cast<int>(bonds_.size())) {
         continue;
       }
-      unite(ia->second, ib->second);
+      islands_.wake(bonds_[static_cast<size_t>(bi)].islandId);
     }
-
-    std::vector<uint8_t> anchoredRoot(ids.size(), 0);
-    for (int i = 0; i < static_cast<int>(ids.size()); ++i) {
-      if (nodes_[static_cast<size_t>(ids[static_cast<size_t>(i)])].anchored) {
-        anchoredRoot[static_cast<size_t>(find(i))] = 1;
-      }
-    }
-    std::unordered_map<int, std::vector<glm::ivec3>> pieces;
-    for (int i = 0; i < static_cast<int>(ids.size()); ++i) {
-      const int r = find(i);
-      if (anchoredRoot[static_cast<size_t>(r)]) {
-        continue;
-      }
-      pieces[r].push_back(nodes_[static_cast<size_t>(ids[static_cast<size_t>(i)])].coarse);
-    }
-    for (auto& kv : pieces) {
-      if (kv.second.empty()) {
-        continue;
-      }
-      scene_->peelCoarseIslands(island.shapeIndex, kv.second);
-      scene_->noteOccupancyGpuDirty();
-    }
-    markDirty(island.shapeIndex);
-    return;  // at most one island split per dt
+    fractureDeadBonds();
   }
 }
 
 void StructureWorld::integrateGhost() {
-  for (BondNode& n : nodes_) {
-    if (n.anchored) {
-      n.u = glm::vec3(0.0f);
-      n.theta = glm::vec3(0.0f);
-      n.v = glm::vec3(0.0f);
-      n.w = glm::vec3(0.0f);
+  for (Island& is : islands_.all()) {
+    if (is.asleep) {
       continue;
     }
-    n.u += n.v * kSubDt;
-    n.theta += n.w * kSubDt;
-    n.v *= kGhostDamp;
-    n.w *= kGhostDamp;
+    float vmax = 0.0f;
+    for (int ni : is.nodes) {
+      if (ni < 0 || ni >= static_cast<int>(nodes_.size())) {
+        continue;
+      }
+      BondNode& n = nodes_[static_cast<size_t>(ni)];
+      if (n.anchored) {
+        n.u = glm::vec3(0.0f);
+        n.theta = glm::vec3(0.0f);
+        n.v = glm::vec3(0.0f);
+        n.w = glm::vec3(0.0f);
+        continue;
+      }
+      vmax = std::max(vmax, glm::length(n.v) + glm::length(n.w) * 0.5f);
+      n.u += n.v * kSubDt;
+      n.theta += n.w * kSubDt;
+      const float ulen = glm::length(n.u);
+      if (ulen > kBondUMax) {
+        n.u *= kBondUMax / ulen;
+      }
+      const float tlen = glm::length(n.theta);
+      if (tlen > kBondThetaMax) {
+        n.theta *= kBondThetaMax / tlen;
+      }
+      n.v = glm::vec3(0.0f);
+      n.w = glm::vec3(0.0f);
+    }
+    is.vmax = vmax;
   }
 }
 
@@ -639,12 +1122,9 @@ void StructureWorld::substep() {
   brokenThisDt_ += brokenThisStep_;
   if (brokenThisStep_ > 0) {
     solveBonds();
-    cutBrokenBonds();
-    peelUnanchored();
-    rebuildGraphColors();
+    fractureDeadBonds();
   }
   integrateGhost();
-  snapshotDebug();
 }
 
 void StructureWorld::updateSleep(float h) {
@@ -656,18 +1136,12 @@ void StructureWorld::updateSleep(float h) {
       is.asleep = true;
       continue;
     }
-    float vmax = 0.0f;
-    for (int ni : is.nodes) {
-      if (ni < 0 || ni >= static_cast<int>(nodes_.size())) {
-        continue;
-      }
-      const BondNode& n = nodes_[static_cast<size_t>(ni)];
-      if (n.anchored) {
-        continue;
-      }
-      vmax = std::max(vmax, glm::length(n.v) + glm::length(n.w) * 0.5f);
+    if (is.brokenThisDt > 0 || is.settleLeft > 0) {
+      is.sleepTimer = 0.0f;
+      is.asleep = false;
+      continue;
     }
-    if (vmax < kSleepLin && brokenThisDt_ == 0) {
+    if (is.vmax < kSleepLin) {
       is.sleepTimer += h;
       if (is.sleepTimer >= kSleepTime) {
         is.asleep = true;
@@ -685,6 +1159,8 @@ void StructureWorld::updateSleep(float h) {
       is.asleep = false;
     }
   }
+  maxPhiPrev_ = maxPhi_;
+  snapshotDebug();
 }
 
 void StructureWorld::fillDebug(DebugSolve& debug) const {

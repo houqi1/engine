@@ -1103,7 +1103,7 @@ bool VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
 
   // UI requests must not destroy resources referenced by an unsubmitted command buffer.
   if (importRequested_ || removeImportRequested_ || rebuildRequested_ || simulateRequested_ ||
-      debrisPending_ >= 0) {
+      spawnBoxRequested_ || debrisPending_ >= 0) {
     gfx_.waitIdle();
     if (importRequested_) {
       MeshVoxelizeConfig cfg;
@@ -1121,6 +1121,9 @@ bool VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
     if (rebuildRequested_) {
       scene.rebuildVoxels(gfx_);
     }
+    if (spawnBoxRequested_) {
+      scene.setSpawnSimulateBox(gfx_, spawnBoxValue_);
+    }
     if (simulateRequested_) {
       scene.setSimulate(gfx_, simulateValue_);
     }
@@ -1129,6 +1132,7 @@ bool VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
     }
     importRequested_ = removeImportRequested_ = rebuildRequested_ = false;
     simulateRequested_ = false;
+    spawnBoxRequested_ = false;
     debrisPending_ = -1;
     boundCoarsePoolBuffer_ = VK_NULL_HANDLE;
   }
@@ -1420,7 +1424,7 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
 
   {
     const glm::mat4 viewProj = scene.camera().proj() * scene.camera().view();
-    if (scene.simulate() && scene.cpuObjectCount() >= 2) {
+    if (scene.simulate() && scene.spawnSimulateBox() && scene.cpuObjectCount() >= 2) {
       drawCornerNormals(scene, viewProj, ImGui::GetIO().DisplaySize);
     }
   }
@@ -1542,14 +1546,24 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
       simulateRequested_ = true;
       simulateValue_ = sim;
     }
-    ImGui::TextDisabled("On = solid test box falls on 3.2 m ground. Off = spinner.");
+    bool spawnBox = spawnBoxRequested_ ? spawnBoxValue_ : scene.spawnSimulateBox();
+    if (ImGui::Checkbox("Falling test box", &spawnBox)) {
+      spawnBoxRequested_ = true;
+      spawnBoxValue_ = spawnBox;
+    }
+    ImGui::TextDisabled("Simulate: physics on. Falling test box: 2x2x2 cube in the center.");
+    ImGui::TextDisabled("Uncheck the box to simulate the house only (no cube).");
     if (scene.simulate()) {
-      ImGui::Text("Test box corners: %u   edges: %u", scene.physicsCornerCount(1),
-                  scene.physicsEdgeCount(1));
-      ImGui::TextDisabled("Corner rays: green = n.y up, red = n.y down, grey = no hit.");
+      if (scene.spawnSimulateBox()) {
+        ImGui::Text("Test box corners: %u   edges: %u", scene.physicsCornerCount(1),
+                    scene.physicsEdgeCount(1));
+        ImGui::TextDisabled("Corner rays: green = n.y up, red = n.y down, grey = no hit.");
+        ImGui::Text("Box v=(%.2f,%.2f,%.2f) |w|=%.2f", scene.physicsDebug().v.x,
+                    scene.physicsDebug().v.y, scene.physicsDebug().v.z,
+                    glm::length(scene.physicsDebug().w));
+      }
       const physics::DebugSolve ds = scene.physicsDebug();
       ImGui::Text("Solve contacts=%d  maxD=%.3f  minNy=%.2f", ds.contacts, ds.maxD, ds.minNy);
-      ImGui::Text("Box v=(%.2f,%.2f,%.2f) |w|=%.2f", ds.v.x, ds.v.y, ds.v.z, glm::length(ds.w));
       ImGui::Text("Bonds alive=%d  broken=%d  maxPhi=%.2f", ds.bondsAlive, ds.bondsBrokenThisStep,
                   ds.maxPhi);
     }

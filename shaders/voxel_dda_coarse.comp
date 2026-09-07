@@ -337,17 +337,19 @@ void main() {
                 anyHit = true;
             }
         }
-        for (uint i = 0u; i < ubo.objectCount; ++i) {
-            if (i == visId) {
-                continue;
-            }
-            Hit h2 = traceCoarse(objects[i], ubo.cameraPos, dir, bestT);
-            bestSteps = max(bestSteps, h2.steps);
-            if (h2.hit && h2.tWorld < bestT) {
-                bestT = h2.tWorld;
-                hitAlbedo = h2.color;
-                hitN = h2.normal;
-                anyHit = true;
+        if (!anyHit) {
+            for (uint i = 0u; i < ubo.objectCount; ++i) {
+                if (i == visId) {
+                    continue;
+                }
+                Hit h2 = traceCoarse(objects[i], ubo.cameraPos, dir, bestT);
+                bestSteps = max(bestSteps, h2.steps);
+                if (h2.hit && h2.tWorld < bestT) {
+                    bestT = h2.tWorld;
+                    hitAlbedo = h2.color;
+                    hitN = h2.normal;
+                    anyHit = true;
+                }
             }
         }
     } else {

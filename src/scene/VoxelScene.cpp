@@ -151,7 +151,7 @@ void VoxelScene::update(float dt) {
   }
   if (simulate_) {
     if (objects_.size() >= 2) {
-      objects_[1].enabled = true;
+      objects_[1].enabled = spawnSimulateBox_;
     }
     for (size_t i = 2; i < objects_.size(); ++i) {
       objects_[i].enabled = true;
@@ -828,9 +828,8 @@ void VoxelScene::ensureGpuBuffers(GfxDevice& gfx) {
     uploadedObjectsGpu_.clear();
     gfx.waitIdle();
     gfx.destroyBuffer(objectBuffer_);
-    objectBuffer_ = gfx.createBuffer(objectBytes,
-                                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                                     VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+    objectBuffer_ = gfx.createBuffer(objectBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                     VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
   }
   const VkDeviceSize visBytes =
       sizeof(VisCoarseInstance) * std::max<size_t>(visInstancesCpu_.size(), 1);
@@ -919,8 +918,6 @@ void VoxelScene::flushObject(GfxDevice& gfx, int objectIndex) {
   if (objectIndex < 0 || objectIndex >= static_cast<int>(objects_.size())) {
     return;
   }
-  // One queue drain per edit. Dirty brick pages batch into a single submit below.
-  gfx.waitIdle();
   packObjectPool();
   fillGpuObjectRecords();
   ensureGpuBuffers(gfx);
@@ -943,15 +940,35 @@ void VoxelScene::uploadVisInstances(GfxDevice& gfx) {
       std::memcmp(uploadedVisInstances_.data(), visInstancesCpu_.data(), visBytes) == 0) {
     return;
   }
-  uploadedVisInstances_.clear();
-  gfx.waitIdle();
   ensureGpuBuffers(gfx);
   gfx.uploadToBuffer(visInstanceBuffer_, visInstancesCpu_.data(), visBytes);
   uploadedVisInstances_ = visInstancesCpu_;
 }
 
+void VoxelScene::refreshGpuTransforms() {
+  size_t gi = 0;
+  for (size_t i = 0; i < objects_.size(); ++i) {
+    const VoxelObject& o = objects_[i];
+    if (!o.enabled) {
+      continue;
+    }
+    if (gi >= objectsGpu_.size() || objectsGpu_[gi].cpuIndex != static_cast<uint32_t>(i)) {
+      fillGpuObjectRecords();
+      return;
+    }
+    GpuVoxelObject& g = objectsGpu_[gi];
+    const glm::mat4 objectToWorld = o.objectToWorld();
+    writeMat4(g.worldToObject, glm::inverse(objectToWorld));
+    writeMat4(g.objectToWorld, objectToWorld);
+    ++gi;
+  }
+  if (gi != objectsGpu_.size()) {
+    fillGpuObjectRecords();
+  }
+}
+
 void VoxelScene::uploadObjectTransforms(GfxDevice& gfx) {
-  fillGpuObjectRecords();
+  refreshGpuTransforms();
   if (objectsGpu_.empty()) {
     uploadedObjectsGpu_.clear();
     uploadedVisInstances_.clear();
@@ -965,11 +982,13 @@ void VoxelScene::uploadObjectTransforms(GfxDevice& gfx) {
     return;
   }
 
-  // The buffer is shared by all frames; only unchanged records can avoid the wait.
-  uploadedObjectsGpu_.clear();
-  gfx.waitIdle();
   ensureGpuBuffers(gfx);
-  gfx.uploadToBuffer(objectBuffer_, objectsGpu_.data(), objectBytes);
+  if (objectBuffer_.info.pMappedData) {
+    std::memcpy(objectBuffer_.info.pMappedData, objectsGpu_.data(), objectBytes);
+    vmaFlushAllocation(gfx.allocator(), objectBuffer_.allocation, 0, objectBytes);
+  } else {
+    gfx.uploadToBuffer(objectBuffer_, objectsGpu_.data(), objectBytes);
+  }
   uploadedObjectsGpu_ = objectsGpu_;
   uploadVisInstances(gfx);
 }
@@ -1080,6 +1099,32 @@ void VoxelScene::buildTestBoxObject(VoxelObject& o) {
   }
 }
 
+void VoxelScene::buildEmptyObject(VoxelObject& o) {
+  constexpr int kN = 8;
+  o.gridSize = kN;
+  o.voxelSize = voxelSize_;
+  o.nestedMicro = nestedMicroVoxels_;
+  o.editable = false;
+  o.enabled = false;
+  o.useImportPalette = false;
+  o.rotation = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+  o.position = glm::vec3(0.0f, 8.0f, 0.0f);
+  o.cells.assign(static_cast<size_t>(kN) * static_cast<size_t>(kN) * static_cast<size_t>(kN),
+                 CoarseCell{});
+}
+
+void VoxelScene::fillSecondaryObject(VoxelObject& o) {
+  clearObjectPages(o);
+  if (simulate_ && spawnSimulateBox_) {
+    buildTestBoxObject(o);
+  } else if (simulate_) {
+    buildEmptyObject(o);
+  } else {
+    buildSpinnerObject(o);
+    o.enabled = spinnerEnabled_;
+  }
+}
+
 void VoxelScene::buildDebrisObject(VoxelObject& o, int debrisIndex, int debrisTotal) {
   buildTestBoxObject(o);
   const int n = std::max(1, debrisTotal);
@@ -1133,14 +1178,25 @@ void VoxelScene::setSimulate(GfxDevice& gfx, bool on) {
   if (objects_.size() < 2) {
     return;
   }
-  clearObjectPages(objects_[1]);
-  if (on) {
-    buildTestBoxObject(objects_[1]);
-    objects_[1].enabled = true;
-  } else {
-    buildSpinnerObject(objects_[1]);
-    objects_[1].enabled = spinnerEnabled_;
+  fillSecondaryObject(objects_[1]);
+  packObjectPool();
+  fillGpuObjectRecords();
+  ensureGpuBuffers(gfx);
+  uploadWorldAndObjects(gfx);
+  physics_.attach(*this);
+  physics_.rebuildFromScene();
+}
+
+void VoxelScene::setSpawnSimulateBox(GfxDevice& gfx, bool on) {
+  if (spawnSimulateBox_ == on) {
+    return;
   }
+  spawnSimulateBox_ = on;
+  if (!simulate_ || objects_.size() < 2) {
+    return;
+  }
+  gfx.waitIdle();
+  fillSecondaryObject(objects_[1]);
   packObjectPool();
   fillGpuObjectRecords();
   ensureGpuBuffers(gfx);
@@ -1282,7 +1338,58 @@ uint32_t VoxelScene::occupiedFineCount(int objectIndex, const glm::ivec3& coarse
   return n;
 }
 
+uint32_t VoxelScene::countSharedFaceFines(int objectIndex, const glm::ivec3& lower, int axis) const {
+  if (objectIndex < 0 || objectIndex >= static_cast<int>(objects_.size()) || axis < 0 || axis > 2) {
+    return 0;
+  }
+  const VoxelObject& o = objects_[static_cast<size_t>(objectIndex)];
+  glm::ivec3 upper = lower;
+  upper[axis] += 1;
+  if (!inBounds(o, lower) || !inBounds(o, upper) || o.cells.empty()) {
+    return 0;
+  }
+  const CoarseCell& a = cellAt(o, indexOf(o, lower));
+  const CoarseCell& b = cellAt(o, indexOf(o, upper));
+  if (a.material == 0u || b.material == 0u) {
+    return 0;
+  }
+  const int N = kFinePerCoarse;
+  if (a.brickPage == kInvalidBrickPage && b.brickPage == kInvalidBrickPage) {
+    return static_cast<uint32_t>(N * N);
+  }
+  uint32_t n = 0;
+  for (int u = 0; u < N; ++u) {
+    for (int v = 0; v < N; ++v) {
+      glm::ivec3 fa = lower * N;
+      if (axis == 0) {
+        fa.x += N - 1;
+        fa.y += u;
+        fa.z += v;
+      } else if (axis == 1) {
+        fa.y += N - 1;
+        fa.x += u;
+        fa.z += v;
+      } else {
+        fa.z += N - 1;
+        fa.x += u;
+        fa.y += v;
+      }
+      glm::ivec3 fb = fa;
+      fb[axis] += 1;
+      if (solidAbsFine(o, fa) && solidAbsFine(o, fb)) {
+        ++n;
+      }
+    }
+  }
+  return n;
+}
+
 void VoxelScene::notifyOccupancyChanged(int objectIndex) { physics_.markDirty(objectIndex); }
+
+void VoxelScene::notifyOccupancyChanged(int objectIndex,
+                                        const std::vector<glm::ivec3>& coarses) {
+  physics_.markDirtyCells(objectIndex, coarses);
+}
 
 bool VoxelScene::fractureFromCuts(int objectIndex, const std::vector<glm::ivec3>& deletedAbsFines) {
   return maybeFracture(objectIndex, deletedAbsFines);
@@ -1297,6 +1404,11 @@ int VoxelScene::cutCoarseInterface(int objectIndex, const glm::ivec3& coarseA,
   if (!inBounds(o, coarseA) || !inBounds(o, coarseB)) {
     return 0;
   }
+  const bool terrainA = isTerrainCoarse(objectIndex, coarseA);
+  const bool terrainB = isTerrainCoarse(objectIndex, coarseB);
+  if (terrainA && terrainB) {
+    return 0;
+  }
   const glm::ivec3 d = coarseB - coarseA;
   int axis = 0;
   int sign = 1;
@@ -1309,25 +1421,42 @@ int VoxelScene::cutCoarseInterface(int objectIndex, const glm::ivec3& coarseA,
   } else {
     sign = d.x >= 0 ? 1 : -1;
   }
-  const glm::ivec3 src = sign > 0 ? coarseA : coarseB;
-  const glm::ivec3 base = src * kFinePerCoarse;
+  const glm::ivec3 lower = sign > 0 ? coarseA : coarseB;
   const int N = kFinePerCoarse;
   int changed = 0;
   for (int u = 0; u < N; ++u) {
     for (int v = 0; v < N; ++v) {
-      glm::ivec3 abs = base;
+      glm::ivec3 fLower = lower * N;
       if (axis == 0) {
-        abs.x += sign > 0 ? N - 1 : 0;
-        abs.y += u;
-        abs.z += v;
+        fLower.x += N - 1;
+        fLower.y += u;
+        fLower.z += v;
       } else if (axis == 1) {
-        abs.y += sign > 0 ? N - 1 : 0;
-        abs.x += u;
-        abs.z += v;
+        fLower.y += N - 1;
+        fLower.x += u;
+        fLower.z += v;
       } else {
-        abs.z += sign > 0 ? N - 1 : 0;
-        abs.x += u;
-        abs.y += v;
+        fLower.z += N - 1;
+        fLower.x += u;
+        fLower.y += v;
+      }
+      glm::ivec3 fUpper = fLower;
+      fUpper[axis] += 1;
+      if (!solidAbsFine(o, fLower) || !solidAbsFine(o, fUpper)) {
+        continue;
+      }
+      const bool tLo = isTerrainFine(objectIndex, fLower);
+      const bool tHi = isTerrainFine(objectIndex, fUpper);
+      if (tLo && tHi) {
+        continue;
+      }
+      const bool foundedLower =
+          objectIndex == 0 && lower.y == kGroundCoarseY && axis == 1;
+      // Never carve terrain. Prefer the unfounded side so a wall peel does
+      // not slice the platform. A 1-fine weld deletes that one fine, not 16².
+      const glm::ivec3 abs = (tLo || foundedLower) ? fUpper : fLower;
+      if (isTerrainFine(objectIndex, abs) || (tHi && abs == fUpper)) {
+        continue;
       }
       const glm::ivec3 c = abs / kFinePerCoarse;
       const glm::ivec3 rem = abs - c * kFinePerCoarse;
@@ -1355,6 +1484,9 @@ void VoxelScene::peelCoarseIslands(int objectIndex, const std::vector<glm::ivec3
   std::vector<glm::ivec3> fines;
   packed.reserve(coarses.size() * 64);
   for (const glm::ivec3& c : coarses) {
+    if (isTerrainCoarse(objectIndex, c)) {
+      continue;
+    }
     collectOccupiedFines(objectIndex, c, fines);
     for (const glm::ivec3& f : fines) {
       packed.push_back(static_cast<uint32_t>(f.x) | (static_cast<uint32_t>(f.y) << 10) |
@@ -1428,11 +1560,7 @@ void VoxelScene::rebuildVoxels(GfxDevice& gfx) {
   objects_.clear();
   objects_.resize(2);
   buildGroundObject(objects_[0]);
-  if (simulate_) {
-    buildTestBoxObject(objects_[1]);
-  } else {
-    buildSpinnerObject(objects_[1]);
-  }
+  fillSecondaryObject(objects_[1]);
   spawnDebrisObjects();
 
   packObjectPool();
@@ -2161,7 +2289,26 @@ void VoxelScene::handleEditInput(GLFWwindow* window, GfxDevice& gfx) {
       maybeFracture(objIndex, deletedFines);
     }
     flushObject(gfx, objIndex);
-    notifyOccupancyChanged(objIndex);
+    if (!deletedFines.empty()) {
+      std::vector<glm::ivec3> dirtyCoarse;
+      dirtyCoarse.reserve(deletedFines.size());
+      for (const glm::ivec3& f : deletedFines) {
+        dirtyCoarse.push_back(f / kFinePerCoarse);
+      }
+      std::sort(dirtyCoarse.begin(), dirtyCoarse.end(), [](const glm::ivec3& a, const glm::ivec3& b) {
+        if (a.x != b.x) {
+          return a.x < b.x;
+        }
+        if (a.y != b.y) {
+          return a.y < b.y;
+        }
+        return a.z < b.z;
+      });
+      dirtyCoarse.erase(std::unique(dirtyCoarse.begin(), dirtyCoarse.end()), dirtyCoarse.end());
+      notifyOccupancyChanged(objIndex, dirtyCoarse);
+    } else {
+      notifyOccupancyChanged(objIndex);
+    }
     for (int i = nBefore; i < static_cast<int>(objects_.size()); ++i) {
       notifyOccupancyChanged(i);
     }

@@ -336,6 +336,76 @@ void reducePairContacts(std::vector<Contact>& out, size_t before) {
 
 }  // namespace
 
+// Occupied-coarse overlap in the static object's local meters. Teardown /
+// OAABB: do not use the static world's full occupancy AABB (ground+house).
+bool occupiedOverlapLocal(const VoxelScene& scene, int staticIdx, const VoxelObject& st,
+                          const glm::vec3& lmn, const glm::vec3& lmx, glm::vec3& omn,
+                          glm::vec3& omx) {
+  const float vs = st.voxelSize;
+  if (vs <= 1e-8f || st.gridSize <= 0) {
+    return false;
+  }
+  const int n = st.gridSize;
+  const int x0 = std::max(0, static_cast<int>(std::floor(lmn.x / vs)));
+  const int y0 = std::max(0, static_cast<int>(std::floor(lmn.y / vs)));
+  const int z0 = std::max(0, static_cast<int>(std::floor(lmn.z / vs)));
+  const int x1 = std::min(n - 1, static_cast<int>(std::floor((lmx.x - 1e-6f) / vs)));
+  const int y1 = std::min(n - 1, static_cast<int>(std::floor((lmx.y - 1e-6f) / vs)));
+  const int z1 = std::min(n - 1, static_cast<int>(std::floor((lmx.z - 1e-6f) / vs)));
+  if (x0 > x1 || y0 > y1 || z0 > z1) {
+    return false;
+  }
+  const int vol = (x1 - x0 + 1) * (y1 - y0 + 1) * (z1 - z0 + 1);
+  if (vol > 2048) {
+    return false;
+  }
+  bool any = false;
+  omn = glm::vec3(1e30f);
+  omx = glm::vec3(-1e30f);
+  for (int z = z0; z <= z1; ++z) {
+    for (int y = y0; y <= y1; ++y) {
+      for (int x = x0; x <= x1; ++x) {
+        if (scene.occupancyMaterial(staticIdx, glm::ivec3(x, y, z)) == 0u) {
+          continue;
+        }
+        any = true;
+        omn = glm::min(omn, glm::vec3(static_cast<float>(x), static_cast<float>(y),
+                                      static_cast<float>(z)) *
+                                vs);
+        omx = glm::max(omx, glm::vec3(static_cast<float>(x + 1), static_cast<float>(y + 1),
+                                      static_cast<float>(z + 1)) *
+                                vs);
+      }
+    }
+  }
+  return any;
+}
+
+void testDynamicVsStatic(const VoxelScene& scene, const RigidBody& dyn, const RigidBody& st,
+                         const VoxelObject& od, const VoxelObject& os, const ShapeClass& cd,
+                         std::vector<Contact>& out) {
+  glm::vec3 dwn, dwx, swn, swx;
+  if (!worldAabb(scene, dyn.shapeIndex, cd, dwn, dwx)) {
+    return;
+  }
+  glm::vec3 lmn, lmx;
+  transformAabb(os.worldToObject(), dwn, dwx, lmn, lmx);
+  const float pad = std::max(fineSize(od), fineSize(os));
+  lmn -= pad;
+  lmx += pad;
+  glm::vec3 omn, omx;
+  if (!occupiedOverlapLocal(scene, st.shapeIndex, os, lmn, lmx, omn, omx)) {
+    return;
+  }
+  glm::vec3 overlapWmn, overlapWmx;
+  transformAabb(os.objectToWorld(), omn, omx, overlapWmn, overlapWmx);
+  glm::vec3 inDynMn, inDynMx;
+  transformAabb(od.worldToObject(), overlapWmn, overlapWmx, inDynMn, inDynMx);
+  const FineBox box = makeFineBox(od, inDynMn - pad, inDynMx + pad);
+  // Teardown: a box on the ground contacts at corners, not every face voxel.
+  testList(scene, dyn, st, od, os, cd, cd.corners, box, out);
+}
+
 void collidePair(VoxelScene& scene, const RigidBody& a, const RigidBody& b, const ShapeClass& ca,
                  const ShapeClass& cb, std::vector<Contact>& out) {
   if (a.shapeIndex < 0 || b.shapeIndex < 0 || a.shapeIndex == b.shapeIndex) {
@@ -348,10 +418,26 @@ void collidePair(VoxelScene& scene, const RigidBody& a, const RigidBody& b, cons
   }
   const VoxelObject& oa = scene.cpuObject(a.shapeIndex);
   const VoxelObject& ob = scene.cpuObject(b.shapeIndex);
-  // 6-neighbor probe sees one fine cell outside the occupancy AABB.
   const float pad = std::max(fineSize(oa), fineSize(ob));
   if (amn.x - pad > bmx.x + pad || amx.x + pad < bmn.x - pad || amn.y - pad > bmx.y + pad ||
       amx.y + pad < bmn.y - pad || amn.z - pad > bmx.z + pad || amx.z + pad < bmn.z - pad) {
+    return;
+  }
+
+  const size_t before = out.size();
+  const bool dynA = a.dynamic && a.invM > 0.0f;
+  const bool dynB = b.dynamic && b.invM > 0.0f;
+  if (!dynA && !dynB) {
+    return;
+  }
+  if (dynA && !dynB) {
+    testDynamicVsStatic(scene, a, b, oa, ob, ca, out);
+    reducePairContacts(out, before);
+    return;
+  }
+  if (dynB && !dynA) {
+    testDynamicVsStatic(scene, b, a, ob, oa, cb, out);
+    reducePairContacts(out, before);
     return;
   }
 
@@ -360,8 +446,6 @@ void collidePair(VoxelScene& scene, const RigidBody& a, const RigidBody& b, cons
   transformAabb(ob.worldToObject(), amn, amx, aInB_mn, aInB_mx);
   const FineBox boxA = makeFineBox(oa, bInA_mn - pad, bInA_mx + pad);
   const FineBox boxB = makeFineBox(ob, aInB_mn - pad, aInB_mx + pad);
-
-  const size_t before = out.size();
   testList(scene, a, b, oa, ob, ca, ca.corners, boxA, out);
   testList(scene, a, b, oa, ob, ca, ca.edges, boxA, out);
   testList(scene, b, a, ob, oa, cb, cb.corners, boxB, out);

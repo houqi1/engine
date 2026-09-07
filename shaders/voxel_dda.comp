@@ -932,12 +932,11 @@ void main() {
     if ((ubo.useVis & 1u) != 0u) {
         float visPacked = imageLoad(visImage, pixel).r;
         uint visId = visPacked >= 0.5 ? uint(visPacked + 0.5) - 1u : VIS_MISS;
-        // Conservative coarse cubes can sit in front of a nearer object (house
-        // vis wins, DDA then hits the house behind the spinner). Always allow
-        // closer hits; vis miss must not skip the object loop.
-        // After a cut, beam t0 can sit past leftover occupancy in the vis cube
-        // (sparse 4^3 AND). Vis already proved a coarse on this pixel: walk
-        // that object from the camera so ground behind a hole still hits.
+        // Occupied-coarse vis with depth: the nearest cube's object owns this
+        // pixel. Teardown only raymarches that volume. Looping every object on
+        // every ground pixel made N debris cost N times the world DDA.
+        // If this ray misses that object (hole in a conservative cube), fall
+        // back to the remaining objects from the camera.
         if (visId != VIS_MISS && visId < ubo.objectCount) {
             ObjectHit h = traverseObject(objects[visId], ubo.cameraPos, dir, 0.0, t1);
             bestSteps = h.steps;
@@ -947,17 +946,18 @@ void main() {
                 anyHit = true;
             }
         }
-        float loopT0 = anyHit ? t0 : 0.0;
-        for (uint i = 0u; i < ubo.objectCount; ++i) {
-            if (i == visId) {
-                continue;
-            }
-            ObjectHit h2 = traverseObject(objects[i], ubo.cameraPos, dir, loopT0, bestT);
-            bestSteps = max(bestSteps, h2.steps);
-            if (h2.hit && h2.tWorld < bestT) {
-                bestT = h2.tWorld;
-                color = h2.color;
-                anyHit = true;
+        if (!anyHit) {
+            for (uint i = 0u; i < ubo.objectCount; ++i) {
+                if (i == visId) {
+                    continue;
+                }
+                ObjectHit h2 = traverseObject(objects[i], ubo.cameraPos, dir, 0.0, bestT);
+                bestSteps = max(bestSteps, h2.steps);
+                if (h2.hit && h2.tWorld < bestT) {
+                    bestT = h2.tWorld;
+                    color = h2.color;
+                    anyHit = true;
+                }
             }
         }
     } else {

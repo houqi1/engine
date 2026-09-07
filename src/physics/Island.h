@@ -4,29 +4,32 @@
 
 namespace physics {
 
+// Connected component of unanchored BondNodes joined by live bonds.
+// Anchored nodes are static (Box3D): they support islands but do not merge
+// two islands into one. Sleep/wake is per island, not per node.
 struct Island {
   int id = -1;
   int shapeIndex = -1;
   std::vector<int> nodes;
-  bool asleep = false;
+  std::vector<int> bonds;
+  bool asleep = true;
   bool needsSplit = false;
   float sleepTimer = 0.0f;
   int settleLeft = 0;
+  int brokenThisDt = 0;
+  float vmax = 0.0f;
 };
 
-// One island per static shape that has a bond graph. Box3D: merge fast, split
-// at most one island per dt, sleep the whole island.
 class IslandSet {
 public:
   void clear();
-  Island& ensureForShape(int shapeIndex);
-  Island* findByShape(int shapeIndex);
-  const Island* findByShape(int shapeIndex) const;
+  Island& add(int shapeIndex);
+  Island* byId(int id);
+  const Island* byId(int id) const;
   std::vector<Island>& all() { return islands_; }
   const std::vector<Island>& all() const { return islands_; }
-  void wakeShape(int shapeIndex);
-  // Returns true if a split was consumed this call.
-  bool consumeSplit(int shapeIndex);
+  void wake(int islandId);
+  int firstNeedsSplit() const;
 
 private:
   std::vector<Island> islands_;

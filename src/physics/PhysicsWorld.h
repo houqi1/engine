@@ -15,6 +15,7 @@ public:
   void attach(VoxelScene& scene);
   void rebuildFromScene();
   void markDirty(int objectIndex);
+  void markDirtyCells(int objectIndex, const std::vector<glm::ivec3>& coarses);
   // src stays; dst is a newly appended CPU object. Copies velocity and adds w × r.
   void onSplit(int srcIndex, int dstIndex, const glm::vec3& newCenterWorld);
   void rebuildDirty();

@@ -57,6 +57,13 @@ void PhysicsWorld::markDirty(int objectIndex) {
   structure_.markDirty(objectIndex);
 }
 
+void PhysicsWorld::markDirtyCells(int objectIndex, const std::vector<glm::ivec3>& coarses) {
+  if (objectIndex >= 0 && objectIndex < static_cast<int>(classes_.size())) {
+    classes_[static_cast<size_t>(objectIndex)].dirty = true;
+  }
+  structure_.markDirtyCells(objectIndex, coarses);
+}
+
 void PhysicsWorld::onSplit(int srcIndex, int dstIndex, const glm::vec3& /*newCenterWorld*/) {
   if (!scene_ || srcIndex < 0 || dstIndex < 0) {
     return;
@@ -143,18 +150,29 @@ void PhysicsWorld::substep() {
                   contacts);
     }
   }
+  // Box3D: contacts do not reset an already-awake body's sleep timer.
+  // Only an awake dynamic can wake a sleeping dynamic. Static ground
+  // contacts must not keep debris in the solver forever.
   for (const Contact& c : contacts) {
-    if (c.a >= 0 && c.a < n && bodies_[static_cast<size_t>(c.a)].dynamic) {
-      bodies_[static_cast<size_t>(c.a)].awake = true;
-      bodies_[static_cast<size_t>(c.a)].sleepTimer = 0.0f;
+    if (c.a < 0 || c.b < 0 || c.a >= n || c.b >= n) {
+      continue;
     }
-    if (c.b >= 0 && c.b < n && bodies_[static_cast<size_t>(c.b)].dynamic) {
-      bodies_[static_cast<size_t>(c.b)].awake = true;
-      bodies_[static_cast<size_t>(c.b)].sleepTimer = 0.0f;
+    RigidBody& A = bodies_[static_cast<size_t>(c.a)];
+    RigidBody& B = bodies_[static_cast<size_t>(c.b)];
+    const bool aLive = A.awake && A.dynamic && A.invM > 0.0f;
+    const bool bLive = B.awake && B.dynamic && B.invM > 0.0f;
+    if (aLive && B.dynamic && B.invM > 0.0f && !B.awake) {
+      B.awake = true;
+      B.sleepTimer = 0.0f;
+    }
+    if (bLive && A.dynamic && A.invM > 0.0f && !A.awake) {
+      A.awake = true;
+      A.sleepTimer = 0.0f;
     }
   }
-  structure_.wakeFromContacts(contacts);
+  structure_.wakeFromContacts(contacts, bodies_);
   solveContacts(bodies_, contacts, kSubDt, kContactIters);
+  structure_.applyContactImpulses(contacts, bodies_);
   integrateBodies(bodies_, kSubDt);
   syncTransformsToScene();
   debug_.contacts = static_cast<int>(contacts.size());

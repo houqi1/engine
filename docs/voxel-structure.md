@@ -2,7 +2,7 @@
 
 活文档。在已有连通断裂和质心刚体之上，给还连着的楼补上「自重会把键拉断」。
 
-Status: **实现中（P0 支撑 flood + P1 键/TGS/Φ + P2 着色/整岛睡）。** P3 加密不做。
+Status: **P0–P2 已接上。** 鬼影准静态（每子步从静止加重力，λ 暖启动）、整岛睡、死键锯邻面再 `maybeFracture`。地面接触不叫醒楼。P3 加密不做。
 
 Related:
 
@@ -318,7 +318,7 @@ for 子步:
 
 **不改：** DDA 主路径、coarsePool 布局、断裂连通算法、角棱分类。
 
-重键范围：只重建被挖 coarse 的 6 邻，不要全楼 flood（和断裂的局部膨胀同一原则）。
+重键范围：只重建被挖 coarse 的 6 邻（`markDirtyCells` / `rebuildNeighborhood`）。剥岛或脏格太多才整栋 `rebuildShape`。鬼影 \(u,\theta\) 留下做伸长，不画成弯曲。\(\lambda_N\) 在 Φ 判定之后夹到 \(A\sigma h\)。接触 \(|J| > j_\mathrm{break}\) 打断命中 coarse 的键。\(\Phi\) 含扭转 \(T\) 和短柱 \(P\)-\(\Delta\)（\(N/N_\mathrm{cr}\)）。
 
 GPU：结构纯 CPU。`flushObject` / `setSimulate` 已有 waitIdle 延后，塌出新物体时走同一条。
 

@@ -31,8 +31,15 @@ constexpr float kSleepTime = 0.5f;
 constexpr float kDensityWood = 600.0f;
 constexpr float kDensityStone = 2200.0f;
 
+// Awake islands only. Box3D: static/sleeping sets are not in the solver.
+// Doc: 键每子步 1～2 次 TGS；每子步破键 8～32。
 constexpr int kBondIters = 2;
-constexpr int kMaxBrokenBondsPerSubstep = 32;
+constexpr int kMaxBrokenBondsPerSubstep = 8;
+constexpr int kMaxBrokenBondsPerDt = 32;
+constexpr int kBondSettleSteps = 2;
+constexpr float kBondUMax = 0.08f;
+constexpr float kBondThetaMax = 0.08f;
+constexpr float kImpactSpeed = 2.5f;
 
 enum class FineClass : uint8_t { Empty = 0, Inside, Face, Edge, Corner };
 

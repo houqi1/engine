@@ -176,6 +176,8 @@ private:
   bool rebuildRequested_ = false;
   bool simulateRequested_ = false;
   bool simulateValue_ = false;
+  bool spawnBoxRequested_ = false;
+  bool spawnBoxValue_ = true;
   int debrisPending_ = -1;
   bool showBondStress_ = false;
   float displayFps_ = 0.0f;
