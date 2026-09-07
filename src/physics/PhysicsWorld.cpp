@@ -19,7 +19,10 @@ glm::vec3 gridCenterLocal(const VoxelObject& o) {
 
 }  // namespace
 
-void PhysicsWorld::attach(VoxelScene& scene) { scene_ = &scene; }
+void PhysicsWorld::attach(VoxelScene& scene) {
+  scene_ = &scene;
+  structure_.attach(scene);
+}
 
 void PhysicsWorld::rebuildFromScene() {
   if (!scene_) {
@@ -42,6 +45,7 @@ void PhysicsWorld::rebuildFromScene() {
     classes_[static_cast<size_t>(i)].dirty = true;
   }
   rebuildDirty();
+  structure_.rebuildAll();
   syncTransformsToScene();
   accumulator_ = 0.0f;
 }
@@ -50,6 +54,7 @@ void PhysicsWorld::markDirty(int objectIndex) {
   if (objectIndex >= 0 && objectIndex < static_cast<int>(classes_.size())) {
     classes_[static_cast<size_t>(objectIndex)].dirty = true;
   }
+  structure_.markDirty(objectIndex);
 }
 
 void PhysicsWorld::onSplit(int srcIndex, int dstIndex, const glm::vec3& /*newCenterWorld*/) {
@@ -87,6 +92,7 @@ void PhysicsWorld::onSplit(int srcIndex, int dstIndex, const glm::vec3& /*newCen
   dst.v = srcCopy.v + glm::cross(srcCopy.w, dst.x - srcCopy.x);
   dst.w = srcCopy.w;
   dst.awake = dst.dynamic;
+  structure_.onSplit(srcIndex, dstIndex);
   syncTransformsToScene();
 }
 
@@ -120,6 +126,7 @@ void PhysicsWorld::substep() {
       b.v += kGravity * kSubDt;
     }
   }
+  structure_.substep();
   std::vector<Contact> contacts;
   const int n = static_cast<int>(bodies_.size());
   for (int i = 0; i < n; ++i) {
@@ -146,11 +153,13 @@ void PhysicsWorld::substep() {
       bodies_[static_cast<size_t>(c.b)].sleepTimer = 0.0f;
     }
   }
+  structure_.wakeFromContacts(contacts);
   solveContacts(bodies_, contacts, kSubDt, kContactIters);
   integrateBodies(bodies_, kSubDt);
   syncTransformsToScene();
   debug_.contacts = static_cast<int>(contacts.size());
   debug_.lastContacts = contacts;
+  structure_.fillDebug(debug_);
   debug_.maxD = 0.0f;
   debug_.minNy = 1.0f;
   for (const Contact& c : contacts) {
@@ -196,9 +205,11 @@ void PhysicsWorld::step(float frameDt) {
       std::min(accumulator_ + std::max(frameDt, 0.0f), kDt * static_cast<float>(kMaxStepsPerFrame));
   int guard = 0;
   while (accumulator_ >= kDt && guard < kMaxStepsPerFrame) {
+    structure_.beginDt();
     for (int s = 0; s < kSubsteps; ++s) {
       substep();
     }
+    structure_.updateSleep(kDt);
     updateSleep(kDt);
     accumulator_ -= kDt;
     ++guard;

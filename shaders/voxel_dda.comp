@@ -46,7 +46,7 @@ layout(set = 0, binding = 0, std140) uniform VoxelDdaUBO {
     float beamMargin;    // world-space safety margin for DDA entry bias
     uint dirMaskBrick;   // 1 = 4^3 direction AND skip inside 8^3 octants
     vec3 solidRgb;
-    uint useVis;
+    uint useVis;  // bit0 vis-buffer, bit1 bond Φ heatmap on hit voxels
 } ubo;
 
 #define RENDER_MODE (kShadedOnly != 0u ? 0u : ubo.renderMode)
@@ -104,6 +104,9 @@ layout(set = 0, binding = 7, std430) readonly buffer OccupancyMip {
 
 layout(set = 0, binding = 8, r32f) uniform image2D beamDepth;
 layout(set = 0, binding = 9, r32f) readonly uniform image2D visImage;
+layout(set = 0, binding = 10, std430) readonly buffer BondHeatmap {
+    float bondPhi[];
+};
 
 const uint VIS_MISS = 0xFFFFFFFFu;
 
@@ -407,6 +410,23 @@ vec3 albedoForVoxel(GpuVoxelObject o, uint matId, uint page, ivec3 micro, ivec3 
         }
     }
     return vec3(0.62, 0.64, 0.68);
+}
+
+vec3 applyBondHeatmap(GpuVoxelObject o, ivec3 mapPos, vec3 albedo) {
+    if ((ubo.useVis & 2u) == 0u) {
+        return albedo;
+    }
+    uint n = o.gridSize.x;
+    uint idx = o.voxelOffset + uint(mapPos.x) + uint(mapPos.y) * n + uint(mapPos.z) * n * n;
+    float phi = bondPhi[idx];
+    if (!(phi >= 0.0)) {
+        return albedo;
+    }
+    float t = clamp(phi, 0.0, 1.0);
+    vec3 g = vec3(0.18, 0.78, 0.22);
+    vec3 y = vec3(0.95, 0.80, 0.12);
+    vec3 r = vec3(0.90, 0.10, 0.08);
+    return t < 0.5 ? mix(g, y, t * 2.0) : mix(y, r, (t - 0.5) * 2.0);
 }
 
 vec3 stepsToColor(uint steps) {
@@ -815,15 +835,18 @@ ObjectHit traverseObject(GpuVoxelObject o, vec3 Ow, vec3 Dw, float tWorldMin, fl
     if (kEnableShade == 0u ||
         ((SOLID_COLOR != 0u || TRACE_STAGE >= STAGE_NO_SHADE) &&
          (RENDER_MODE == MODE_SHADED || RENDER_MODE == MODE_ALBEDO))) {
-        result.color = SOLID_COLOR != 0u ? ubo.solidRgb
-                                            : albedoForVoxel(o, matId, hitPage, microPos, finePos,
-                                                             usedMicro, usedFine);
+        vec3 albedo = SOLID_COLOR != 0u ? ubo.solidRgb
+                                        : albedoForVoxel(o, matId, hitPage, microPos, finePos,
+                                                         usedMicro, usedFine);
+        result.color = applyBondHeatmap(o, mapPos, albedo);
         return result;
     }
 
     vec3 normalLocal = -vec3(mask) * sgn;
     vec3 normalWorld = normalize(mat3(o.objectToWorld) * normalLocal);
-    vec3 albedo = albedoForVoxel(o, matId, hitPage, microPos, finePos, usedMicro, usedFine);
+    vec3 albedo = applyBondHeatmap(o, mapPos,
+                                   albedoForVoxel(o, matId, hitPage, microPos, finePos, usedMicro,
+                                                  usedFine));
 
     ivec3 solidPos = usedFine ? (mapPos * 16 + microPos * 2 + finePos)
                               : (usedMicro ? (mapPos * 8 + microPos) : mapPos);
@@ -906,30 +929,35 @@ void main() {
     uint bestSteps = 0u;
     bool anyHit = false;
 
-    if (ubo.useVis != 0u) {
+    if ((ubo.useVis & 1u) != 0u) {
         float visPacked = imageLoad(visImage, pixel).r;
         uint visId = visPacked >= 0.5 ? uint(visPacked + 0.5) - 1u : VIS_MISS;
+        // Conservative coarse cubes can sit in front of a nearer object (house
+        // vis wins, DDA then hits the house behind the spinner). Always allow
+        // closer hits; vis miss must not skip the object loop.
+        // After a cut, beam t0 can sit past leftover occupancy in the vis cube
+        // (sparse 4^3 AND). Vis already proved a coarse on this pixel: walk
+        // that object from the camera so ground behind a hole still hits.
         if (visId != VIS_MISS && visId < ubo.objectCount) {
-            ObjectHit h = traverseObject(objects[visId], ubo.cameraPos, dir, t0, t1);
+            ObjectHit h = traverseObject(objects[visId], ubo.cameraPos, dir, 0.0, t1);
             bestSteps = h.steps;
             if (h.hit) {
                 bestT = h.tWorld;
                 color = h.color;
                 anyHit = true;
-            } else {
-                // Occupancy AABB can cover holes after a cut. Keep searching.
-                for (uint i = 0u; i < ubo.objectCount; ++i) {
-                    if (i == visId) {
-                        continue;
-                    }
-                    ObjectHit h2 = traverseObject(objects[i], ubo.cameraPos, dir, t0, t1);
-                    bestSteps = max(bestSteps, h2.steps);
-                    if (h2.hit && h2.tWorld < bestT) {
-                        bestT = h2.tWorld;
-                        color = h2.color;
-                        anyHit = true;
-                    }
-                }
+            }
+        }
+        float loopT0 = anyHit ? t0 : 0.0;
+        for (uint i = 0u; i < ubo.objectCount; ++i) {
+            if (i == visId) {
+                continue;
+            }
+            ObjectHit h2 = traverseObject(objects[i], ubo.cameraPos, dir, loopT0, bestT);
+            bestSteps = max(bestSteps, h2.steps);
+            if (h2.hit && h2.tWorld < bestT) {
+                bestT = h2.tWorld;
+                color = h2.color;
+                anyHit = true;
             }
         }
     } else {

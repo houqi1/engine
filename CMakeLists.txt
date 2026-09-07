@@ -77,6 +77,9 @@ set(VE_VOXEL_SOURCES
   src/physics/Solver.cpp
   src/physics/PhysicsWorld.cpp
   src/physics/Fracture.cpp
+  src/physics/Structure.cpp
+  src/physics/ConstraintGraph.cpp
+  src/physics/Island.cpp
 )
 
 function(ve_configure_target target_name)

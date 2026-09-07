@@ -95,6 +95,44 @@ void drawCornerNormals(VoxelScene& scene, const glm::mat4& viewProj, ImVec2 disp
   }
 }
 
+void drawBondStress(VoxelScene& scene, const glm::mat4& viewProj, ImVec2 display) {
+  ImDrawList* dl = ImGui::GetForegroundDrawList();
+  auto project = [&](const glm::vec3& world, ImVec2& out) -> bool {
+    const glm::vec4 clip = viewProj * glm::vec4(world, 1.0f);
+    if (clip.w <= 1.0e-4f) {
+      return false;
+    }
+    const float iw = 1.0f / clip.w;
+    const float nx = clip.x * iw;
+    const float ny = clip.y * iw;
+    if (nx < -1.2f || nx > 1.2f || ny < -1.2f || ny > 1.2f) {
+      return false;
+    }
+    out.x = (nx * 0.5f + 0.5f) * display.x;
+    out.y = (ny * 0.5f + 0.5f) * display.y;
+    return true;
+  };
+  int drawn = 0;
+  for (const physics::DebugBond& b : scene.structureDebugBonds()) {
+    if (drawn >= 8000) {
+      break;
+    }
+    ImVec2 a{};
+    ImVec2 p1{};
+    if (!project(b.a, a) || !project(b.b, p1)) {
+      continue;
+    }
+    const float t = std::clamp(b.phi, 0.0f, 1.0f);
+    const int r = static_cast<int>(40.0f + 215.0f * t);
+    const int g = static_cast<int>(220.0f * (1.0f - t));
+    const int alpha = b.alive ? (b.phi >= 0.35f ? 230 : 160) : 100;
+    const ImU32 col = b.alive ? IM_COL32(r, g, 40, alpha) : IM_COL32(80, 80, 80, 100);
+    const float thickness = !b.alive ? 1.0f : (b.phi >= 1.0f ? 4.0f : (b.phi >= 0.5f ? 2.5f : 1.5f));
+    dl->AddLine(a, p1, col, thickness);
+    ++drawn;
+  }
+}
+
 void printPipelineExecutableStatistics(VkDevice device, VkPipeline pipeline) {
   const auto getProperties = reinterpret_cast<PFN_vkGetPipelineExecutablePropertiesKHR>(
       vkGetDeviceProcAddr(device, "vkGetPipelineExecutablePropertiesKHR"));
@@ -479,13 +517,14 @@ void VoxelRenderer::resize() {
   boundCoarsePoolBuffer_ = VK_NULL_HANDLE;
   boundPaletteBuffer_ = VK_NULL_HANDLE;
   boundOccMipBuffer_ = VK_NULL_HANDLE;
+  boundHeatmapBuffer_ = VK_NULL_HANDLE;
   boundSkyView_ = VK_NULL_HANDLE;
   boundBeamView_ = VK_NULL_HANDLE;
   boundVisViews_.fill(VK_NULL_HANDLE);
 }
 
 void VoxelRenderer::createDescriptors() {
-  VkDescriptorSetLayoutBinding bindings[10]{};
+  VkDescriptorSetLayoutBinding bindings[11]{};
   bindings[0].binding = 0;
   bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
   bindings[0].descriptorCount = 1;
@@ -538,9 +577,14 @@ void VoxelRenderer::createDescriptors() {
   bindings[9].descriptorCount = 1;
   bindings[9].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
+  bindings[10].binding = 10;
+  bindings[10].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  bindings[10].descriptorCount = 1;
+  bindings[10].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
   VkDescriptorSetLayoutCreateInfo layoutInfo{};
   layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-  layoutInfo.bindingCount = 10;
+  layoutInfo.bindingCount = 11;
   layoutInfo.pBindings = bindings;
   if (vkCreateDescriptorSetLayout(gfx_.device(), &layoutInfo, nullptr, &frameLayout_) !=
       VK_SUCCESS) {
@@ -550,7 +594,7 @@ void VoxelRenderer::createDescriptors() {
   VkDescriptorPoolSize poolSizes[] = {
       {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, GfxDevice::kFramesInFlight},
       {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-       GfxDevice::kFramesInFlight * (4u + VoxelScene::kMaxBrickSlabs)},
+       GfxDevice::kFramesInFlight * (5u + VoxelScene::kMaxBrickSlabs)},
       {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, GfxDevice::kFramesInFlight * 3u},
       {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, GfxDevice::kFramesInFlight},
   };
@@ -848,7 +892,8 @@ void VoxelRenderer::updateDescriptors(VoxelScene& scene) {
       scene.objectBuffer().buffer == VK_NULL_HANDLE ||
       scene.coarsePoolBuffer().buffer == VK_NULL_HANDLE ||
       scene.paletteBuffer().buffer == VK_NULL_HANDLE ||
-      scene.occMipBuffer().buffer == VK_NULL_HANDLE || !scene.hasSky() ||
+      scene.occMipBuffer().buffer == VK_NULL_HANDLE ||
+      scene.heatmapBuffer().buffer == VK_NULL_HANDLE || !scene.hasSky() ||
       dummyBeamImage_.view == VK_NULL_HANDLE || dummyVisImage_.view == VK_NULL_HANDLE) {
     return;
   }
@@ -896,6 +941,10 @@ void VoxelRenderer::updateDescriptors(VoxelScene& scene) {
     occMipInfo.buffer = scene.occMipBuffer().buffer;
     occMipInfo.range = scene.occMipBuffer().size;
 
+    VkDescriptorBufferInfo heatmapInfo{};
+    heatmapInfo.buffer = scene.heatmapBuffer().buffer;
+    heatmapInfo.range = scene.heatmapBuffer().size;
+
     VkDescriptorImageInfo beamInfo{};
     beamInfo.imageView =
         beamImage_.view != VK_NULL_HANDLE ? beamImage_.view : dummyBeamImage_.view;
@@ -907,7 +956,7 @@ void VoxelRenderer::updateDescriptors(VoxelScene& scene) {
         visImages_[fi].view != VK_NULL_HANDLE ? visImages_[fi].view : dummyVisImage_.view;
     visInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
-    VkWriteDescriptorSet writes[10]{};
+    VkWriteDescriptorSet writes[11]{};
     writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[0].dstSet = frame.frameSet;
     writes[0].dstBinding = 0;
@@ -978,7 +1027,14 @@ void VoxelRenderer::updateDescriptors(VoxelScene& scene) {
     writes[9].descriptorCount = 1;
     writes[9].pImageInfo = &visInfo;
 
-    vkUpdateDescriptorSets(gfx_.device(), 10, writes, 0, nullptr);
+    writes[10].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[10].dstSet = frame.frameSet;
+    writes[10].dstBinding = 10;
+    writes[10].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[10].descriptorCount = 1;
+    writes[10].pBufferInfo = &heatmapInfo;
+
+    vkUpdateDescriptorSets(gfx_.device(), 11, writes, 0, nullptr);
   }
 
   boundBrickSlabCount_ = scene.brickSlabCount();
@@ -990,6 +1046,7 @@ void VoxelRenderer::updateDescriptors(VoxelScene& scene) {
   boundCoarsePoolBuffer_ = scene.coarsePoolBuffer().buffer;
   boundPaletteBuffer_ = scene.paletteBuffer().buffer;
   boundOccMipBuffer_ = scene.occMipBuffer().buffer;
+  boundHeatmapBuffer_ = scene.heatmapBuffer().buffer;
   boundSkyView_ = scene.sky().image.view;
   boundBeamView_ = beamImage_.view != VK_NULL_HANDLE ? beamImage_.view : dummyBeamImage_.view;
   for (uint32_t i = 0; i < GfxDevice::kFramesInFlight; ++i) {
@@ -1028,7 +1085,7 @@ void VoxelRenderer::updateFrameUBO(VoxelScene& scene, uint32_t frameIndex) {
   ubo.beamMargin = std::max(0.0f, beamMargin_);
   ubo.dirMaskBrick = dirMaskBrick_ ? 1u : 0u;
   writeVec3(ubo.solidRgb, scene.solidColor());
-  ubo.useVis = visSelect_ ? 1u : 0u;
+  ubo.useVis = (visSelect_ ? 1u : 0u) | (showBondStress_ ? 2u : 0u);
 
   void* mapped = frames_[frameIndex].frameUBO.info.pMappedData;
   if (!mapped) {
@@ -1084,7 +1141,11 @@ bool VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
   if (outImage_.image == VK_NULL_HANDLE) {
     createOutputImage();
   }
+  scene.flushOccupancyGpu(gfx_);
   scene.uploadObjectTransforms(gfx_);
+  if (showBondStress_) {
+    scene.uploadBondHeatmap(gfx_);
+  }
   bool brickSlabsChanged = scene.brickSlabCount() != boundBrickSlabCount_;
   for (uint32_t i = 0; i < scene.brickSlabCount() && !brickSlabsChanged; ++i) {
     brickSlabsChanged = scene.brickSlabBuffer(i).buffer != boundBrickSlabs_[i];
@@ -1093,6 +1154,7 @@ bool VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
       scene.coarsePoolBuffer().buffer != boundCoarsePoolBuffer_ ||
       scene.paletteBuffer().buffer != boundPaletteBuffer_ ||
       scene.occMipBuffer().buffer != boundOccMipBuffer_ ||
+      scene.heatmapBuffer().buffer != boundHeatmapBuffer_ ||
       scene.sky().image.view != boundSkyView_ || outImage_.view == VK_NULL_HANDLE ||
       (beamImage_.view != VK_NULL_HANDLE ? beamImage_.view : dummyBeamImage_.view) !=
           boundBeamView_ ||
@@ -1356,9 +1418,11 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
   ImGui_ImplGlfw_NewFrame();
   ImGui::NewFrame();
 
-  if (scene.simulate() && scene.cpuObjectCount() >= 2) {
+  {
     const glm::mat4 viewProj = scene.camera().proj() * scene.camera().view();
-    drawCornerNormals(scene, viewProj, ImGui::GetIO().DisplaySize);
+    if (scene.simulate() && scene.cpuObjectCount() >= 2) {
+      drawCornerNormals(scene, viewProj, ImGui::GetIO().DisplaySize);
+    }
   }
 
   ImGuiWindowFlags flags = 0;
@@ -1447,6 +1511,14 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
   ImGui::Text("Occupied 8^3 micros: %u   2^3 fines: %u", scene.occupiedMicroCount(),
               scene.occupiedFineCount());
   ImGui::Separator();
+  ImGui::Checkbox("Bond stress heatmap", &showBondStress_);
+  ImGui::TextDisabled("Off by default. Colors the voxels: green = low Φ, red = Φ≥1.");
+  {
+    const physics::DebugSolve dsHeat = scene.physicsDebug();
+    const int nBonds = static_cast<int>(scene.structureDebugBonds().size());
+    ImGui::Text("Heatmap bonds=%d  alive=%d  maxPhi=%.2f", nBonds, dsHeat.bondsAlive, dsHeat.maxPhi);
+  }
+  ImGui::Separator();
   ImGui::TextWrapped("LMB: remove hit object  |  F: place on hit face  |  RMB drag: look");
   ImGui::SliderInt("Brush Material", &scene.brushMaterial(), 1, 2);
   ImGui::Checkbox("Nested 8^3 (micro bricks)", &scene.nestedMicroVoxels());
@@ -1478,6 +1550,8 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
       const physics::DebugSolve ds = scene.physicsDebug();
       ImGui::Text("Solve contacts=%d  maxD=%.3f  minNy=%.2f", ds.contacts, ds.maxD, ds.minNy);
       ImGui::Text("Box v=(%.2f,%.2f,%.2f) |w|=%.2f", ds.v.x, ds.v.y, ds.v.z, glm::length(ds.w));
+      ImGui::Text("Bonds alive=%d  broken=%d  maxPhi=%.2f", ds.bondsAlive, ds.bondsBrokenThisStep,
+                  ds.maxPhi);
     }
   }
   ImGui::Checkbox("Show Rotating Object", &scene.spinnerEnabled());

@@ -165,6 +165,7 @@ private:
   VkBuffer boundCoarsePoolBuffer_ = VK_NULL_HANDLE;
   VkBuffer boundPaletteBuffer_ = VK_NULL_HANDLE;
   VkBuffer boundOccMipBuffer_ = VK_NULL_HANDLE;
+  VkBuffer boundHeatmapBuffer_ = VK_NULL_HANDLE;
   VkImageView boundSkyView_ = VK_NULL_HANDLE;
   VkImageView boundBeamView_ = VK_NULL_HANDLE;
   std::array<VkImageView, GfxDevice::kFramesInFlight> boundVisViews_{};
@@ -176,6 +177,7 @@ private:
   bool simulateRequested_ = false;
   bool simulateValue_ = false;
   int debrisPending_ = -1;
+  bool showBondStress_ = false;
   float displayFps_ = 0.0f;
   int traceStage_ = 0;
   bool brickBitSkip_ = true;

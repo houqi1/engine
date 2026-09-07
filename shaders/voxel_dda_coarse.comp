@@ -324,7 +324,7 @@ void main() {
     vec3 hitN = vec3(0.0);
     vec3 hitAlbedo = vec3(0.0);
 
-    if (ubo.useVis != 0u) {
+    if ((ubo.useVis & 1u) != 0u) {
         float visPacked = imageLoad(visImage, pixel).r;
         uint visId = visPacked >= 0.5 ? uint(visPacked + 0.5) - 1u : VIS_MISS;
         if (visId != VIS_MISS && visId < ubo.objectCount) {
@@ -335,20 +335,19 @@ void main() {
                 hitAlbedo = h.color;
                 hitN = h.normal;
                 anyHit = true;
-            } else {
-                for (uint i = 0u; i < ubo.objectCount; ++i) {
-                    if (i == visId) {
-                        continue;
-                    }
-                    Hit h2 = traceCoarse(objects[i], ubo.cameraPos, dir, FLT_MAX);
-                    bestSteps = max(bestSteps, h2.steps);
-                    if (h2.hit && h2.tWorld < bestT) {
-                        bestT = h2.tWorld;
-                        hitAlbedo = h2.color;
-                        hitN = h2.normal;
-                        anyHit = true;
-                    }
-                }
+            }
+        }
+        for (uint i = 0u; i < ubo.objectCount; ++i) {
+            if (i == visId) {
+                continue;
+            }
+            Hit h2 = traceCoarse(objects[i], ubo.cameraPos, dir, bestT);
+            bestSteps = max(bestSteps, h2.steps);
+            if (h2.hit && h2.tWorld < bestT) {
+                bestT = h2.tWorld;
+                hitAlbedo = h2.color;
+                hitN = h2.normal;
+                anyHit = true;
             }
         }
     } else {

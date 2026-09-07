@@ -8,7 +8,6 @@ float conservativeBeamT(ivec2 beamPixel, ivec2 fullSize) {
     const float roundoff = 8.0e-6;
     const uint maxIntervals = 64u;
     const uint maxTileReads = 128u;
-    const uint maxNarrowReads = 128u;
     const int maxIntervalTiles = 32;
 
     if (any(lessThanEqual(fullSize, ivec2(0))) || any(lessThan(beamPixel, ivec2(0)))) {
@@ -46,8 +45,6 @@ float conservativeBeamT(ivec2 beamPixel, ivec2 fullSize) {
         return 0.0;
     }
     float safeDepth = maxWorldT / minimumNorm;
-    // Shared by all objects: one unit per coarse texel or brick occupancy word.
-    uint narrowReadsLeft = maxNarrowReads;
 
     for (uint objectIndex = 0u; objectIndex < ubo.objectCount; ++objectIndex) {
         GpuVoxelObject o = objects[objectIndex];
@@ -119,9 +116,7 @@ float conservativeBeamT(ivec2 beamPixel, ivec2 fullSize) {
         float stepDepth = 4.0 / maxSpeed;
         float a = enter;
         uint readsLeft = maxTileReads;
-        // The beam specializes kEnableNested to zero; use the rendered object flags.
-        bool allowMicro = (o.flags & FLAG_NESTED) != 0u && ubo.traceStage < STAGE_COARSE;
-        uint refinementsLeft = allowMicro ? 5u : 2u;
+        uint refinementsLeft = 2u;
         for (uint interval = 0u; interval < maxIntervals && a < exit; ++interval) {
             float b = min(exit, a + stepDepth);
             if (!(b > a)) {
@@ -152,88 +147,25 @@ float conservativeBeamT(ivec2 beamPixel, ivec2 fullSize) {
             }
             readsLeft -= uint(tileCount);
             bool blocked = false;
-            bool narrowExhausted = false;
             ivec3 tile = tileMin;
             for (int j = 0; j < maxIntervalTiles && j < tileCount; ++j) {
                 ivec3 tileOrigin = tile << 2;
                 uvec2 occ = loadCoarseOcc4(o, tileOrigin);
                 if ((occ.x | occ.y) != 0u) {
+                    // Any occupied coarse in the swept 4^3 box blocks. dirReach AND plus
+                    // nested brick tests skipped leftover occupancy after a cut, so the
+                    // empty-prefix t0 jumped past the remaining hut/ground and DDA stored sky.
                     ivec3 lo = max(cellMin - tileOrigin, ivec3(0));
                     ivec3 hi = min(cellMax - tileOrigin, ivec3(3));
-                    uvec2 overlap = occ & dirReach4(0u, lo) & dirReach4(7u, hi);
-                    if (!allowMicro && (overlap.x | overlap.y) != 0u) {
-                        blocked = true;
-                        break;
-                    }
-                    // Only occupied coarse cells intersecting this swept box need a texel fetch.
-                    for (int c = 0; c < 64 && (overlap.x | overlap.y) != 0u; ++c) {
-                        if (narrowReadsLeft == 0u) {
-                            blocked = true;
-                            narrowExhausted = true;
-                            break;
-                        }
-                        uint bit;
-                        if (overlap.x != 0u) {
-                            bit = uint(findLSB(overlap.x));
-                            overlap.x &= overlap.x - 1u;
-                        } else {
-                            bit = 32u + uint(findLSB(overlap.y));
-                            overlap.y &= overlap.y - 1u;
-                        }
-                        ivec3 coarse = tileOrigin + ivec3(
-                            int((bit & 1u) | ((bit >> 2u) & 2u)),
-                            int(((bit >> 1u) & 1u) | ((bit >> 3u) & 2u)),
-                            int(((bit >> 2u) & 1u) | ((bit >> 4u) & 2u)));
-                        narrowReadsLeft -= 1u;
-                        CoarseCell cell = readCell(o, coarse);
-                        if (cell.material == 0u) {
-                            continue;
-                        }
-                        if (cell.brickPage == INVALID_BRICK_PAGE) {
-                            blocked = true;
-                            break;
-                        }
-                        // boxMin/Max already enclose the whole beam. A small local pad
-                        // also keeps both sides of exact micro planes after conversion.
-                        ivec3 microMin = ivec3(clamp(floor((boxMin - vec3(coarse)) * 8.0 - 1.0e-4),
-                                                       vec3(0.0), vec3(7.0)));
-                        ivec3 microMax = ivec3(clamp(floor((boxMax - vec3(coarse)) * 8.0 + 1.0e-4),
-                                                       vec3(0.0), vec3(7.0)));
-                        ivec3 octMin = microMin >> 2;
-                        ivec3 octMax = microMax >> 2;
-                        ivec3 octSpan = octMax - octMin + 1;
-                        int octCount = octSpan.x * octSpan.y * octSpan.z;
-                        ivec3 octPos = octMin;
-                        for (int k = 0; k < 8 && k < octCount; ++k) {
-                            if (narrowReadsLeft < 2u) {
-                                blocked = true;
-                                narrowExhausted = true;
-                                break;
-                            }
-                            narrowReadsLeft -= 2u;
-                            ivec3 octOrigin = octPos << 2;
-                            uvec2 microOcc = loadBrickOcc4(cell.brickPage, octOrigin);
-                            if ((microOcc.x | microOcc.y) != 0u) {
-                                ivec3 microLo = max(microMin - octOrigin, ivec3(0));
-                                ivec3 microHi = min(microMax - octOrigin, ivec3(3));
-                                uvec2 microOverlap = microOcc & dirReach4(0u, microLo) & dirReach4(7u, microHi);
-                                if ((microOverlap.x | microOverlap.y) != 0u) {
+                    for (int z = lo.z; z <= hi.z && !blocked; ++z) {
+                        for (int y = lo.y; y <= hi.y && !blocked; ++y) {
+                            for (int x = lo.x; x <= hi.x && !blocked; ++x) {
+                                uint bit = morton3Brick(ivec3(x, y, z));
+                                uint word = bit < 32u ? occ.x : occ.y;
+                                if ((word & (1u << (bit & 31u))) != 0u) {
                                     blocked = true;
-                                    break;
                                 }
                             }
-                            octPos.x += 1;
-                            if (octPos.x > octMax.x) {
-                                octPos.x = octMin.x;
-                                octPos.y += 1;
-                                if (octPos.y > octMax.y) {
-                                    octPos.y = octMin.y;
-                                    octPos.z += 1;
-                                }
-                            }
-                        }
-                        if (blocked) {
-                            break;
                         }
                     }
                     if (blocked) {
@@ -251,7 +183,7 @@ float conservativeBeamT(ivec2 beamPixel, ivec2 fullSize) {
                 }
             }
             if (blocked) {
-                if (narrowExhausted || refinementsLeft == 0u) {
+                if (refinementsLeft == 0u) {
                     break;
                 }
                 stepDepth *= 0.5;

@@ -11,8 +11,9 @@ Related shipped code:
 - `src/render/VoxelRenderer.cpp` — OBB vis-buffer + compute DDA
 - `docs/nested-brick-voxels.md` — 空 brick 不租页（已上）
 - `docs/object-order-ess.md` — occupancy hull（已上，多物体可见性要接到这里）
+- `docs/voxel-structure.md` — 结构坍塌（coarse 键 + \(N,V,M\) + Box3D TGS；方案，未实现）
 
-不覆盖：结构塌方（2026 原型，不是「能掉」的前提）、Teardown 的 OBB 片元光栅、硬件 RT、火/烟/水。
+不覆盖：Teardown 的 OBB 片元光栅、硬件 RT、火/烟/水。结构塌方见 `docs/voxel-structure.md`，不是「能掉」的前提。
 
 ---
 
@@ -145,7 +146,7 @@ hSub = h / nSub
 
 并行（后做，结构先留好）：接触生成按 pair 可并行；求解按接触图分岛。小岛并行，一大堆粘着的渣先单线程。不要第一版就上图着色。
 
-楼没锯断就还站着。不要做结构力学。
+连通断裂：楼没锯断就还站着。自重把键拉断见 `docs/voxel-structure.md`。
 
 ---
 

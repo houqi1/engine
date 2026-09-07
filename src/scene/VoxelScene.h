@@ -136,6 +136,9 @@ public:
   bool& importSampleColor() { return importSampleColor_; }
   const AllocatedBuffer& paletteBuffer() const { return paletteBuffer_; }
   const AllocatedBuffer& occMipBuffer() const { return occMipBuffer_; }
+  const AllocatedBuffer& heatmapBuffer() const { return heatmapBuffer_; }
+  void uploadBondHeatmap(GfxDevice& gfx);
+  uint32_t poolCellIndex(int objectIndex, const glm::ivec3& coarse) const;
   uint32_t occMipBytes() const {
     return static_cast<uint32_t>(occMipCpu_.size() * sizeof(uint32_t));
   }
@@ -206,7 +209,15 @@ public:
   uint32_t coarseBrickPage(int objectIndex, const glm::ivec3& coarse) const;
   void collectOccupiedFines(int objectIndex, const glm::ivec3& coarse,
                             std::vector<glm::ivec3>& out) const;
+  uint32_t occupiedFineCount(int objectIndex, const glm::ivec3& coarse) const;
   void notifyOccupancyChanged(int objectIndex);
+  bool fractureFromCuts(int objectIndex, const std::vector<glm::ivec3>& deletedAbsFines);
+  int cutCoarseInterface(int objectIndex, const glm::ivec3& coarseA, const glm::ivec3& coarseB,
+                         std::vector<glm::ivec3>* deletedOut);
+  void peelCoarseIslands(int objectIndex, const std::vector<glm::ivec3>& coarses);
+  void noteOccupancyGpuDirty();
+  void flushOccupancyGpu(GfxDevice& gfx);
+  const std::vector<physics::DebugBond>& structureDebugBonds() const;
   uint32_t physicsCornerCount(int objectIndex) const;
   uint32_t physicsEdgeCount(int objectIndex) const;
   physics::DebugSolve physicsDebug() const { return physics_.debugSolve(); }
@@ -305,6 +316,8 @@ private:
   std::vector<CoarseCell> coarsePoolCpu_{};
   AllocatedBuffer paletteBuffer_{};
   AllocatedBuffer occMipBuffer_{};
+  AllocatedBuffer heatmapBuffer_{};
+  std::vector<float> heatmapCpu_;
   MeshVoxelizerGpu voxelizeGpu_{};
   std::array<glm::vec4, 256> importPalette_{};
   std::string importPath_;
@@ -359,5 +372,6 @@ private:
 
   bool prevLmb_ = false;
   bool prevF_ = false;
+  bool occupancyGpuDirty_ = false;
   std::optional<VoxelHit> lastHit_;
 };

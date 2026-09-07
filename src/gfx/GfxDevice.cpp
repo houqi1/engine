@@ -640,6 +640,84 @@ void GfxDevice::uploadToBuffer(AllocatedBuffer& dst, const void* data, VkDeviceS
   destroyBuffer(staging);
 }
 
+void GfxDevice::uploadToBuffer(AllocatedBuffer& dst, const BufferRegionUpload* regions,
+                               uint32_t count) {
+  if (regions == nullptr || count == 0) {
+    return;
+  }
+  if (count == 1) {
+    uploadToBuffer(dst, regions[0].data, regions[0].size, regions[0].dstOffset);
+    return;
+  }
+
+  VkDeviceSize total = 0;
+  for (uint32_t i = 0; i < count; ++i) {
+    if (regions[i].data == nullptr || regions[i].size == 0) {
+      continue;
+    }
+    if (regions[i].dstOffset + regions[i].size > dst.size) {
+      fail("uploadToBuffer: region write exceeds destination buffer size");
+    }
+    total += regions[i].size;
+  }
+  if (total == 0) {
+    return;
+  }
+
+  AllocatedBuffer staging =
+      createBuffer(total, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
+  std::vector<VkBufferCopy> copies;
+  copies.reserve(count);
+  VkDeviceSize stagingOff = 0;
+  uint8_t* mapped = static_cast<uint8_t*>(staging.info.pMappedData);
+  for (uint32_t i = 0; i < count; ++i) {
+    if (regions[i].data == nullptr || regions[i].size == 0) {
+      continue;
+    }
+    std::memcpy(mapped + stagingOff, regions[i].data, static_cast<size_t>(regions[i].size));
+    VkBufferCopy copy{};
+    copy.srcOffset = stagingOff;
+    copy.dstOffset = regions[i].dstOffset;
+    copy.size = regions[i].size;
+    copies.push_back(copy);
+    stagingOff += regions[i].size;
+  }
+  if (vmaFlushAllocation(allocator_, staging.allocation, 0, total) != VK_SUCCESS) {
+    destroyBuffer(staging);
+    fail("Failed to flush buffer upload staging memory");
+  }
+
+  immediateSubmit([&](VkCommandBuffer cmd) {
+    VkBufferMemoryBarrier2 barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
+    barrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    barrier.srcAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+    barrier.dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    barrier.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.buffer = dst.buffer;
+    barrier.offset = 0;
+    barrier.size = VK_WHOLE_SIZE;
+    VkDependencyInfo dependency{};
+    dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dependency.bufferMemoryBarrierCount = 1;
+    dependency.pBufferMemoryBarriers = &barrier;
+    vkCmdPipelineBarrier2(cmd, &dependency);
+
+    vkCmdCopyBuffer(cmd, staging.buffer, dst.buffer, static_cast<uint32_t>(copies.size()),
+                    copies.data());
+
+    barrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    barrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    barrier.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+    vkCmdPipelineBarrier2(cmd, &dependency);
+  });
+
+  destroyBuffer(staging);
+}
+
 uint32_t GfxDevice::calcMipLevels(uint32_t width, uint32_t height) {
   uint32_t levels = 1;
   uint32_t w = width;

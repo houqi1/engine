@@ -29,6 +29,10 @@ constexpr float kSleepAng = 0.2f;
 constexpr float kSleepTime = 0.5f;
 
 constexpr float kDensityWood = 600.0f;
+constexpr float kDensityStone = 2200.0f;
+
+constexpr int kBondIters = 2;
+constexpr int kMaxBrokenBondsPerSubstep = 32;
 
 enum class FineClass : uint8_t { Empty = 0, Inside, Face, Edge, Corner };
 
@@ -64,6 +68,9 @@ struct DebugSolve {
   float maxD = 0.0f;
   float minNy = 1.0f;
   std::vector<Contact> lastContacts;
+  int bondsAlive = 0;
+  int bondsBrokenThisStep = 0;
+  float maxPhi = 0.0f;
 };
 
 inline uint32_t packFine(int x, int y, int z, int n) {

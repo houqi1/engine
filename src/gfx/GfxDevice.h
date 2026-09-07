@@ -44,6 +44,13 @@ public:
   void uploadToBuffer(AllocatedBuffer& dst, const void* data, VkDeviceSize size);
   void uploadToBuffer(AllocatedBuffer& dst, const void* data, VkDeviceSize size,
                       VkDeviceSize dstOffset);
+  struct BufferRegionUpload {
+    const void* data = nullptr;
+    VkDeviceSize size = 0;
+    VkDeviceSize dstOffset = 0;
+  };
+  // One submit for many non-overlapping regions of the same destination buffer.
+  void uploadToBuffer(AllocatedBuffer& dst, const BufferRegionUpload* regions, uint32_t count);
 
   AllocatedImage createImage(VkExtent3D extent, VkFormat format, VkImageUsageFlags usage,
                              VkImageAspectFlags aspect, bool dedicated = false,

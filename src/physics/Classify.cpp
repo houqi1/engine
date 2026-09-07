@@ -79,6 +79,31 @@ bool uniformSolidCoarse(VoxelScene& scene, int objectIndex, const glm::ivec3& c)
          scene.coarseBrickPage(objectIndex, c) == VoxelScene::kInvalidBrickPage;
 }
 
+glm::ivec3 unpackOccupiedCoarse(uint32_t packed) {
+  return glm::ivec3(static_cast<int>(packed & 1023u), static_cast<int>((packed >> 10) & 1023u),
+                    static_cast<int>((packed >> 20) & 1023u));
+}
+
+template <typename Fn>
+void forEachOccupiedCoarse(VoxelScene& scene, int objectIndex, const VoxelObject& o, Fn&& fn) {
+  if (!o.occupiedCoarses.empty()) {
+    for (uint32_t packed : o.occupiedCoarses) {
+      fn(unpackOccupiedCoarse(packed));
+    }
+    return;
+  }
+  for (int z = 0; z < o.gridSize; ++z) {
+    for (int y = 0; y < o.gridSize; ++y) {
+      for (int x = 0; x < o.gridSize; ++x) {
+        const glm::ivec3 c(x, y, z);
+        if (scene.occupancyMaterial(objectIndex, c) != 0u) {
+          fn(c);
+        }
+      }
+    }
+  }
+}
+
 }  // namespace
 
 void rebuildShapeClass(VoxelScene& scene, int objectIndex, ShapeClass& out) {
@@ -97,22 +122,14 @@ void rebuildShapeClass(VoxelScene& scene, int objectIndex, ShapeClass& out) {
   glm::ivec3 mx(-1);
   bool anyBrick = false;
   int occupiedCoarse = 0;
-  for (int z = 0; z < o.gridSize; ++z) {
-    for (int y = 0; y < o.gridSize; ++y) {
-      for (int x = 0; x < o.gridSize; ++x) {
-        const glm::ivec3 c(x, y, z);
-        if (scene.occupancyMaterial(objectIndex, c) == 0u) {
-          continue;
-        }
-        ++occupiedCoarse;
-        mn = glm::min(mn, c);
-        mx = glm::max(mx, c);
-        if (scene.coarseBrickPage(objectIndex, c) != VoxelScene::kInvalidBrickPage) {
-          anyBrick = true;
-        }
-      }
+  forEachOccupiedCoarse(scene, objectIndex, o, [&](const glm::ivec3& c) {
+    ++occupiedCoarse;
+    mn = glm::min(mn, c);
+    mx = glm::max(mx, c);
+    if (scene.coarseBrickPage(objectIndex, c) != VoxelScene::kInvalidBrickPage) {
+      anyBrick = true;
     }
-  }
+  });
   if (occupiedCoarse == 0) {
     out.occValid = false;
     out.dirty = false;
@@ -154,25 +171,17 @@ void rebuildShapeClass(VoxelScene& scene, int objectIndex, ShapeClass& out) {
 
   std::vector<glm::ivec3> fines;
   fines.reserve(64);
-  for (int z = 0; z < o.gridSize; ++z) {
-    for (int y = 0; y < o.gridSize; ++y) {
-      for (int x = 0; x < o.gridSize; ++x) {
-        const glm::ivec3 c(x, y, z);
-        if (scene.occupancyMaterial(objectIndex, c) == 0u) {
-          continue;
-        }
-        if (uniformSolidCoarse(scene, objectIndex, c)) {
-          const glm::ivec3 f0 = c * F;
-          emitAabbEdges(scene, objectIndex, n, f0, f0 + glm::ivec3(F - 1), out);
-          continue;
-        }
-        scene.collectOccupiedFines(objectIndex, c, fines);
-        for (const glm::ivec3& p : fines) {
-          classifyFine(scene, objectIndex, n, p, out);
-        }
-      }
+  forEachOccupiedCoarse(scene, objectIndex, o, [&](const glm::ivec3& c) {
+    if (uniformSolidCoarse(scene, objectIndex, c)) {
+      const glm::ivec3 f0 = c * F;
+      emitAabbEdges(scene, objectIndex, n, f0, f0 + glm::ivec3(F - 1), out);
+      return;
     }
-  }
+    scene.collectOccupiedFines(objectIndex, c, fines);
+    for (const glm::ivec3& p : fines) {
+      classifyFine(scene, objectIndex, n, p, out);
+    }
+  });
   uniqueIds(out.corners);
   uniqueIds(out.edges);
   out.dirty = false;
@@ -192,35 +201,27 @@ void computeMassProperties(VoxelScene& scene, int objectIndex, RigidBody& body) 
   std::vector<glm::ivec3> fines;
   fines.reserve(64);
 
-  for (int z = 0; z < o.gridSize; ++z) {
-    for (int y = 0; y < o.gridSize; ++y) {
-      for (int x = 0; x < o.gridSize; ++x) {
-        const glm::ivec3 c(x, y, z);
-        if (scene.occupancyMaterial(objectIndex, c) == 0u) {
-          continue;
-        }
-        if (scene.coarseBrickPage(objectIndex, c) == VoxelScene::kInvalidBrickPage) {
-          const double mC = miFine * static_cast<double>(F * F * F);
-          const glm::dvec3 p((static_cast<double>(x) + 0.5) * static_cast<double>(o.voxelSize),
-                             (static_cast<double>(y) + 0.5) * static_cast<double>(o.voxelSize),
-                             (static_cast<double>(z) + 0.5) * static_cast<double>(o.voxelSize));
-          mass += mC;
-          moment += mC * p;
-          count += static_cast<uint32_t>(F * F * F);
-        } else {
-          scene.collectOccupiedFines(objectIndex, c, fines);
-          for (const glm::ivec3& fp : fines) {
-            const glm::dvec3 p((static_cast<double>(fp.x) + 0.5) * static_cast<double>(s),
-                               (static_cast<double>(fp.y) + 0.5) * static_cast<double>(s),
-                               (static_cast<double>(fp.z) + 0.5) * static_cast<double>(s));
-            mass += miFine;
-            moment += miFine * p;
-            ++count;
-          }
-        }
+  forEachOccupiedCoarse(scene, objectIndex, o, [&](const glm::ivec3& c) {
+    if (scene.coarseBrickPage(objectIndex, c) == VoxelScene::kInvalidBrickPage) {
+      const double mC = miFine * static_cast<double>(F * F * F);
+      const glm::dvec3 p((static_cast<double>(c.x) + 0.5) * static_cast<double>(o.voxelSize),
+                         (static_cast<double>(c.y) + 0.5) * static_cast<double>(o.voxelSize),
+                         (static_cast<double>(c.z) + 0.5) * static_cast<double>(o.voxelSize));
+      mass += mC;
+      moment += mC * p;
+      count += static_cast<uint32_t>(F * F * F);
+    } else {
+      scene.collectOccupiedFines(objectIndex, c, fines);
+      for (const glm::ivec3& fp : fines) {
+        const glm::dvec3 p((static_cast<double>(fp.x) + 0.5) * static_cast<double>(s),
+                           (static_cast<double>(fp.y) + 0.5) * static_cast<double>(s),
+                           (static_cast<double>(fp.z) + 0.5) * static_cast<double>(s));
+        mass += miFine;
+        moment += miFine * p;
+        ++count;
       }
     }
-  }
+  });
 
   body.occupiedFine = count;
   if (mass <= 1e-8 || !body.dynamic) {
@@ -237,52 +238,44 @@ void computeMassProperties(VoxelScene& scene, int objectIndex, RigidBody& body) 
   const double a = static_cast<double>(o.voxelSize);
   const double a2 = a * a;
 
-  for (int z = 0; z < o.gridSize; ++z) {
-    for (int y = 0; y < o.gridSize; ++y) {
-      for (int x = 0; x < o.gridSize; ++x) {
-        const glm::ivec3 c(x, y, z);
-        if (scene.occupancyMaterial(objectIndex, c) == 0u) {
-          continue;
-        }
-        if (scene.coarseBrickPage(objectIndex, c) == VoxelScene::kInvalidBrickPage) {
-          const double mC = miFine * static_cast<double>(F * F * F);
-          const glm::dvec3 p((static_cast<double>(x) + 0.5) * static_cast<double>(o.voxelSize),
-                             (static_cast<double>(y) + 0.5) * static_cast<double>(o.voxelSize),
-                             (static_cast<double>(z) + 0.5) * static_cast<double>(o.voxelSize));
-          const glm::dvec3 r = p - com;
-          const double r2 = glm::dot(r, r);
-          const double ic = mC * a2 / 6.0;
-          I[0][0] += ic + mC * (r2 - r.x * r.x);
-          I[1][1] += ic + mC * (r2 - r.y * r.y);
-          I[2][2] += ic + mC * (r2 - r.z * r.z);
-          I[0][1] -= mC * r.x * r.y;
-          I[1][0] -= mC * r.x * r.y;
-          I[0][2] -= mC * r.x * r.z;
-          I[2][0] -= mC * r.x * r.z;
-          I[1][2] -= mC * r.y * r.z;
-          I[2][1] -= mC * r.y * r.z;
-        } else {
-          scene.collectOccupiedFines(objectIndex, c, fines);
-          for (const glm::ivec3& fp : fines) {
-            const glm::dvec3 p((static_cast<double>(fp.x) + 0.5) * static_cast<double>(s),
-                               (static_cast<double>(fp.y) + 0.5) * static_cast<double>(s),
-                               (static_cast<double>(fp.z) + 0.5) * static_cast<double>(s));
-            const glm::dvec3 r = p - com;
-            const double r2 = glm::dot(r, r);
-            I[0][0] += miFine * (r2 - r.x * r.x);
-            I[1][1] += miFine * (r2 - r.y * r.y);
-            I[2][2] += miFine * (r2 - r.z * r.z);
-            I[0][1] -= miFine * r.x * r.y;
-            I[1][0] -= miFine * r.x * r.y;
-            I[0][2] -= miFine * r.x * r.z;
-            I[2][0] -= miFine * r.x * r.z;
-            I[1][2] -= miFine * r.y * r.z;
-            I[2][1] -= miFine * r.y * r.z;
-          }
-        }
+  forEachOccupiedCoarse(scene, objectIndex, o, [&](const glm::ivec3& c) {
+    if (scene.coarseBrickPage(objectIndex, c) == VoxelScene::kInvalidBrickPage) {
+      const double mC = miFine * static_cast<double>(F * F * F);
+      const glm::dvec3 p((static_cast<double>(c.x) + 0.5) * static_cast<double>(o.voxelSize),
+                         (static_cast<double>(c.y) + 0.5) * static_cast<double>(o.voxelSize),
+                         (static_cast<double>(c.z) + 0.5) * static_cast<double>(o.voxelSize));
+      const glm::dvec3 r = p - com;
+      const double r2 = glm::dot(r, r);
+      const double ic = mC * a2 / 6.0;
+      I[0][0] += ic + mC * (r2 - r.x * r.x);
+      I[1][1] += ic + mC * (r2 - r.y * r.y);
+      I[2][2] += ic + mC * (r2 - r.z * r.z);
+      I[0][1] -= mC * r.x * r.y;
+      I[1][0] -= mC * r.x * r.y;
+      I[0][2] -= mC * r.x * r.z;
+      I[2][0] -= mC * r.x * r.z;
+      I[1][2] -= mC * r.y * r.z;
+      I[2][1] -= mC * r.y * r.z;
+    } else {
+      scene.collectOccupiedFines(objectIndex, c, fines);
+      for (const glm::ivec3& fp : fines) {
+        const glm::dvec3 p((static_cast<double>(fp.x) + 0.5) * static_cast<double>(s),
+                           (static_cast<double>(fp.y) + 0.5) * static_cast<double>(s),
+                           (static_cast<double>(fp.z) + 0.5) * static_cast<double>(s));
+        const glm::dvec3 r = p - com;
+        const double r2 = glm::dot(r, r);
+        I[0][0] += miFine * (r2 - r.x * r.x);
+        I[1][1] += miFine * (r2 - r.y * r.y);
+        I[2][2] += miFine * (r2 - r.z * r.z);
+        I[0][1] -= miFine * r.x * r.y;
+        I[1][0] -= miFine * r.x * r.y;
+        I[0][2] -= miFine * r.x * r.z;
+        I[2][0] -= miFine * r.x * r.z;
+        I[1][2] -= miFine * r.y * r.z;
+        I[2][1] -= miFine * r.y * r.z;
       }
     }
-  }
+  });
 
   const glm::vec3 newComW = glm::vec3(o.objectToWorld() * glm::vec4(body.comLocal, 1.0f));
   if (body.invM > 0.0f) {

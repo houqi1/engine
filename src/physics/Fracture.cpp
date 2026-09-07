@@ -157,6 +157,12 @@ int nextGridN(int coarseExtent) {
   return 64;
 }
 
+constexpr int kGroundCoarseY = 2;
+
+bool isStaticGroundFine(int objectIndex, const glm::ivec3& absFine) {
+  return objectIndex == 0 && (absFine.y / kFinePerCoarse) < kGroundCoarseY;
+}
+
 }  // namespace
 
 bool VoxelScene::solidAbsFine(const VoxelObject& o, const glm::ivec3& absFine) const {
@@ -188,7 +194,7 @@ void VoxelScene::emitFracturePiece(int srcIndex, const std::vector<uint32_t>& pa
     return;
   }
   if (static_cast<uint32_t>(objects_.size()) >= kMaxShapes) {
-    clearPackedFines(objects_[static_cast<size_t>(srcIndex)], packedFines);
+    // Cap is full: leave the island on the source. Deleting it made the world vanish.
     return;
   }
   if (packedFines.size() < physics::kResidualFineLimit) {
@@ -295,7 +301,6 @@ void VoxelScene::emitFracturePiece(int srcIndex, const std::vector<uint32_t>& pa
     const glm::ivec3 f = rem - m * kFineRes;
     const glm::ivec3 nc = oldC - c0;
     if (nc.x < 0 || nc.y < 0 || nc.z < 0 || nc.x >= newN || nc.y >= newN || nc.z >= newN) {
-      setFineCpu(src, oldC, m, f, false);
       continue;
     }
     CoarseCell& dstCell = cellAt(dst, indexOf(dst, nc));
@@ -343,7 +348,7 @@ bool VoxelScene::maybeFracture(int objectIndex, const std::vector<glm::ivec3>& d
   for (const glm::ivec3& d : deletedAbsFines) {
     for (const glm::ivec3& dir : kFace) {
       const glm::ivec3 n = d + dir;
-      if (!solidAbsFine(o, n)) {
+      if (!solidAbsFine(o, n) || isStaticGroundFine(objectIndex, n)) {
         continue;
       }
       const uint32_t packed = packFine(n.x, n.y, n.z);
@@ -358,7 +363,8 @@ bool VoxelScene::maybeFracture(int objectIndex, const std::vector<glm::ivec3>& d
   }
 
   UnionFind uf;
-  uf.reset(static_cast<int>(seeds.size()));
+  uf.reset(static_cast<int>(seeds.size()) + 1);
+  const int groundId = static_cast<int>(seeds.size());
   std::vector<std::vector<uint32_t>> cells(seeds.size());
   std::vector<uint32_t> qPos;
   std::vector<int> qLab;
@@ -378,6 +384,10 @@ bool VoxelScene::maybeFracture(int objectIndex, const std::vector<glm::ivec3>& d
 
   auto enqueue = [&](uint32_t packed, int lab) {
     lab = uf.find(lab);
+    if (isStaticGroundFine(objectIndex, unpackFine(packed))) {
+      uf.unite(lab, groundId);
+      return;
+    }
     int existing = -1;
     if (!visit.insertOrGet(packed, lab, &existing)) {
       uf.unite(lab, existing);
@@ -396,6 +406,9 @@ bool VoxelScene::maybeFracture(int objectIndex, const std::vector<glm::ivec3>& d
     const uint32_t packed = qPos[head];
     int lab = uf.find(qLab[head]);
     ++head;
+    if (uf.find(lab) == uf.find(groundId)) {
+      continue;
+    }
     --uf.queueCount[static_cast<size_t>(lab)];
     const glm::ivec3 p = unpackFine(packed);
 
@@ -403,7 +416,9 @@ bool VoxelScene::maybeFracture(int objectIndex, const std::vector<glm::ivec3>& d
     if (inBounds(o, c)) {
       const uint32_t cidx = indexOf(o, c);
       const CoarseCell& cell = cellAt(o, cidx);
-      if (cell.material != 0u && cell.brickPage == kInvalidBrickPage &&
+      if (isStaticGroundFine(objectIndex, p) || (objectIndex == 0 && c.y < kGroundCoarseY)) {
+        uf.unite(lab, groundId);
+      } else if (cell.material != 0u && cell.brickPage == kInvalidBrickPage &&
           coarseJumped[cidx] == 0) {
         coarseJumped[cidx] = 1;
         const glm::ivec3 base = c * kFinePerCoarse;
@@ -511,9 +526,14 @@ bool VoxelScene::maybeFracture(int objectIndex, const std::vector<glm::ivec3>& d
 
   bool changed = false;
   std::vector<uint8_t> emitted(seeds.size(), 0);
+  std::vector<std::vector<uint32_t>> pieces;
+  pieces.reserve(finished.size());
   for (int root : finished) {
     const int r = uf.find(root);
     if (r < 0 || r >= static_cast<int>(emitted.size()) || emitted[static_cast<size_t>(r)]) {
+      continue;
+    }
+    if (uf.find(r) == uf.find(groundId)) {
       continue;
     }
     emitted[static_cast<size_t>(r)] = 1;
@@ -529,7 +549,23 @@ bool VoxelScene::maybeFracture(int objectIndex, const std::vector<glm::ivec3>& d
     if (piece.empty()) {
       continue;
     }
-    emitFracturePiece(objectIndex, piece);
+    pieces.push_back(std::move(piece));
+  }
+  int keep = -1;
+  if (pieces.size() > 1) {
+    size_t best = 0;
+    for (size_t i = 1; i < pieces.size(); ++i) {
+      if (pieces[i].size() > pieces[best].size()) {
+        best = i;
+      }
+    }
+    keep = static_cast<int>(best);
+  }
+  for (int i = 0; i < static_cast<int>(pieces.size()); ++i) {
+    if (i == keep) {
+      continue;
+    }
+    emitFracturePiece(objectIndex, pieces[static_cast<size_t>(i)]);
     changed = true;
   }
   return changed;

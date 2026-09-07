@@ -1,7 +1,10 @@
 #include "scene/VoxelScene.h"
 
 #include "gfx/GfxDevice.h"
+
+#include <vk_mem_alloc.h>
 #include "gfx/Texture.h"
+#include "physics/Fracture.h"
 #include "physics/VoxelCollide.h"
 
 #include <GLFW/glfw3.h>
@@ -117,6 +120,7 @@ void VoxelScene::cleanup(GfxDevice& gfx) {
   gfx.destroyBuffer(coarsePoolBuffer_);
   gfx.destroyBuffer(paletteBuffer_);
   gfx.destroyBuffer(occMipBuffer_);
+  gfx.destroyBuffer(heatmapBuffer_);
   for (BrickSlab& s : slabs_) {
     gfx.destroyBuffer(s.gpu);
   }
@@ -128,6 +132,7 @@ void VoxelScene::cleanup(GfxDevice& gfx) {
   uploadedVisInstances_.clear();
   coarsePoolCpu_.clear();
   occMipCpu_.clear();
+  heatmapCpu_.clear();
   slabs_.clear();
   freePages_.clear();
   dirtyPages_.clear();
@@ -864,6 +869,14 @@ void VoxelScene::ensureGpuBuffers(GfxDevice& gfx) {
         poolBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
   }
+  if (heatmapBuffer_.buffer == VK_NULL_HANDLE) {
+    heatmapBuffer_ = gfx.createBuffer(sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                      VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
+    if (heatmapBuffer_.info.pMappedData) {
+      float none = -1.0f;
+      std::memcpy(heatmapBuffer_.info.pMappedData, &none, sizeof(none));
+    }
+  }
 }
 
 void VoxelScene::uploadPalette(GfxDevice& gfx) {
@@ -874,24 +887,39 @@ void VoxelScene::uploadPalette(GfxDevice& gfx) {
 }
 
 void VoxelScene::flushDirtyPages(GfxDevice& gfx) {
-  for (uint32_t page : dirtyPages_) {
-    const uint32_t si = page / kPagesPerSlab;
-    const uint32_t li = page % kPagesPerSlab;
-    if (si >= slabs_.size() || slabs_[si].gpu.buffer == VK_NULL_HANDLE) {
-      continue;
-    }
-    const uint32_t* src = brickPageWords(page);
-    gfx.uploadToBuffer(slabs_[si].gpu, src, sizeof(uint32_t) * static_cast<size_t>(kBrickPageWords),
-                       sizeof(uint32_t) * static_cast<VkDeviceSize>(li) *
-                           static_cast<VkDeviceSize>(kBrickPageWords));
+  if (dirtyPages_.empty()) {
+    return;
   }
+  std::vector<uint32_t> pages(dirtyPages_.begin(), dirtyPages_.end());
   dirtyPages_.clear();
+  std::sort(pages.begin(), pages.end());
+  size_t i = 0;
+  while (i < pages.size()) {
+    const uint32_t si = pages[i] / kPagesPerSlab;
+    std::vector<GfxDevice::BufferRegionUpload> regions;
+    while (i < pages.size() && pages[i] / kPagesPerSlab == si) {
+      if (si < slabs_.size() && slabs_[si].gpu.buffer != VK_NULL_HANDLE) {
+        const uint32_t li = pages[i] % kPagesPerSlab;
+        GfxDevice::BufferRegionUpload up{};
+        up.data = brickPageWords(pages[i]);
+        up.size = sizeof(uint32_t) * static_cast<VkDeviceSize>(kBrickPageWords);
+        up.dstOffset = sizeof(uint32_t) * static_cast<VkDeviceSize>(li) *
+                       static_cast<VkDeviceSize>(kBrickPageWords);
+        regions.push_back(up);
+      }
+      ++i;
+    }
+    if (!regions.empty() && si < slabs_.size()) {
+      gfx.uploadToBuffer(slabs_[si].gpu, regions.data(), static_cast<uint32_t>(regions.size()));
+    }
+  }
 }
 
 void VoxelScene::flushObject(GfxDevice& gfx, int objectIndex) {
   if (objectIndex < 0 || objectIndex >= static_cast<int>(objects_.size())) {
     return;
   }
+  // One queue drain per edit. Dirty brick pages batch into a single submit below.
   gfx.waitIdle();
   packObjectPool();
   fillGpuObjectRecords();
@@ -1129,6 +1157,36 @@ bool VoxelScene::occupancyFine(int objectIndex, const glm::ivec3& coarse, const 
   return getFine(objects_[static_cast<size_t>(objectIndex)], coarse, micro, fine);
 }
 
+uint32_t VoxelScene::poolCellIndex(int objectIndex, const glm::ivec3& coarse) const {
+  if (objectIndex < 0 || objectIndex >= static_cast<int>(objects_.size())) {
+    return ~0u;
+  }
+  const VoxelObject& o = objects_[static_cast<size_t>(objectIndex)];
+  if (!inBounds(o, coarse) || o.cells.empty()) {
+    return ~0u;
+  }
+  return o.voxelOffset + indexOf(o, coarse);
+}
+
+void VoxelScene::uploadBondHeatmap(GfxDevice& gfx) {
+  const size_t n = std::max(coarsePoolCpu_.size(), size_t{1});
+  heatmapCpu_.assign(n, -1.0f);
+  physics_.fillCoarsePhi(heatmapCpu_);
+  const VkDeviceSize bytes = sizeof(float) * n;
+  if (heatmapBuffer_.buffer == VK_NULL_HANDLE || heatmapBuffer_.size < bytes) {
+    gfx.waitIdle();
+    gfx.destroyBuffer(heatmapBuffer_);
+    heatmapBuffer_ = gfx.createBuffer(bytes,
+                                      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                      VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
+  }
+  if (!heatmapBuffer_.info.pMappedData) {
+    return;
+  }
+  std::memcpy(heatmapBuffer_.info.pMappedData, heatmapCpu_.data(), static_cast<size_t>(bytes));
+  vmaFlushAllocation(gfx.allocator(), heatmapBuffer_.allocation, 0, bytes);
+}
+
 uint32_t VoxelScene::occupancyMaterial(int objectIndex, const glm::ivec3& coarse) const {
   if (objectIndex < 0 || objectIndex >= static_cast<int>(objects_.size())) {
     return 0;
@@ -1201,7 +1259,132 @@ void VoxelScene::collectOccupiedFines(int objectIndex, const glm::ivec3& coarse,
   }
 }
 
+uint32_t VoxelScene::occupiedFineCount(int objectIndex, const glm::ivec3& coarse) const {
+  if (objectIndex < 0 || objectIndex >= static_cast<int>(objects_.size())) {
+    return 0;
+  }
+  const VoxelObject& o = objects_[static_cast<size_t>(objectIndex)];
+  if (!inBounds(o, coarse) || o.cells.empty()) {
+    return 0;
+  }
+  const CoarseCell& cell = cellAt(o, indexOf(o, coarse));
+  if (cell.material == 0u) {
+    return 0;
+  }
+  if (cell.brickPage == kInvalidBrickPage) {
+    return static_cast<uint32_t>(kFinePerBrick);
+  }
+  uint32_t n = 0;
+  for (int i = 0; i < kFineTableBytes; ++i) {
+    n += static_cast<uint32_t>(
+        std::popcount(static_cast<unsigned>(readFineByte(cell.brickPage, static_cast<uint32_t>(i)))));
+  }
+  return n;
+}
+
 void VoxelScene::notifyOccupancyChanged(int objectIndex) { physics_.markDirty(objectIndex); }
+
+bool VoxelScene::fractureFromCuts(int objectIndex, const std::vector<glm::ivec3>& deletedAbsFines) {
+  return maybeFracture(objectIndex, deletedAbsFines);
+}
+
+int VoxelScene::cutCoarseInterface(int objectIndex, const glm::ivec3& coarseA,
+                                   const glm::ivec3& coarseB, std::vector<glm::ivec3>* deletedOut) {
+  if (objectIndex < 0 || objectIndex >= static_cast<int>(objects_.size())) {
+    return 0;
+  }
+  VoxelObject& o = objects_[static_cast<size_t>(objectIndex)];
+  if (!inBounds(o, coarseA) || !inBounds(o, coarseB)) {
+    return 0;
+  }
+  const glm::ivec3 d = coarseB - coarseA;
+  int axis = 0;
+  int sign = 1;
+  if (std::abs(d.y) > std::abs(d.x) && std::abs(d.y) >= std::abs(d.z)) {
+    axis = 1;
+    sign = d.y >= 0 ? 1 : -1;
+  } else if (std::abs(d.z) > std::abs(d.x)) {
+    axis = 2;
+    sign = d.z >= 0 ? 1 : -1;
+  } else {
+    sign = d.x >= 0 ? 1 : -1;
+  }
+  const glm::ivec3 src = sign > 0 ? coarseA : coarseB;
+  const glm::ivec3 base = src * kFinePerCoarse;
+  const int N = kFinePerCoarse;
+  int changed = 0;
+  for (int u = 0; u < N; ++u) {
+    for (int v = 0; v < N; ++v) {
+      glm::ivec3 abs = base;
+      if (axis == 0) {
+        abs.x += sign > 0 ? N - 1 : 0;
+        abs.y += u;
+        abs.z += v;
+      } else if (axis == 1) {
+        abs.y += sign > 0 ? N - 1 : 0;
+        abs.x += u;
+        abs.z += v;
+      } else {
+        abs.z += sign > 0 ? N - 1 : 0;
+        abs.x += u;
+        abs.y += v;
+      }
+      const glm::ivec3 c = abs / kFinePerCoarse;
+      const glm::ivec3 rem = abs - c * kFinePerCoarse;
+      const glm::ivec3 m = rem / kFineRes;
+      const glm::ivec3 f = rem - m * kFineRes;
+      if (setFineCpu(o, c, m, f, false)) {
+        ++changed;
+        if (deletedOut) {
+          deletedOut->push_back(abs);
+        }
+      }
+    }
+  }
+  return changed;
+}
+
+void VoxelScene::peelCoarseIslands(int objectIndex, const std::vector<glm::ivec3>& coarses) {
+  if (objectIndex < 0 || objectIndex >= static_cast<int>(objects_.size()) || coarses.empty()) {
+    return;
+  }
+  if (static_cast<uint32_t>(objects_.size()) >= kMaxShapes) {
+    return;
+  }
+  std::vector<uint32_t> packed;
+  std::vector<glm::ivec3> fines;
+  packed.reserve(coarses.size() * 64);
+  for (const glm::ivec3& c : coarses) {
+    collectOccupiedFines(objectIndex, c, fines);
+    for (const glm::ivec3& f : fines) {
+      packed.push_back(static_cast<uint32_t>(f.x) | (static_cast<uint32_t>(f.y) << 10) |
+                       (static_cast<uint32_t>(f.z) << 20));
+    }
+  }
+  if (packed.empty()) {
+    return;
+  }
+  if (packed.size() < physics::kResidualFineLimit) {
+    clearPackedFines(objects_[static_cast<size_t>(objectIndex)], packed);
+    return;
+  }
+  emitFracturePiece(objectIndex, packed);
+}
+
+void VoxelScene::noteOccupancyGpuDirty() { occupancyGpuDirty_ = true; }
+
+void VoxelScene::flushOccupancyGpu(GfxDevice& gfx) {
+  if (!occupancyGpuDirty_ || objects_.empty()) {
+    occupancyGpuDirty_ = false;
+    return;
+  }
+  occupancyGpuDirty_ = false;
+  flushObject(gfx, 0);
+}
+
+const std::vector<physics::DebugBond>& VoxelScene::structureDebugBonds() const {
+  return physics_.debugBonds();
+}
 
 uint32_t VoxelScene::physicsCornerCount(int objectIndex) const {
   const physics::ShapeClass* sc = physics_.shapeClass(objectIndex);
@@ -1230,7 +1413,7 @@ void VoxelScene::rebuildVoxels(GfxDevice& gfx) {
   uploadedVisInstances_.clear();
   const int n = std::clamp(gridSize_, 8, 64);
   gridSize_ = n;
-  maxSteps_ = static_cast<uint32_t>(std::max(16, n * 3));
+  maxSteps_ = static_cast<uint32_t>(std::max(256, n * 8));
   lastHit_.reset();
 
   for (BrickSlab& s : slabs_) {
@@ -1977,8 +2160,6 @@ void VoxelScene::handleEditInput(GLFWwindow* window, GfxDevice& gfx) {
     if (!deletedFines.empty()) {
       maybeFracture(objIndex, deletedFines);
     }
-    recountOccupiedMicro();
-    recountOccupiedFine();
     flushObject(gfx, objIndex);
     notifyOccupancyChanged(objIndex);
     for (int i = nBefore; i < static_cast<int>(objects_.size()); ++i) {
