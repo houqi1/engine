@@ -176,22 +176,6 @@ void transformAabb(const glm::mat4& m, const glm::vec3& mn, const glm::vec3& mx,
   }
 }
 
-bool worldAabb(const VoxelScene& scene, int objectIndex, const ShapeClass& sc, glm::vec3& wmn,
-               glm::vec3& wmx) {
-  if (!sc.occValid) {
-    return false;
-  }
-  const VoxelObject& o = scene.cpuObject(objectIndex);
-  const float s = fineSize(o);
-  const glm::vec3 lmn(static_cast<float>(sc.occFineMn.x) * s, static_cast<float>(sc.occFineMn.y) * s,
-                      static_cast<float>(sc.occFineMn.z) * s);
-  const glm::vec3 lmx((static_cast<float>(sc.occFineMx.x) + 1.0f) * s,
-                      (static_cast<float>(sc.occFineMx.y) + 1.0f) * s,
-                      (static_cast<float>(sc.occFineMx.z) + 1.0f) * s);
-  transformAabb(o.objectToWorld(), lmn, lmx, wmn, wmx);
-  return true;
-}
-
 glm::vec3 arbitraryPerp(const glm::vec3& n) {
   glm::vec3 t;
   if (n.x >= 0.57735f) {
@@ -339,6 +323,30 @@ void reducePairContacts(std::vector<Contact>& out, size_t before) {
 }
 
 }  // namespace
+
+bool worldAabb(const VoxelScene& scene, int objectIndex, const ShapeClass& sc, glm::vec3& wmn,
+               glm::vec3& wmx) {
+  if (!sc.occValid) {
+    return false;
+  }
+  const VoxelObject& o = scene.cpuObject(objectIndex);
+  const float s = o.voxelSize / static_cast<float>(VoxelScene::kFinePerCoarse);
+  const glm::vec3 lmn(static_cast<float>(sc.occFineMn.x) * s, static_cast<float>(sc.occFineMn.y) * s,
+                      static_cast<float>(sc.occFineMn.z) * s);
+  const glm::vec3 lmx((static_cast<float>(sc.occFineMx.x) + 1.0f) * s,
+                      (static_cast<float>(sc.occFineMx.y) + 1.0f) * s,
+                      (static_cast<float>(sc.occFineMx.z) + 1.0f) * s);
+  const glm::mat4 m = o.objectToWorld();
+  wmn = glm::vec3(1e30f);
+  wmx = glm::vec3(-1e30f);
+  for (int i = 0; i < 8; ++i) {
+    const glm::vec3 c((i & 1) ? lmx.x : lmn.x, (i & 2) ? lmx.y : lmn.y, (i & 4) ? lmx.z : lmn.z);
+    const glm::vec3 w = glm::vec3(m * glm::vec4(c, 1.0f));
+    wmn = glm::min(wmn, w);
+    wmx = glm::max(wmx, w);
+  }
+  return true;
+}
 
 void collidePair(VoxelScene& scene, const RigidBody& a, const RigidBody& b, const ShapeClass& ca,
                  const ShapeClass& cb, std::vector<Contact>& out) {

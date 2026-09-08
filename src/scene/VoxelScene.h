@@ -6,7 +6,9 @@
 #include "gfx/Texture.h"
 #include "physics/PhysicsWorld.h"
 #include "physics/VoxelCollide.h"
+#include "scene/VoxelTypes.h"
 #include "voxel/MeshVoxelizer.h"
+#include "voxel/VoxelConnectivity.h"
 
 #include <glm/glm.hpp>
 #include <glm/gtc/quaternion.hpp>
@@ -72,6 +74,12 @@ struct VoxelObject {
   bool editable = true;
   bool enabled = true;
   bool useImportPalette = false;
+  // Slot is live in the object table (distinct from enabled, which is visibility/sim).
+  bool slotOccupied = true;
+  bool isScatter = false;
+  MotionType motionType = MotionType::Dynamic;
+  // Bumped when occupancy, material connectivity rules, or anchors change.
+  uint64_t topologyRevision = 1;
 
   std::vector<CoarseCell> cells;
   uint32_t voxelOffset = 0;  // coarse cell index into shared CoarsePool
@@ -119,6 +127,11 @@ public:
   void cleanup(GfxDevice& gfx);
   void update(float dt);
   void handleEditInput(GLFWwindow* window, GfxDevice& gfx);
+  // Dig → connectivity → split commit. See advance/commit in the frame loop.
+  void advanceFractureWork(float dt);
+  void commitReadyFractures(GfxDevice& gfx);
+  bool fractureEnabled() const { return fractureEnabled_; }
+  bool& fractureEnabled() { return fractureEnabled_; }
   void rebuildVoxels(GfxDevice& gfx);
   // Keep ground (+ optional spinner/test box), append `count` small solid boxes for scale tests.
   void spawnScatterBoxes(GfxDevice& gfx, uint32_t count);
@@ -158,6 +171,8 @@ public:
   uint32_t objectCount() const { return static_cast<uint32_t>(objectsGpu_.size()); }
   uint32_t objectFlags(uint32_t i) const { return objectsGpu_.at(i).flags; }
   const std::vector<GpuVoxelObject>& gpuObjects() const { return objectsGpu_; }
+  // Bumped when GPU buffer handles are recreated; renderer must refresh descriptors.
+  uint32_t gpuResourceSerial() const { return gpuResourceSerial_; }
 
   uint32_t voxelCount() const;
   uint32_t occupiedCount() const { return occupiedCount_; }
@@ -203,6 +218,14 @@ public:
   int cpuObjectCount() const { return static_cast<int>(objects_.size()); }
   const VoxelObject& cpuObject(int i) const { return objects_.at(static_cast<size_t>(i)); }
   VoxelObject& cpuObject(int i) { return objects_.at(static_cast<size_t>(i)); }
+  bool slotOccupied(int i) const {
+    return i >= 0 && i < static_cast<int>(objects_.size()) && objects_[static_cast<size_t>(i)].slotOccupied;
+  }
+  VoxelObjectId objectIdAt(int slot) const;
+  VoxelObjectId groundObjectId() const { return groundObjectId_; }
+  VoxelObjectId testObjectId() const { return testObjectId_; }
+  VoxelObject* tryGetObject(VoxelObjectId id);
+  const VoxelObject* tryGetObject(VoxelObjectId id) const;
   bool occupancyFine(int objectIndex, const glm::ivec3& coarse, const glm::ivec3& micro,
                      const glm::ivec3& fine) const;
   uint32_t occupancyMaterial(int objectIndex, const glm::ivec3& coarse) const;
@@ -252,6 +275,11 @@ private:
   void buildSpinnerObject(VoxelObject& o);
   void buildTestBoxObject(VoxelObject& o);
   void clearObjectPages(VoxelObject& o);
+  uint32_t allocObjectSlot();
+  void freeObjectSlot(uint32_t slot);
+  void resetObjectTable(uint32_t reservedSlots);
+  VoxelObjectId makeObjectId(uint32_t slot) const;
+  VoxelObject* mutableObject(VoxelObjectId id);
   uint32_t stampMeshIntoWorld(const MeshVoxelizeResult& r, bool sampleColor);
   void uploadWorldAndObjects(GfxDevice& gfx);
   void packObjectPool();
@@ -276,11 +304,43 @@ private:
   void flushDirtyPages(GfxDevice& gfx);
 
   int applyCoarseSphereBrush(VoxelObject& o, const glm::ivec3& center, float radius,
-                             uint32_t material, bool placeOnlyEmpty);
+                             uint32_t material, bool placeOnlyEmpty,
+                             std::vector<voxel::FineCoord>* removedOut = nullptr);
   int applyMicroSphereBrush(VoxelObject& o, const glm::ivec3& coarse, const glm::ivec3& micro,
-                            float radius, bool solid, uint32_t placeMaterial);
+                            float radius, bool solid, uint32_t placeMaterial,
+                            std::vector<voxel::FineCoord>* removedOut = nullptr);
   int applyFineSphereBrush(VoxelObject& o, const glm::ivec3& coarse, const glm::ivec3& micro,
-                           const glm::ivec3& fine, float radius, bool solid, uint32_t placeMaterial);
+                           const glm::ivec3& fine, float radius, bool solid, uint32_t placeMaterial,
+                           std::vector<voxel::FineCoord>* removedOut = nullptr);
+
+  struct FractureJob {
+    enum class Phase : uint8_t { Searching, ReadyToCommit, Done, Cancelled };
+    VoxelObjectId objectId{};
+    uint64_t topologyRevision = 0;
+    std::vector<voxel::FineCoord> removed;
+    voxel::MultiSourceConnectivity search;
+    voxel::ConnectivityResult result{};
+    Phase phase = Phase::Searching;
+  };
+
+  class ObjectSolidView final : public voxel::SolidView {
+  public:
+    ObjectSolidView(const VoxelScene& scene, int objectIndex) : scene_(scene), objectIndex_(objectIndex) {}
+    bool isSolid(voxel::FineCoord p) const override;
+
+  private:
+    const VoxelScene& scene_;
+    int objectIndex_ = -1;
+  };
+
+  void enqueueFractureJob(VoxelObjectId id, std::vector<voxel::FineCoord> removed);
+  bool commitFractureJob(GfxDevice& gfx, FractureJob& job);
+  bool extractFragmentFromMasks(GfxDevice& gfx, VoxelObject& parent, int parentIndex,
+                                const voxel::FinalizedComponent& comp, VoxelObjectId parentId,
+                                const physics::BodyState& parentState, glm::dvec3 parentComLocal);
+  glm::dvec3 computeLocalCom(int objectIndex) const;
+  uint32_t countSolidFines(int objectIndex) const;
+  uint32_t readFineRgb(uint32_t page, uint32_t colorIndex) const;
 
   struct PickResult {
     VoxelHit hit{};
@@ -315,6 +375,10 @@ private:
   bool importConservative_ = true;
 
   std::vector<VoxelObject> objects_;
+  std::vector<uint32_t> objectGenerations_;
+  std::vector<uint32_t> freeObjectSlots_;
+  VoxelObjectId groundObjectId_{};
+  VoxelObjectId testObjectId_{};
   std::vector<GpuVoxelObject> objectsGpu_;
   std::array<std::vector<GpuVoxelObject>, GfxDevice::kFramesInFlight> uploadedObjectsGpu_;
   std::vector<CoarseCell> coarsePoolCpu_;
@@ -357,4 +421,10 @@ private:
   bool prevLmb_ = false;
   bool prevF_ = false;
   std::optional<VoxelHit> lastHit_;
+
+  bool fractureEnabled_ = true;
+  std::vector<FractureJob> fractureJobs_;
+  // Debris smaller than this many fines is deleted instead of becoming a body.
+  static constexpr uint32_t kMinFragmentFines = 8;
+  uint32_t gpuResourceSerial_ = 1;
 };

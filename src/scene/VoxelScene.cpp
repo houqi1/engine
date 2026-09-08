@@ -79,6 +79,108 @@ glm::mat4 VoxelObject::worldToObject() const {
   return glm::inverse(objectToWorld());
 }
 
+VoxelObjectId VoxelScene::makeObjectId(uint32_t slot) const {
+  if (slot >= objects_.size() || slot >= objectGenerations_.size() || !objects_[slot].slotOccupied) {
+    return {};
+  }
+  return VoxelObjectId{slot, objectGenerations_[slot]};
+}
+
+VoxelObjectId VoxelScene::objectIdAt(int slot) const {
+  if (slot < 0) {
+    return {};
+  }
+  return makeObjectId(static_cast<uint32_t>(slot));
+}
+
+VoxelObject* VoxelScene::tryGetObject(VoxelObjectId id) {
+  if (!id.valid() || id.slot >= objects_.size() || id.slot >= objectGenerations_.size()) {
+    return nullptr;
+  }
+  if (!objects_[id.slot].slotOccupied || objectGenerations_[id.slot] != id.generation) {
+    return nullptr;
+  }
+  return &objects_[id.slot];
+}
+
+const VoxelObject* VoxelScene::tryGetObject(VoxelObjectId id) const {
+  if (!id.valid() || id.slot >= objects_.size() || id.slot >= objectGenerations_.size()) {
+    return nullptr;
+  }
+  if (!objects_[id.slot].slotOccupied || objectGenerations_[id.slot] != id.generation) {
+    return nullptr;
+  }
+  return &objects_[id.slot];
+}
+
+VoxelObject* VoxelScene::mutableObject(VoxelObjectId id) { return tryGetObject(id); }
+
+void VoxelScene::resetObjectTable(uint32_t reservedSlots) {
+  for (VoxelObject& o : objects_) {
+    if (o.slotOccupied) {
+      clearObjectPages(o);
+    }
+  }
+  objects_.clear();
+  objectGenerations_.clear();
+  freeObjectSlots_.clear();
+  groundObjectId_ = {};
+  testObjectId_ = {};
+  objects_.resize(reservedSlots);
+  objectGenerations_.assign(reservedSlots, 1u);
+  for (uint32_t i = 0; i < reservedSlots; ++i) {
+    objects_[i] = VoxelObject{};
+    objects_[i].slotOccupied = false;
+    objects_[i].enabled = false;
+  }
+}
+
+uint32_t VoxelScene::allocObjectSlot() {
+  if (!freeObjectSlots_.empty()) {
+    const uint32_t slot = freeObjectSlots_.back();
+    freeObjectSlots_.pop_back();
+    VoxelObject& o = objects_[slot];
+    o = VoxelObject{};
+    o.slotOccupied = true;
+    return slot;
+  }
+  if (objects_.size() >= kMaxVoxelObjects) {
+    throw std::runtime_error("Voxel object slot limit reached");
+  }
+  const uint32_t slot = static_cast<uint32_t>(objects_.size());
+  objects_.push_back(VoxelObject{});
+  objectGenerations_.push_back(1u);
+  objects_.back().slotOccupied = true;
+  return slot;
+}
+
+void VoxelScene::freeObjectSlot(uint32_t slot) {
+  if (slot >= objects_.size()) {
+    return;
+  }
+  VoxelObject& o = objects_[slot];
+  if (!o.slotOccupied) {
+    return;
+  }
+  clearObjectPages(o);
+  o = VoxelObject{};
+  o.slotOccupied = false;
+  o.enabled = false;
+  if (slot < objectGenerations_.size()) {
+    objectGenerations_[slot] += 1u;
+    if (objectGenerations_[slot] == 0u) {
+      objectGenerations_[slot] = 1u;
+    }
+  }
+  freeObjectSlots_.push_back(slot);
+  if (groundObjectId_.slot == slot) {
+    groundObjectId_ = {};
+  }
+  if (testObjectId_.slot == slot) {
+    testObjectId_ = {};
+  }
+}
+
 void VoxelScene::init(GfxDevice& gfx) {
   // Ground top is 2 coarse cells (3.2 m at default). Orbit from about eye height above it.
   camera_.setOrbitTarget(glm::vec3(0.0f, 4.0f, 0.0f));
@@ -136,31 +238,36 @@ void VoxelScene::cleanup(GfxDevice& gfx) {
   lastHit_.reset();
 }
 
+// Fracture implementations live in VoxelSceneFracture.cpp.
+
 void VoxelScene::update(float dt) {
   time_ += dt;
   for (VoxelObject& o : objects_) {
+    if (!o.slotOccupied) {
+      continue;
+    }
     o.nestedMicro = nestedMicroVoxels_;
   }
   if (simulate_) {
-    if (objects_.size() >= 2) {
-      objects_[1].enabled = true;
+    if (VoxelObject* test = tryGetObject(testObjectId_)) {
+      test->enabled = true;
     }
     physics_.step(dt);
     physics_.syncTransformsToScene();
-  } else if (objects_.size() >= 2) {
-    objects_[1].enabled = spinnerEnabled_;
-    objects_[1].rotation = glm::angleAxis(time_ * spinSpeed_, glm::vec3(0.0f, 1.0f, 0.0f));
+  } else if (VoxelObject* test = tryGetObject(testObjectId_)) {
+    test->enabled = spinnerEnabled_;
+    test->rotation = glm::angleAxis(time_ * spinSpeed_, glm::vec3(0.0f, 1.0f, 0.0f));
   }
   fillGpuObjectRecords();
   lastHit_ = pickCenterRay();
 }
 
 glm::vec3 VoxelScene::gridOrigin() const {
-  if (objects_.empty()) {
-    const float half = 0.5f * static_cast<float>(gridSize_);
-    return glm::vec3(-half, 0.0f, -half) * voxelSize_;
+  if (const VoxelObject* ground = tryGetObject(groundObjectId_)) {
+    return glm::vec3(ground->objectToWorld() * glm::vec4(0.0f, 0.0f, 0.0f, 1.0f));
   }
-  return glm::vec3(objects_[0].objectToWorld() * glm::vec4(0.0f, 0.0f, 0.0f, 1.0f));
+  const float half = 0.5f * static_cast<float>(gridSize_);
+  return glm::vec3(-half, 0.0f, -half) * voxelSize_;
 }
 
 bool VoxelScene::inBounds(const VoxelObject& o, const glm::ivec3& p) const {
@@ -633,6 +740,9 @@ void VoxelScene::ensureCoarseBrick(VoxelObject& o, const glm::ivec3& coarse, uin
 uint32_t VoxelScene::voxelCount() const {
   uint32_t n = 0;
   for (const VoxelObject& o : objects_) {
+    if (!o.slotOccupied) {
+      continue;
+    }
     n += static_cast<uint32_t>(o.cells.size());
   }
   return n;
@@ -641,6 +751,13 @@ uint32_t VoxelScene::voxelCount() const {
 void VoxelScene::fillCoarseDirTiles() {
   occMipCpu_.clear();
   for (VoxelObject& o : objects_) {
+    if (!o.slotOccupied) {
+      o.occMipOffset = 0;
+      o.occMipWords = 0;
+      o.occMin = glm::vec3(0.0f);
+      o.occMax = glm::vec3(0.0f);
+      continue;
+    }
     o.occMipOffset = static_cast<uint32_t>(occMipCpu_.size());
     o.occMin = glm::vec3(0.0f);
     o.occMax = glm::vec3(0.0f);
@@ -698,10 +815,17 @@ void VoxelScene::packCoarsePool() {
   occupiedCount_ = 0;
   size_t totalCells = 0;
   for (const VoxelObject& o : objects_) {
+    if (!o.slotOccupied) {
+      continue;
+    }
     totalCells += o.cells.size();
   }
   coarsePoolCpu_.reserve(totalCells);
   for (VoxelObject& o : objects_) {
+    if (!o.slotOccupied) {
+      o.voxelOffset = 0;
+      continue;
+    }
     o.voxelOffset = static_cast<uint32_t>(coarsePoolCpu_.size());
     coarsePoolCpu_.insert(coarsePoolCpu_.end(), o.cells.begin(), o.cells.end());
     for (const CoarseCell& c : o.cells) {
@@ -735,7 +859,7 @@ void VoxelScene::fillGpuObjectRecords() {
   objectsGpu_.clear();
   objectsGpu_.reserve(objects_.size());
   for (const VoxelObject& o : objects_) {
-    if (!o.enabled) {
+    if (!o.slotOccupied || !o.enabled) {
       continue;
     }
     GpuVoxelObject g{};
@@ -853,57 +977,73 @@ void VoxelScene::ensureGpuBuffers(GfxDevice& gfx) {
   const VkDeviceSize coarseBytes =
       sizeof(CoarseCell) * std::max<size_t>(coarsePoolCpu_.size(), 1);
 
+  bool structuralChange = false;
+  auto destroySynced = [&](AllocatedBuffer& buffer) {
+    if (buffer.buffer != VK_NULL_HANDLE) {
+      gfx.waitIdle();
+      gfx.destroyBuffer(buffer);
+      structuralChange = true;
+    }
+  };
+
   if (dummyBrickSlabBuffer_.buffer == VK_NULL_HANDLE || dummyBrickSlabBuffer_.size < slabBytes) {
-    gfx.destroyBuffer(dummyBrickSlabBuffer_);
+    destroySynced(dummyBrickSlabBuffer_);
     dummyBrickSlabBuffer_ = gfx.createBuffer(slabBytes,
                                              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                                              VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
     std::vector<uint32_t> zeros(kWordsPerSlab, 0u);
     gfx.uploadToBuffer(dummyBrickSlabBuffer_, zeros.data(), slabBytes);
+    structuralChange = true;
   }
   for (BrickSlab& s : slabs_) {
     if (s.gpu.buffer == VK_NULL_HANDLE) {
+      // New slab: in-flight frames must not keep stale descriptor bindings.
+      gfx.waitIdle();
       s.gpu = gfx.createBuffer(slabBytes,
                                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                                VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
       gfx.uploadToBuffer(s.gpu, s.words.data(), slabBytes);
+      structuralChange = true;
     }
   }
   if (coarsePoolBuffer_.buffer == VK_NULL_HANDLE || coarsePoolBuffer_.size < coarseBytes) {
-    if (coarsePoolBuffer_.buffer != VK_NULL_HANDLE) {
-      gfx.waitIdle();
-    }
-    gfx.destroyBuffer(coarsePoolBuffer_);
+    destroySynced(coarsePoolBuffer_);
     coarsePoolBuffer_ = gfx.createBuffer(
         coarseBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+    structuralChange = true;
   }
   for (uint32_t i = 0; i < GfxDevice::kFramesInFlight; ++i) {
     AllocatedBuffer& buf = objectFrameBuffers_[i];
     if (buf.buffer == VK_NULL_HANDLE || buf.size < objectBytes) {
       uploadedObjectsGpu_[i].clear();
-      if (buf.buffer != VK_NULL_HANDLE) {
-        gfx.waitIdle();
-      }
-      gfx.destroyBuffer(buf);
+      destroySynced(buf);
       buf = gfx.createBuffer(objectBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                              VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
+      structuralChange = true;
     }
   }
   const VkDeviceSize paletteBytes = sizeof(glm::vec4) * 256;
   if (paletteBuffer_.buffer == VK_NULL_HANDLE || paletteBuffer_.size < paletteBytes) {
-    gfx.destroyBuffer(paletteBuffer_);
+    destroySynced(paletteBuffer_);
     paletteBuffer_ = gfx.createBuffer(
         paletteBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
     uploadPalette(gfx);
+    structuralChange = true;
   }
   const VkDeviceSize mipBytes = sizeof(uint32_t) * std::max<size_t>(occMipCpu_.size(), 1);
   if (occMipBuffer_.buffer == VK_NULL_HANDLE || occMipBuffer_.size < mipBytes) {
-    gfx.destroyBuffer(occMipBuffer_);
+    // Previously destroyed without waitIdle — in-flight frames still sampled the old
+    // occ-mip buffer and the whole scene flickered every other frame.
+    destroySynced(occMipBuffer_);
     occMipBuffer_ = gfx.createBuffer(
         mipBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+    structuralChange = true;
+  }
+  if (structuralChange) {
+    ++gpuResourceSerial_;
   }
 }
 
@@ -991,6 +1131,10 @@ void VoxelScene::buildGroundObject(VoxelObject& o) {
   o.nestedMicro = nestedMicroVoxels_;
   o.editable = true;
   o.enabled = true;
+  o.slotOccupied = true;
+  o.isScatter = false;
+  o.motionType = MotionType::Static;
+  o.topologyRevision = 1;
   o.useImportPalette = false;
   o.rotation = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
   const float half = 0.5f * static_cast<float>(n);
@@ -1021,6 +1165,10 @@ void VoxelScene::buildSpinnerObject(VoxelObject& o) {
   o.nestedMicro = nestedMicroVoxels_;
   o.editable = true;
   o.enabled = spinnerEnabled_;
+  o.slotOccupied = true;
+  o.isScatter = false;
+  o.motionType = MotionType::Kinematic;
+  o.topologyRevision = 1;
   o.rotation = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
   o.position = glm::vec3(0.0f, 4.0f * voxelSize_ + 0.5f * static_cast<float>(kSpinnerN) * voxelSize_,
                          0.0f);
@@ -1068,6 +1216,10 @@ void VoxelScene::buildTestBoxObject(VoxelObject& o) {
   o.nestedMicro = nestedMicroVoxels_;
   o.editable = true;
   o.enabled = true;
+  o.slotOccupied = true;
+  o.isScatter = false;
+  o.motionType = MotionType::Dynamic;
+  o.topologyRevision = 1;
   o.useImportPalette = false;
   o.rotation = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
   // 2x2x2 solid at coarse (3,3,3)-(4,4,4) so COM ~= grid center (6.4 m).
@@ -1095,28 +1247,32 @@ void VoxelScene::setSimulate(GfxDevice& gfx, bool on) {
     return;
   }
   simulate_ = on;
-  if (objects_.size() < 2) {
+  VoxelObject* test = tryGetObject(testObjectId_);
+  if (!test) {
     return;
   }
-  clearObjectPages(objects_[1]);
+  const int testSlot = static_cast<int>(testObjectId_.slot);
+  clearObjectPages(*test);
   if (on) {
-    buildTestBoxObject(objects_[1]);
-    objects_[1].enabled = true;
+    buildTestBoxObject(*test);
+    test->enabled = true;
   } else {
-    buildSpinnerObject(objects_[1]);
-    objects_[1].enabled = spinnerEnabled_;
+    buildSpinnerObject(*test);
+    test->enabled = spinnerEnabled_;
   }
+  testObjectId_ = makeObjectId(testObjectId_.slot);
   packObjectPool();
-  flushObject(gfx, 1);
+  flushObject(gfx, testSlot);
   physics_.attach(*this);
   physics_.rebuildFromScene();
 }
 
 void VoxelScene::clearScatterBoxes(GfxDevice& gfx) {
   gfx.waitIdle();
-  while (objects_.size() > 2) {
-    clearObjectPages(objects_.back());
-    objects_.pop_back();
+  for (int i = static_cast<int>(objects_.size()) - 1; i >= 0; --i) {
+    if (objects_[static_cast<size_t>(i)].slotOccupied && objects_[static_cast<size_t>(i)].isScatter) {
+      freeObjectSlot(static_cast<uint32_t>(i));
+    }
   }
   packObjectPool();
   fillGpuObjectRecords();
@@ -1131,7 +1287,7 @@ void VoxelScene::clearScatterBoxes(GfxDevice& gfx) {
 }
 
 void VoxelScene::spawnScatterBoxes(GfxDevice& gfx, uint32_t count) {
-  if (objects_.empty()) {
+  if (!tryGetObject(groundObjectId_)) {
     return;
   }
   clearScatterBoxes(gfx);
@@ -1140,18 +1296,29 @@ void VoxelScene::spawnScatterBoxes(GfxDevice& gfx, uint32_t count) {
   constexpr uint32_t kMat = 2u;
   const float vs = voxelSize_;
   const float spacing = static_cast<float>(kN) * vs * 1.75f;
+  uint32_t occupied = 0;
+  for (const VoxelObject& o : objects_) {
+    if (o.slotOccupied) {
+      ++occupied;
+    }
+  }
   const uint32_t maxAdd =
-      count == 0 ? 0u : std::min(count, kMaxVoxelObjects - static_cast<uint32_t>(objects_.size()));
+      count == 0 ? 0u : std::min(count, kMaxVoxelObjects > occupied ? kMaxVoxelObjects - occupied : 0u);
 
   // Grid in XZ above the ground slab; Y stacks every row wrap.
   const int side = std::max(1, static_cast<int>(std::ceil(std::sqrt(static_cast<float>(maxAdd)))));
   for (uint32_t i = 0; i < maxAdd; ++i) {
-    VoxelObject o{};
+    const uint32_t slot = allocObjectSlot();
+    VoxelObject& o = objects_[slot];
     o.gridSize = kN;
     o.voxelSize = vs;
     o.nestedMicro = nestedMicroVoxels_;
     o.editable = true;
     o.enabled = true;
+    o.slotOccupied = true;
+    o.isScatter = true;
+    o.motionType = MotionType::Dynamic;
+    o.topologyRevision = 1;
     o.useImportPalette = false;
     o.rotation = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
     const int ix = static_cast<int>(i % static_cast<uint32_t>(side));
@@ -1178,7 +1345,6 @@ void VoxelScene::spawnScatterBoxes(GfxDevice& gfx, uint32_t count) {
         }
       }
     }
-    objects_.push_back(std::move(o));
   }
 
   packObjectPool();
@@ -1195,14 +1361,14 @@ void VoxelScene::spawnScatterBoxes(GfxDevice& gfx, uint32_t count) {
 
 bool VoxelScene::occupancyFine(int objectIndex, const glm::ivec3& coarse, const glm::ivec3& micro,
                                const glm::ivec3& fine) const {
-  if (objectIndex < 0 || objectIndex >= static_cast<int>(objects_.size())) {
+  if (!slotOccupied(objectIndex)) {
     return false;
   }
   return getFine(objects_[static_cast<size_t>(objectIndex)], coarse, micro, fine);
 }
 
 uint32_t VoxelScene::occupancyMaterial(int objectIndex, const glm::ivec3& coarse) const {
-  if (objectIndex < 0 || objectIndex >= static_cast<int>(objects_.size())) {
+  if (!slotOccupied(objectIndex)) {
     return 0;
   }
   const VoxelObject& o = objects_[static_cast<size_t>(objectIndex)];
@@ -1213,7 +1379,7 @@ uint32_t VoxelScene::occupancyMaterial(int objectIndex, const glm::ivec3& coarse
 }
 
 uint32_t VoxelScene::coarseBrickPage(int objectIndex, const glm::ivec3& coarse) const {
-  if (objectIndex < 0 || objectIndex >= static_cast<int>(objects_.size())) {
+  if (!slotOccupied(objectIndex)) {
     return kInvalidBrickPage;
   }
   const VoxelObject& o = objects_[static_cast<size_t>(objectIndex)];
@@ -1226,7 +1392,7 @@ uint32_t VoxelScene::coarseBrickPage(int objectIndex, const glm::ivec3& coarse) 
 void VoxelScene::collectOccupiedFines(int objectIndex, const glm::ivec3& coarse,
                                       std::vector<glm::ivec3>& out) const {
   out.clear();
-  if (objectIndex < 0 || objectIndex >= static_cast<int>(objects_.size())) {
+  if (!slotOccupied(objectIndex)) {
     return;
   }
   const VoxelObject& o = objects_[static_cast<size_t>(objectIndex)];
@@ -1315,14 +1481,17 @@ void VoxelScene::rebuildVoxels(GfxDevice& gfx) {
   nextPage_ = 0;
   allocatedPageCount_ = 0;
 
-  objects_.clear();
-  objects_.resize(2);
+  resetObjectTable(2);
+  objects_[0].slotOccupied = true;
   buildGroundObject(objects_[0]);
+  groundObjectId_ = makeObjectId(0);
+  objects_[1].slotOccupied = true;
   if (simulate_) {
     buildTestBoxObject(objects_[1]);
   } else {
     buildSpinnerObject(objects_[1]);
   }
+  testObjectId_ = makeObjectId(1);
 
   packObjectPool();
   fillGpuObjectRecords();
@@ -1353,10 +1522,11 @@ void VoxelScene::uploadWorldAndObjects(GfxDevice& gfx) {
 }
 
 uint32_t VoxelScene::stampMeshIntoWorld(const MeshVoxelizeResult& r, bool sampleColor) {
-  if (objects_.empty() || r.n <= 0 || r.material.empty()) {
+  VoxelObject* worldPtr = tryGetObject(groundObjectId_);
+  if (!worldPtr || r.n <= 0 || r.material.empty()) {
     return 0;
   }
-  VoxelObject& world = objects_[0];
+  VoxelObject& world = *worldPtr;
   const int wn = world.gridSize;
   const float wvs = world.voxelSize;
   if (wn <= 0 || wvs <= 0.0f) {
@@ -1490,13 +1660,19 @@ bool VoxelScene::importSurfaceMesh(GfxDevice& gfx, const std::string& path,
             << std::chrono::duration<float>(t1 - t0).count() << "s  occupiedFine="
             << r.occupiedFine << "  colorSamples=" << r.colorSamples << std::endl;
 
-  VoxelObject& world = objects_[0];
+  VoxelObject* worldPtr = tryGetObject(groundObjectId_);
+  if (!worldPtr) {
+    importStatus_ = "Ground object is not ready";
+    return false;
+  }
+  VoxelObject& world = *worldPtr;
   for (CoarseCell& c : world.cells) {
     if (c.brickPage != kInvalidBrickPage) {
       freeBrickPage(c.brickPage);
     }
   }
   buildGroundObject(world);
+  groundObjectId_ = makeObjectId(groundObjectId_.slot);
 
   const uint32_t stamped = stampMeshIntoWorld(r, local.sampleColor);
   std::cout << "Import stamp done  worldFines=" << stamped << std::endl;
@@ -1553,7 +1729,8 @@ void VoxelScene::removeImportedMesh(GfxDevice& gfx) {
 }
 
 int VoxelScene::applyCoarseSphereBrush(VoxelObject& o, const glm::ivec3& center, float radius,
-                                       uint32_t material, bool placeOnlyEmpty) {
+                                       uint32_t material, bool placeOnlyEmpty,
+                                       std::vector<voxel::FineCoord>* removedOut) {
   const float r = std::max(0.0f, radius);
   const int extent = static_cast<int>(std::ceil(r));
   const float r2 = r * r;
@@ -1576,8 +1753,19 @@ int VoxelScene::applyCoarseSphereBrush(VoxelObject& o, const glm::ivec3& center,
         if (placeOnlyEmpty && getVoxel(o, p) != 0) {
           continue;
         }
+        const bool recording = removedOut && material == 0u && getVoxel(o, p) != 0u;
         if (setVoxelCpu(o, p, material)) {
           ++changed;
+          if (recording) {
+            const int F = kFinePerCoarse;
+            for (int fz = 0; fz < F; ++fz) {
+              for (int fy = 0; fy < F; ++fy) {
+                for (int fx = 0; fx < F; ++fx) {
+                  removedOut->push_back(voxel::FineCoord{p.x * F + fx, p.y * F + fy, p.z * F + fz});
+                }
+              }
+            }
+          }
         }
       }
     }
@@ -1587,7 +1775,8 @@ int VoxelScene::applyCoarseSphereBrush(VoxelObject& o, const glm::ivec3& center,
 
 int VoxelScene::applyMicroSphereBrush(VoxelObject& o, const glm::ivec3& coarse,
                                       const glm::ivec3& micro, float radius, bool solid,
-                                      uint32_t placeMaterial) {
+                                      uint32_t placeMaterial,
+                                      std::vector<voxel::FineCoord>* removedOut) {
   const float r = std::max(0.0f, radius);
   const int extent = static_cast<int>(std::ceil(r));
   const float r2 = r * r;
@@ -1631,8 +1820,20 @@ int VoxelScene::applyMicroSphereBrush(VoxelObject& o, const glm::ivec3& coarse,
           if (getVoxel(o, c) == 0) {
             continue;
           }
+          const bool was = getMicro(o, c, m);
           if (setMicroCpu(o, c, m, false)) {
             ++changed;
+            if (removedOut && was) {
+              const glm::ivec3 base = c * (kMicroRes * kFineRes) + m * kFineRes;
+              for (int fz = 0; fz < kFineRes; ++fz) {
+                for (int fy = 0; fy < kFineRes; ++fy) {
+                  for (int fx = 0; fx < kFineRes; ++fx) {
+                    removedOut->push_back(
+                        voxel::FineCoord{base.x + fx, base.y + fy, base.z + fz});
+                  }
+                }
+              }
+            }
           }
         }
       }
@@ -1643,7 +1844,8 @@ int VoxelScene::applyMicroSphereBrush(VoxelObject& o, const glm::ivec3& coarse,
 
 int VoxelScene::applyFineSphereBrush(VoxelObject& o, const glm::ivec3& coarse,
                                      const glm::ivec3& micro, const glm::ivec3& fine, float radius,
-                                     bool solid, uint32_t placeMaterial) {
+                                     bool solid, uint32_t placeMaterial,
+                                     std::vector<voxel::FineCoord>* removedOut) {
   const float r = std::max(0.0f, radius);
   const int extent = static_cast<int>(std::ceil(r));
   const float r2 = r * r;
@@ -1693,8 +1895,12 @@ int VoxelScene::applyFineSphereBrush(VoxelObject& o, const glm::ivec3& coarse,
           if (getVoxel(o, c) == 0) {
             continue;
           }
+          const bool was = getFine(o, c, m, f);
           if (setFineCpu(o, c, m, f, false)) {
             ++changed;
+            if (removedOut && was) {
+              removedOut->push_back(voxel::FineCoord{absFine.x, absFine.y, absFine.z});
+            }
           }
         }
       }
@@ -1905,7 +2111,7 @@ std::optional<VoxelHit> VoxelScene::pickCenterRay() const {
 
   std::optional<PickResult> best;
   for (size_t i = 0; i < objects_.size(); ++i) {
-    if (!objects_[i].enabled) {
+    if (!objects_[i].slotOccupied || !objects_[i].enabled) {
       continue;
     }
     auto hit = pickObject(objects_[i], static_cast<int>(i), Ow, Dw);
@@ -1958,13 +2164,18 @@ void VoxelScene::handleEditInput(GLFWwindow* window, GfxDevice& gfx) {
   brushRadius_ = radius;
   const uint32_t mat = static_cast<uint32_t>(std::clamp(brushMaterial_, 1, 255));
 
+  std::vector<voxel::FineCoord> removed;
+  const bool wantFracture =
+      fractureEnabled_ && removeEdge && o.motionType == MotionType::Dynamic && o.slotOccupied;
+  std::vector<voxel::FineCoord>* removedOut = wantFracture ? &removed : nullptr;
+
   int changed = 0;
   if (nestedMicroVoxels_ && nestedFineVoxels_ && (hit->hasFine || hit->hasMicro)) {
     glm::ivec3 fine = hit->fine;
     glm::ivec3 micro = hit->micro;
     glm::ivec3 coarse = hit->cell;
     if (removeEdge) {
-      changed = applyFineSphereBrush(o, coarse, micro, fine, radius, false, mat);
+      changed = applyFineSphereBrush(o, coarse, micro, fine, radius, false, mat, removedOut);
     } else if (placeEdge) {
       glm::ivec3 placeFine = fine + hit->normal;
       glm::ivec3 placeMicro = micro;
@@ -1993,7 +2204,7 @@ void VoxelScene::handleEditInput(GLFWwindow* window, GfxDevice& gfx) {
     glm::ivec3 micro = hit->micro;
     glm::ivec3 coarse = hit->cell;
     if (removeEdge) {
-      changed = applyMicroSphereBrush(o, coarse, micro, radius, false, mat);
+      changed = applyMicroSphereBrush(o, coarse, micro, radius, false, mat, removedOut);
     } else if (placeEdge) {
       glm::ivec3 placeMicro = micro + hit->normal;
       glm::ivec3 placeCoarse = coarse;
@@ -2012,17 +2223,21 @@ void VoxelScene::handleEditInput(GLFWwindow* window, GfxDevice& gfx) {
     }
   } else {
     if (removeEdge) {
-      changed = applyCoarseSphereBrush(o, hit->cell, radius, 0, false);
+      changed = applyCoarseSphereBrush(o, hit->cell, radius, 0, false, removedOut);
     } else if (placeEdge) {
       changed = applyCoarseSphereBrush(o, hit->cell + hit->normal, radius, mat, true);
     }
   }
 
   if (changed > 0) {
+    o.topologyRevision += 1;
     recountOccupiedMicro();
     recountOccupiedFine();
     flushObject(gfx, objIndex);
     notifyOccupancyChanged(objIndex);
+    if (wantFracture && !removed.empty()) {
+      enqueueFractureJob(objectIdAt(objIndex), std::move(removed));
+    }
   }
   lastHit_ = pickCenterRay();
 }

@@ -70,8 +70,10 @@ set(VE_GRASS_SOURCES
 set(VE_VOXEL_SOURCES
   src/main_voxel.cpp
   src/scene/VoxelScene.cpp
+  src/scene/VoxelSceneFracture.cpp
   src/render/VoxelRenderer.cpp
   src/voxel/MeshVoxelizer.cpp
+  src/voxel/VoxelConnectivity.cpp
   src/physics/Classify.cpp
   src/physics/VoxelCollide.cpp
   src/physics/Solver.cpp
@@ -131,6 +133,15 @@ ve_configure_target(vulkan_engine)
 
 add_executable(vulkan_engine_voxel ${VE_COMMON_SOURCES} ${VE_VOXEL_SOURCES})
 ve_configure_target(vulkan_engine_voxel)
+
+add_executable(voxel_connectivity_tests
+  tests/voxel_connectivity_tests.cpp
+  src/voxel/VoxelConnectivity.cpp
+)
+target_include_directories(voxel_connectivity_tests PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_compile_features(voxel_connectivity_tests PRIVATE cxx_std_20)
 
 # ---- Shader compilation ----
 find_program(GLSLC glslc HINTS /opt/homebrew/bin ENV VULKAN_SDK PATH_SUFFIXES bin REQUIRED)

@@ -12,6 +12,9 @@ namespace physics {
 void collidePair(VoxelScene& scene, const RigidBody& a, const RigidBody& b, const ShapeClass& ca,
                  const ShapeClass& cb, std::vector<Contact>& out);
 
+bool worldAabb(const VoxelScene& scene, int objectIndex, const ShapeClass& sc, glm::vec3& wmn,
+               glm::vec3& wmx);
+
 struct DebugCornerNormal {
   glm::vec3 p{0.0f};
   glm::vec3 n{0.0f, 1.0f, 0.0f};

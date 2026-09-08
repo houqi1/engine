@@ -1102,6 +1102,7 @@ void VoxelRenderer::updateDescriptors(VoxelScene& scene) {
   }
 
   boundCoarsePoolBuffer_ = scene.coarsePoolBuffer().buffer;
+  boundGpuResourceSerial_ = scene.gpuResourceSerial();
   boundBrickSlabCount_ = scene.brickSlabCount();
   boundBrickSlabs_.fill(VK_NULL_HANDLE);
   for (uint32_t i = 0; i < boundBrickSlabCount_; ++i) {
@@ -1336,7 +1337,8 @@ bool VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
   displayFps_ = displayFps;
 
   // UI requests must not destroy resources referenced by an unsubmitted command buffer.
-  if (importRequested_ || removeImportRequested_ || rebuildRequested_) {
+  if (importRequested_ || removeImportRequested_ || rebuildRequested_ || scatterSpawnRequested_ ||
+      scatterClearRequested_ || simulateRequested_) {
     gfx_.waitIdle();
     if (importRequested_) {
       MeshVoxelizeConfig cfg;
@@ -1354,7 +1356,17 @@ bool VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
     if (rebuildRequested_) {
       scene.rebuildVoxels(gfx_);
     }
+    if (scatterClearRequested_) {
+      scene.clearScatterBoxes(gfx_);
+    }
+    if (scatterSpawnRequested_) {
+      scene.spawnScatterBoxes(gfx_, scatterSpawnCount_);
+    }
+    if (simulateRequested_) {
+      scene.setSimulate(gfx_, pendingSimulate_);
+    }
     importRequested_ = removeImportRequested_ = rebuildRequested_ = false;
+    scatterSpawnRequested_ = scatterClearRequested_ = simulateRequested_ = false;
     boundCoarsePoolBuffer_ = VK_NULL_HANDLE;
   }
 
@@ -1374,7 +1386,8 @@ bool VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
   for (uint32_t i = 0; i < GfxDevice::kFramesInFlight && !objectBuffersChanged; ++i) {
     objectBuffersChanged = scene.objectBuffer(i).buffer != boundObjectBuffers_[i];
   }
-  if (scene.coarsePoolBuffer().buffer != boundCoarsePoolBuffer_ || brickSlabsChanged ||
+  if (scene.gpuResourceSerial() != boundGpuResourceSerial_ ||
+      scene.coarsePoolBuffer().buffer != boundCoarsePoolBuffer_ || brickSlabsChanged ||
       objectBuffersChanged || scene.paletteBuffer().buffer != boundPaletteBuffer_ ||
       scene.occMipBuffer().buffer != boundOccMipBuffer_ ||
       scene.sky().image.view != boundSkyView_ || outImage_.view == VK_NULL_HANDLE ||
@@ -1908,15 +1921,14 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
     static int scatterCount = 100;
     ImGui::SliderInt("Scatter count", &scatterCount, 1, 1000);
     if (ImGui::Button("Spawn scatter")) {
-      scene.spawnScatterBoxes(gfx_, static_cast<uint32_t>(scatterCount));
-      boundCoarsePoolBuffer_ = VK_NULL_HANDLE;  // refresh descriptors after pool resize
+      scatterSpawnCount_ = static_cast<uint32_t>(scatterCount);
+      scatterSpawnRequested_ = true;
     }
     ImGui::SameLine();
     if (ImGui::Button("Clear scatter")) {
-      scene.clearScatterBoxes(gfx_);
-      boundCoarsePoolBuffer_ = VK_NULL_HANDLE;
+      scatterClearRequested_ = true;
     }
-    ImGui::TextDisabled("Keeps ground + object[1]; adds small solid boxes for multi-object load.");
+    ImGui::TextDisabled("Keeps ground + test object; clears only isScatter objects.");
   }
   const char* stages[] = {
       "Full (DDA + nest + AO + light)",
@@ -1989,12 +2001,16 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
   {
     bool sim = scene.simulate();
     if (ImGui::Checkbox("Simulate", &sim)) {
-      scene.setSimulate(gfx_, sim);
+      pendingSimulate_ = sim;
+      simulateRequested_ = true;
     }
+    ImGui::Checkbox("Fracture on dig", &scene.fractureEnabled());
+    ImGui::TextDisabled("On = digging a dynamic object can split it into falling pieces.");
     ImGui::TextDisabled("On = solid test box falls on 3.2 m ground. Off = spinner.");
     if (scene.simulate()) {
-      ImGui::Text("Test box corners: %u   edges: %u", scene.physicsCornerCount(1),
-                  scene.physicsEdgeCount(1));
+      const int testSlot = scene.testObjectId().valid() ? static_cast<int>(scene.testObjectId().slot) : 1;
+      ImGui::Text("Test box corners: %u   edges: %u", scene.physicsCornerCount(testSlot),
+                  scene.physicsEdgeCount(testSlot));
       ImGui::TextDisabled("Corner rays: green = n.y up, red = n.y down, grey = no hit.");
       const physics::DebugSolve ds = scene.physicsDebug();
       ImGui::Text("Solve contacts=%d  maxD=%.3f  minNy=%.2f", ds.contacts, ds.maxD, ds.minNy);

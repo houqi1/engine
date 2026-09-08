@@ -215,6 +215,7 @@ private:
 
   std::array<FrameResources, GfxDevice::kFramesInFlight> frames_{};
   VkBuffer boundCoarsePoolBuffer_ = VK_NULL_HANDLE;
+  uint32_t boundGpuResourceSerial_ = 0;
   std::array<VkBuffer, VoxelScene::kMaxBrickSlabs> boundBrickSlabs_{};
   uint32_t boundBrickSlabCount_ = 0;
   std::array<VkBuffer, GfxDevice::kFramesInFlight> boundObjectBuffers_{};
@@ -228,6 +229,11 @@ private:
   bool importRequested_ = false;
   bool removeImportRequested_ = false;
   bool rebuildRequested_ = false;
+  bool scatterSpawnRequested_ = false;
+  bool scatterClearRequested_ = false;
+  bool simulateRequested_ = false;
+  uint32_t scatterSpawnCount_ = 0;
+  bool pendingSimulate_ = false;
   float displayFps_ = 0.0f;
   int traceStage_ = 0;
   bool brickBitSkip_ = true;

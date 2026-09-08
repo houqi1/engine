@@ -498,8 +498,11 @@ int main(int argc, char** argv) {
                                : 1.0f;
       scene.camera().handleInput(window.handle(), dt);
       scene.camera().update(aspect);
-      scene.update(dt);
+      // Edit / fracture prepare+commit before physics so the same frame uses new shapes.
       scene.handleEditInput(window.handle(), gfx);
+      scene.advanceFractureWork(dt);
+      scene.commitReadyFractures(gfx);
+      scene.update(dt);
       renderer.draw(scene, fps);
     }
 
