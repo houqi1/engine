@@ -67,25 +67,31 @@ void solveContacts(std::vector<RigidBody>& bodies, std::vector<Contact>& contact
     const glm::vec3 vB = B.v + glm::cross(B.w, c.rB);
     const glm::vec3 vRel = vA - vB;
     const float vn = glm::dot(vRel, c.n);
-    // Gap or just touching, and already separating: skip. Resting d≈0 must stay.
-    if (vn > 0.0f && c.d <= 0.0f) {
-      continue;
-    }
-    float bias = 0.0f;
-    if (c.d > kSlop && hSub > 0.0f) {
-      bias = kBaumgarte * (c.d - kSlop) / hSub;
-    }
     const float k = effectiveMass(A, B, c.rA, c.rB, c.n);
     if (k <= 1e-8f) {
       continue;
     }
-    // If already separating, don't fight vn; only push out leftover penetration.
-    const float vnCorr = (vn > 0.0f) ? 0.0f : vn;
-    float dLam = -(vnCorr + bias) / k;
+
+    // Target normal velocity: speculative gap limits approach; penetration gets
+    // Baumgarte push-out; flush / within slop wants vn == 0.
+    float targetVn = 0.0f;
+    if (hSub > 0.0f) {
+      if (c.d < 0.0f) {
+        targetVn = c.d / hSub;
+      } else if (c.d > kSlop) {
+        targetVn = kBaumgarte * (c.d - kSlop) / hSub;
+      }
+    }
+    float dLam = (targetVn - vn) / k;
     const float lambdaN = std::max(0.0f, c.lambdaN + dLam);
     dLam = lambdaN - c.lambdaN;
     c.lambdaN = lambdaN;
     applyImpulse(A, B, c.rA, c.rB, dLam * c.n);
+
+    // No friction while still separated — otherwise speculative contacts brake in air.
+    if (c.d < 0.0f || c.lambdaN <= 0.0f) {
+      continue;
+    }
 
     const glm::vec3 vA2 = A.v + glm::cross(A.w, c.rA);
     const glm::vec3 vB2 = B.v + glm::cross(B.w, c.rB);

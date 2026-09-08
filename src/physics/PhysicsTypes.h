@@ -16,7 +16,10 @@ constexpr glm::vec3 kGravity{0.0f, -9.81f, 0.0f};
 
 constexpr float kVoxel = 0.1f;
 constexpr float kSphereRadius = 0.5f * kVoxel;
+// Penetration tolerance: how deep before Baumgarte position correction. Not hover height.
 constexpr float kSlop = 0.01f;
+// Speculative contact range (d >= -lookAhead). Matches 6-neighbor fine probe reach.
+constexpr float kContactLookAhead = kVoxel;
 constexpr float kBaumgarte = 0.2f;
 constexpr float kRestitution = 0.0f;
 constexpr float kFriction = 0.5f;

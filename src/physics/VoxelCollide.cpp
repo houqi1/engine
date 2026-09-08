@@ -111,9 +111,13 @@ void considerContact(const VoxelScene& scene, const RigidBody& a, const RigidBod
   c.rB = worldP - b.x;
   const glm::vec3 cB =
       glm::vec3(ob.objectToWorld() * glm::vec4(fineCenterLocal(ob, hitFine), 1.0f));
-  // Two spheres of radius r: rest along n is 2r. Occupancy already means hit;
-  // negative d is a gap, not a miss.
+  // Two spheres of radius r: faces flush when centers are 2r apart (d == 0).
+  // d < 0 is a gap (speculative); d > 0 is overlap. Keep look-ahead contacts so the
+  // solver can limit approach speed; drop hits beyond the 6-neighbor fine range.
   c.d = 2.0f * kSphereRadius - glm::dot(worldP - cB, c.n);
+  if (c.d < -kContactLookAhead) {
+    return;
+  }
   c.fineA = packFine(pA.x, pA.y, pA.z, finePerAxis(oa));
   c.fineB = packFine(hitFine.x, hitFine.y, hitFine.z, finePerAxis(ob));
   out.push_back(c);
