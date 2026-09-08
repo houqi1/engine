@@ -148,21 +148,18 @@ void main() {
         vec3 Dl = mat3(o.worldToObject) * dir;
         vec3 ro = Ol / o.voxelSize;
         vec3 rd = Dl;
-        vec3 invDir = clamp(1.0 / rd, vec3(-FLT_MAX), vec3(FLT_MAX));
-        vec3 mini = ((vec3(mapPos) - ro) + 0.5 - 0.5 * sgn) * invDir;
-        float tCoarse = max(mini.x, max(mini.y, mini.z));
-        vec3 intersect = ro + rd * tCoarse;
-        vec3 local01 = clamp(intersect - vec3(mapPos), vec3(0.0), vec3(0.9999));
-        if (usedFine) {
-            vec3 microF = local01 * 8.0;
-            vec3 fineF = fract(microF) * 2.0;
-            uvw = clamp(fineF - vec3(fine), vec3(0.0), vec3(1.0));
-        } else if (usedMicro) {
-            vec3 microF = local01 * 8.0;
-            uvw = clamp(microF - vec3(micro), vec3(0.0), vec3(1.0));
-        } else {
-            uvw = local01;
-        }
+        // Nested hits are inside the coarse cube. Intersect the packed face of the
+        // actual micro/fine voxel — subdividing the coarse entry UV (via fract)
+        // made AO crawl with the camera and clamp to occluded corners.
+        float scale = usedFine ? 16.0 : (usedMicro ? 8.0 : 1.0);
+        ivec3 vp = usedFine ? (mapPos * 16 + micro * 2 + fine)
+                            : (usedMicro ? (mapPos * 8 + micro) : mapPos);
+        vec3 vmin = vec3(vp) / scale;
+        vec3 faceN = vec3(mask);
+        float plane = dot(faceN, vmin) + (faceSign != 0u ? (1.0 / scale) : 0.0);
+        float denom = dot(faceN, rd);
+        float tHit = abs(denom) > 1e-12 ? (plane - dot(faceN, ro)) / denom : 0.0;
+        uvw = clamp((ro + rd * tHit - vmin) * scale, vec3(0.0), vec3(1.0));
     }
 
     if (ubo.solidColor != 0u) {
