@@ -1,8 +1,12 @@
 # Object-Order Empty Space Skipping (Occupancy Hull → tMin/tMax → Compute DDA)
 
+> **Superseded for multi-object visibility.** Use `docs/multi-object-box-dda.md`
+> (Teardown-style back-face OBB + Fragment DDA) as the main path. This note is
+> retained as historical design for occupancy-hull → compute interval experiments.
+
 Living design note. **Not a KD-tree. Not nested AABBs. Not world-AABB-only.**
 
-Status: **v1 implemented (P0–P5)** — occupancy hull raster → `tMin/tMax/tBack` → compute DDA starts at `tMin`.
+Status: **historical / superseded** — occupancy hull raster → `tMin/tMax/tBack` → compute DDA starts at `tMin`.
 
 Related shipped code:
 

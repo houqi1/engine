@@ -156,6 +156,9 @@ set(VE_SHADER_SOURCES
   voxel_dda.comp
   voxel_dda_coarse.comp
   voxelize_surface.comp
+  proxy_box.vert
+  visibility.frag
+  voxel_shade.frag
 )
 
 set(VE_SPV_FILES "")
@@ -176,6 +179,18 @@ foreach(SHADER ${VE_SHADER_SOURCES})
       OUTPUT ${SPV}
       COMMAND ${GLSLC} -O -g -I ${VE_SHADER_SOURCE_DIR} ${SRC} -o ${SPV}
       DEPENDS ${SRC} ${VE_SHADER_SOURCE_DIR}/dir_mask_lut.glsl
+      COMMENT "Compiling shader ${SHADER}"
+      VERBATIM
+    )
+  elseif(SHADER STREQUAL "proxy_box.vert" OR SHADER STREQUAL "visibility.frag" OR SHADER STREQUAL "voxel_shade.frag")
+    add_custom_command(
+      OUTPUT ${SPV}
+      COMMAND ${GLSLC} -O -g -I ${VE_SHADER_SOURCE_DIR} ${SRC} -o ${SPV}
+      DEPENDS ${SRC}
+        ${VE_SHADER_SOURCE_DIR}/voxel_types.glsl
+        ${VE_SHADER_SOURCE_DIR}/voxel_trace.glsl
+        ${VE_SHADER_SOURCE_DIR}/dir_mask_lut.glsl
+        ${VE_SHADER_SOURCE_DIR}/voxel_ao.glsl
       COMMENT "Compiling shader ${SHADER}"
       VERBATIM
     )

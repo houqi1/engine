@@ -176,6 +176,9 @@ VkPipeline PipelineBuilder::build(VkDevice device) const {
       att.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
       att.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
       att.alphaBlendOp = VK_BLEND_OP_ADD;
+    } else {
+      // Explicit off — required for integer attachments (e.g. HitBuffer RGBA32UI).
+      att.blendEnable = VK_FALSE;
     }
   }
 

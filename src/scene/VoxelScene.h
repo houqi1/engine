@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/Camera.h"
+#include "gfx/GfxDevice.h"
 #include "gfx/GpuTypes.h"
 #include "gfx/Texture.h"
 #include "physics/PhysicsWorld.h"
@@ -18,7 +19,6 @@
 #include <vector>
 
 struct GLFWwindow;
-class GfxDevice;
 
 struct VoxelHit {
   glm::ivec3 cell{0};
@@ -39,7 +39,7 @@ struct GpuVoxelObject {
   float _pad0[3];
   uint32_t gridSize[3];
   uint32_t flags;  // bit0 nestedMicro, bit1 enabled, bit2 import color, bit3 nestedFine
-  uint32_t voxelOffset;  // grids[] texture index (0 = world, 1 = spinner)
+  uint32_t voxelOffset;  // coarse cell index into shared CoarsePool
   uint32_t occMipOffset;  // 4^3 coarse tiles: two uints (64 Morton bits) each
   uint32_t occMipWords;   // tile count * 2
   uint32_t _pad1;
@@ -74,7 +74,7 @@ struct VoxelObject {
   bool useImportPalette = false;
 
   std::vector<CoarseCell> cells;
-  uint32_t voxelOffset = 0;  // grids[] texture index (0 = world, 1 = spinner)
+  uint32_t voxelOffset = 0;  // coarse cell index into shared CoarsePool
   uint32_t occMipOffset = 0;
   uint32_t occMipWords = 0;
   glm::vec3 occMin{0.0f};
@@ -112,13 +112,20 @@ public:
   static constexpr int kOccMipShift = 2;
   static constexpr uint32_t kGridTexCount = 2;
   static constexpr VkFormat kGridFormat = VK_FORMAT_R32G32_UINT;
+  // Soft cap for scatter / fracture objects (Phase 3 scale tests).
+  static constexpr uint32_t kMaxVoxelObjects = 1024;
 
   void init(GfxDevice& gfx);
   void cleanup(GfxDevice& gfx);
   void update(float dt);
   void handleEditInput(GLFWwindow* window, GfxDevice& gfx);
   void rebuildVoxels(GfxDevice& gfx);
-  void uploadObjectTransforms(GfxDevice& gfx);
+  // Keep ground (+ optional spinner/test box), append `count` small solid boxes for scale tests.
+  void spawnScatterBoxes(GfxDevice& gfx, uint32_t count);
+  void clearScatterBoxes(GfxDevice& gfx);
+  void uploadObjectTransforms(GfxDevice& gfx, uint32_t frameIndex);
+  void uploadObjectTransforms(GfxDevice& gfx) { uploadObjectTransforms(gfx, 0); }
+  void uploadCoarsePool(GfxDevice& gfx);
   bool importSurfaceMesh(GfxDevice& gfx, const std::string& path, const MeshVoxelizeConfig& cfg);
   void removeImportedMesh(GfxDevice& gfx);
   const std::string& importStatus() const { return importStatus_; }
@@ -141,11 +148,16 @@ public:
   const AllocatedImage& dummyGridImage() const { return dummyGrid3D_; }
   VkSampler gridSampler() const { return gridSampler_; }
   const AllocatedBuffer& dummyBrickSlabBuffer() const { return dummyBrickSlabBuffer_; }
-  const AllocatedBuffer& objectBuffer() const { return objectBuffer_; }
+  const AllocatedBuffer& coarsePoolBuffer() const { return coarsePoolBuffer_; }
+  const AllocatedBuffer& objectBuffer(uint32_t frameIndex) const {
+    return objectFrameBuffers_[frameIndex % GfxDevice::kFramesInFlight];
+  }
+  const AllocatedBuffer& objectBuffer() const { return objectBuffer(0); }
   uint32_t brickSlabCount() const { return static_cast<uint32_t>(slabs_.size()); }
   const AllocatedBuffer& brickSlabBuffer(uint32_t i) const { return slabs_[i].gpu; }
   uint32_t objectCount() const { return static_cast<uint32_t>(objectsGpu_.size()); }
   uint32_t objectFlags(uint32_t i) const { return objectsGpu_.at(i).flags; }
+  const std::vector<GpuVoxelObject>& gpuObjects() const { return objectsGpu_; }
 
   uint32_t voxelCount() const;
   uint32_t occupiedCount() const { return occupiedCount_; }
@@ -243,6 +255,7 @@ private:
   uint32_t stampMeshIntoWorld(const MeshVoxelizeResult& r, bool sampleColor);
   void uploadWorldAndObjects(GfxDevice& gfx);
   void packObjectPool();
+  void packCoarsePool();
   void fillCoarseDirTiles();
   void fillGpuObjectRecords();
   void uploadOccMip(GfxDevice& gfx);
@@ -287,7 +300,8 @@ private:
   VkSampler gridSampler_ = VK_NULL_HANDLE;
   bool gridFormatChecked_ = false;
   AllocatedBuffer dummyBrickSlabBuffer_{};
-  AllocatedBuffer objectBuffer_{};
+  AllocatedBuffer coarsePoolBuffer_{};
+  std::array<AllocatedBuffer, GfxDevice::kFramesInFlight> objectFrameBuffers_{};
   AllocatedBuffer paletteBuffer_{};
   AllocatedBuffer occMipBuffer_{};
   MeshVoxelizerGpu voxelizeGpu_{};
@@ -302,7 +316,8 @@ private:
 
   std::vector<VoxelObject> objects_;
   std::vector<GpuVoxelObject> objectsGpu_;
-  std::vector<GpuVoxelObject> uploadedObjectsGpu_;
+  std::array<std::vector<GpuVoxelObject>, GfxDevice::kFramesInFlight> uploadedObjectsGpu_;
+  std::vector<CoarseCell> coarsePoolCpu_;
   std::vector<uint32_t> occMipCpu_;
   std::vector<BrickSlab> slabs_;
   std::vector<uint32_t> freePages_;

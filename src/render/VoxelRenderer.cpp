@@ -1,5 +1,7 @@
 #include "render/VoxelRenderer.h"
 
+#include "gfx/PipelineBuilder.h"
+
 #include <imgui.h>
 #include <imgui_impl_glfw.h>
 #include <imgui_impl_vulkan.h>
@@ -15,6 +17,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <locale>
 #include <optional>
 #include <stdexcept>
@@ -222,6 +225,7 @@ VoxelRenderer::~VoxelRenderer() {
   gfx_.waitIdle();
   shutdownImGui();
   destroyOutputImage();
+  destroyCubeMesh();
   destroyTimestampPool();
 
   if (computePipeline_) {
@@ -245,12 +249,27 @@ VoxelRenderer::~VoxelRenderer() {
   if (beamPipeline_) {
     vkDestroyPipeline(gfx_.device(), beamPipeline_, nullptr);
   }
+  if (visibilityPipeline_) {
+    vkDestroyPipeline(gfx_.device(), visibilityPipeline_, nullptr);
+  }
+  if (shadePipeline_) {
+    vkDestroyPipeline(gfx_.device(), shadePipeline_, nullptr);
+  }
   if (pipelineLayout_) {
     vkDestroyPipelineLayout(gfx_.device(), pipelineLayout_, nullptr);
   }
+  if (gfxPipelineLayout_) {
+    vkDestroyPipelineLayout(gfx_.device(), gfxPipelineLayout_, nullptr);
+  }
   gfx_.destroyImage(dummyBeamImage_);
+  gfx_.destroyBuffer(dummyVisibleInstances_);
+  if (hitSampler_) {
+    gfx_.destroySampler(hitSampler_);
+  }
   for (auto& frame : frames_) {
     gfx_.destroyBuffer(frame.frameUBO);
+    gfx_.destroyBuffer(frame.gfxUBO);
+    gfx_.destroyBuffer(frame.visibleInstances);
   }
   if (descriptorPool_) {
     vkDestroyDescriptorPool(gfx_.device(), descriptorPool_, nullptr);
@@ -258,19 +277,39 @@ VoxelRenderer::~VoxelRenderer() {
   if (frameLayout_) {
     vkDestroyDescriptorSetLayout(gfx_.device(), frameLayout_, nullptr);
   }
+  if (gfxLayout_) {
+    vkDestroyDescriptorSetLayout(gfx_.device(), gfxLayout_, nullptr);
+  }
 }
 
 void VoxelRenderer::init(VoxelScene& scene) {
   dummyBeamImage_ = gfx_.createImage({1, 1, 1}, kBeamFormat, VK_IMAGE_USAGE_STORAGE_BIT,
                                      VK_IMAGE_ASPECT_COLOR_BIT, true);
+  {
+    VisibleInstance dummy{0, 0};
+    dummyVisibleInstances_ = gfx_.createBuffer(sizeof(VisibleInstance),
+                                               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                               VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
+    if (dummyVisibleInstances_.info.pMappedData) {
+      std::memcpy(dummyVisibleInstances_.info.pMappedData, &dummy, sizeof(dummy));
+    }
+  }
+  hitSampler_ = gfx_.createSampler(VK_FILTER_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, false,
+                                   1, 0.0f, VK_SAMPLER_MIPMAP_MODE_NEAREST);
   createDescriptors();
   createOutputImage();
+  createCubeMesh();
   createTimestampPool();
   createPipelines();
 
   for (auto& frame : frames_) {
     frame.frameUBO = gfx_.createBuffer(sizeof(VoxelDdaUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
                                        VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
+    frame.gfxUBO = gfx_.createBuffer(sizeof(VoxelGfxUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                                     VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
+    frame.visibleInstances = gfx_.createBuffer(
+        sizeof(VisibleInstance) * 256u, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
 
     VkDescriptorSetAllocateInfo allocInfo{};
     allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
@@ -279,6 +318,11 @@ void VoxelRenderer::init(VoxelScene& scene) {
     allocInfo.pSetLayouts = &frameLayout_;
     if (vkAllocateDescriptorSets(gfx_.device(), &allocInfo, &frame.frameSet) != VK_SUCCESS) {
       throw std::runtime_error("Failed to allocate voxel DDA descriptor set");
+    }
+
+    allocInfo.pSetLayouts = &gfxLayout_;
+    if (vkAllocateDescriptorSets(gfx_.device(), &allocInfo, &frame.gfxSet) != VK_SUCCESS) {
+      throw std::runtime_error("Failed to allocate voxel graphics descriptor set");
     }
   }
 
@@ -462,15 +506,16 @@ void VoxelRenderer::resize() {
   destroyOutputImage();
   createOutputImage();
   // Force descriptor refresh so storage-image views stay valid.
-  boundGridViews_.fill(VK_NULL_HANDLE);
-  boundGridSampler_ = VK_NULL_HANDLE;
+  boundCoarsePoolBuffer_ = VK_NULL_HANDLE;
   boundBrickSlabs_.fill(VK_NULL_HANDLE);
   boundBrickSlabCount_ = 0;
-  boundObjectBuffer_ = VK_NULL_HANDLE;
+  boundObjectBuffers_.fill(VK_NULL_HANDLE);
   boundPaletteBuffer_ = VK_NULL_HANDLE;
   boundOccMipBuffer_ = VK_NULL_HANDLE;
   boundSkyView_ = VK_NULL_HANDLE;
   boundBeamView_ = VK_NULL_HANDLE;
+  boundHitView_ = VK_NULL_HANDLE;
+  boundDepthSnapshotView_ = VK_NULL_HANDLE;
 }
 
 void VoxelRenderer::createDescriptors() {
@@ -481,8 +526,8 @@ void VoxelRenderer::createDescriptors() {
   bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
   bindings[1].binding = 1;
-  bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-  bindings[1].descriptorCount = VoxelScene::kGridTexCount;
+  bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  bindings[1].descriptorCount = 1;
   bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
   bindings[2].binding = 2;
@@ -529,17 +574,74 @@ void VoxelRenderer::createDescriptors() {
     throw std::runtime_error("Failed to create voxel DDA set layout");
   }
 
+  // Graphics set: mirrors voxel data + hit sampler + visible instances + depth snapshot.
+  VkDescriptorSetLayoutBinding gfxBindings[10]{};
+  gfxBindings[0].binding = 0;
+  gfxBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+  gfxBindings[0].descriptorCount = 1;
+  gfxBindings[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+
+  gfxBindings[1].binding = 1;
+  gfxBindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  gfxBindings[1].descriptorCount = 1;
+  gfxBindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+  gfxBindings[2].binding = 2;
+  gfxBindings[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+  gfxBindings[2].descriptorCount = 1;
+  gfxBindings[2].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+  gfxBindings[3].binding = 3;
+  gfxBindings[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  gfxBindings[3].descriptorCount = VoxelScene::kMaxBrickSlabs;
+  gfxBindings[3].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+  gfxBindings[4].binding = 4;
+  gfxBindings[4].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+  gfxBindings[4].descriptorCount = 1;
+  gfxBindings[4].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+  gfxBindings[5].binding = 5;
+  gfxBindings[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  gfxBindings[5].descriptorCount = 1;
+  gfxBindings[5].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+
+  gfxBindings[6].binding = 6;
+  gfxBindings[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  gfxBindings[6].descriptorCount = 1;
+  gfxBindings[6].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+  gfxBindings[7].binding = 7;
+  gfxBindings[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  gfxBindings[7].descriptorCount = 1;
+  gfxBindings[7].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+  gfxBindings[8].binding = 8;
+  gfxBindings[8].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  gfxBindings[8].descriptorCount = 1;
+  gfxBindings[8].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+
+  gfxBindings[9].binding = 9;
+  gfxBindings[9].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+  gfxBindings[9].descriptorCount = 1;
+  gfxBindings[9].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+  layoutInfo.bindingCount = 10;
+  layoutInfo.pBindings = gfxBindings;
+  if (vkCreateDescriptorSetLayout(gfx_.device(), &layoutInfo, nullptr, &gfxLayout_) != VK_SUCCESS) {
+    throw std::runtime_error("Failed to create voxel graphics set layout");
+  }
+
   VkDescriptorPoolSize poolSizes[] = {
-      {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, GfxDevice::kFramesInFlight},
+      {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, GfxDevice::kFramesInFlight * 2u},
       {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-       GfxDevice::kFramesInFlight * (3u + VoxelScene::kMaxBrickSlabs)},
+       GfxDevice::kFramesInFlight * (4u + VoxelScene::kMaxBrickSlabs + 5u + VoxelScene::kMaxBrickSlabs)},
       {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, GfxDevice::kFramesInFlight * 2u},
-      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-       GfxDevice::kFramesInFlight * (1u + VoxelScene::kGridTexCount)},
+      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, GfxDevice::kFramesInFlight * 4u},
   };
   VkDescriptorPoolCreateInfo poolInfo{};
   poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-  poolInfo.maxSets = GfxDevice::kFramesInFlight;
+  poolInfo.maxSets = GfxDevice::kFramesInFlight * 2u;
   poolInfo.poolSizeCount = static_cast<uint32_t>(std::size(poolSizes));
   poolInfo.pPoolSizes = poolSizes;
   if (vkCreateDescriptorPool(gfx_.device(), &poolInfo, nullptr, &descriptorPool_) != VK_SUCCESS) {
@@ -552,18 +654,71 @@ void VoxelRenderer::createOutputImage() {
   if (ext.width == 0 || ext.height == 0) {
     return;
   }
-  outImage_ = gfx_.createImage({ext.width, ext.height, 1}, kOutFormat,
-                               VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-                               VK_IMAGE_ASPECT_COLOR_BIT, true);
+  outImage_ = gfx_.createImage(
+      {ext.width, ext.height, 1}, kOutFormat,
+      VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+          VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+      VK_IMAGE_ASPECT_COLOR_BIT, true);
   const uint32_t beamW = std::max(1u, (ext.width + 7u) / 8u);
   const uint32_t beamH = std::max(1u, (ext.height + 7u) / 8u);
   beamImage_ = gfx_.createImage({beamW, beamH, 1}, kBeamFormat, VK_IMAGE_USAGE_STORAGE_BIT,
                                 VK_IMAGE_ASPECT_COLOR_BIT, true);
+  hitImage_ = gfx_.createImage(
+      {ext.width, ext.height, 1}, kHitFormat,
+      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+          VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+      VK_IMAGE_ASPECT_COLOR_BIT, true);
+  visibilityDepth_ = gfx_.createImage(
+      {ext.width, ext.height, 1}, kDepthFormat,
+      VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+          VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+      VK_IMAGE_ASPECT_DEPTH_BIT, true);
+  // Sampled reverse-Z copy for inter-batch occlusion (Phase 2). Prefer TRANSFER_DST+SAMPLED.
+  depthSnapshot_ = gfx_.createImage(
+      {ext.width, ext.height, 1}, kDepthFormat,
+      VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+      VK_IMAGE_ASPECT_DEPTH_BIT, true);
 }
 
 void VoxelRenderer::destroyOutputImage() {
   gfx_.destroyImage(outImage_);
   gfx_.destroyImage(beamImage_);
+  gfx_.destroyImage(hitImage_);
+  gfx_.destroyImage(visibilityDepth_);
+  gfx_.destroyImage(depthSnapshot_);
+}
+
+void VoxelRenderer::createCubeMesh() {
+  // Unit cube [0,1]^3, CCW when viewed from outside (+ outward normals).
+  const float verts[] = {
+      0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0,  // z=0
+      0, 0, 1, 1, 0, 1, 1, 1, 1, 0, 1, 1,  // z=1
+  };
+  const uint16_t indices[] = {
+      // -Z (front for CCW from -Z looking +Z? exterior of [0,1]^3)
+      0, 2, 1, 0, 3, 2,  // z=0 face, outward -Z: from outside looking +Z → CW of 0,1,2 is...
+      4, 5, 6, 4, 6, 7,  // z=1 +Z
+      0, 1, 5, 0, 5, 4,  // y=0 -Y
+      3, 7, 6, 3, 6, 2,  // y=1 +Y
+      0, 4, 7, 0, 7, 3,  // x=0 -X
+      1, 2, 6, 1, 6, 5,  // x=1 +X
+  };
+  cubeVbo_ = gfx_.createBuffer(sizeof(verts), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                               VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
+  cubeIbo_ = gfx_.createBuffer(sizeof(indices), VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                               VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
+  if (!cubeVbo_.info.pMappedData || !cubeIbo_.info.pMappedData) {
+    throw std::runtime_error("Failed to map cube mesh buffers");
+  }
+  std::memcpy(cubeVbo_.info.pMappedData, verts, sizeof(verts));
+  std::memcpy(cubeIbo_.info.pMappedData, indices, sizeof(indices));
+  vmaFlushAllocation(gfx_.allocator(), cubeVbo_.allocation, 0, sizeof(verts));
+  vmaFlushAllocation(gfx_.allocator(), cubeIbo_.allocation, 0, sizeof(indices));
+}
+
+void VoxelRenderer::destroyCubeMesh() {
+  gfx_.destroyBuffer(cubeVbo_);
+  gfx_.destroyBuffer(cubeIbo_);
 }
 
 VkPipeline VoxelRenderer::createComputePipeline(VkShaderModule shader, DdaSpec spec,
@@ -647,8 +802,19 @@ void VoxelRenderer::createPipelines() {
     throw std::runtime_error("Failed to create voxel DDA pipeline layout");
   }
 
+  layoutInfo.pSetLayouts = &gfxLayout_;
+  if (vkCreatePipelineLayout(gfx_.device(), &layoutInfo, nullptr, &gfxPipelineLayout_) !=
+      VK_SUCCESS) {
+    vkDestroyShaderModule(gfx_.device(), comp, nullptr);
+    throw std::runtime_error("Failed to create voxel graphics pipeline layout");
+  }
+
   VkShaderModule coarseMod = VK_NULL_HANDLE;
   VkShaderModule slimMod = VK_NULL_HANDLE;
+  VkShaderModule proxyVert = VK_NULL_HANDLE;
+  VkShaderModule visFrag = VK_NULL_HANDLE;
+  VkShaderModule fullscreenVert = VK_NULL_HANDLE;
+  VkShaderModule shadeFrag = VK_NULL_HANDLE;
   try {
     computePipeline_ = createComputePipeline(comp, DdaSpec{0u, 1u, 1u, 0u, 0u});
     specializedFullPipeline_ = createComputePipeline(comp, DdaSpec{0u, 1u, 1u, 1u, 0u, 8u});
@@ -659,7 +825,55 @@ void VoxelRenderer::createPipelines() {
     slimMod = gfx_.loadShaderModule(shaderDir + "/voxel_dda_slim.comp.spv");
     coarsePipeline_ = createComputePipeline(coarseMod, DdaSpec{}, false);
     slimPipeline_ = createComputePipeline(slimMod, DdaSpec{}, false);
+
+    proxyVert = gfx_.loadShaderModule(shaderDir + "/proxy_box.vert.spv");
+    visFrag = gfx_.loadShaderModule(shaderDir + "/visibility.frag.spv");
+    fullscreenVert = gfx_.loadShaderModule(shaderDir + "/fullscreen.vert.spv");
+    shadeFrag = gfx_.loadShaderModule(shaderDir + "/voxel_shade.frag.spv");
+
+    VkVertexInputBindingDescription vertBind{};
+    vertBind.binding = 0;
+    vertBind.stride = sizeof(float) * 3;
+    vertBind.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+    VkVertexInputAttributeDescription vertAttr{};
+    vertAttr.location = 0;
+    vertAttr.binding = 0;
+    vertAttr.format = VK_FORMAT_R32G32B32_SFLOAT;
+    vertAttr.offset = 0;
+
+    visibilityPipeline_ =
+        PipelineBuilder()
+            .setShaders(proxyVert, visFrag)
+            .setVertexInput(vertBind, {vertAttr})
+            .setCullMode(VK_CULL_MODE_FRONT_BIT, VK_FRONT_FACE_COUNTER_CLOCKWISE)
+            .setDepthTest(true, true, VK_COMPARE_OP_GREATER)
+            .setColorBlend(false)
+            .setColorFormat(kHitFormat)
+            .setDepthFormat(kDepthFormat)
+            .setLayout(gfxPipelineLayout_)
+            .build(gfx_.device());
+
+    shadePipeline_ = PipelineBuilder()
+                         .setShaders(fullscreenVert, shadeFrag)
+                         .setCullMode(VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE)
+                         .setDepthTest(false, false, VK_COMPARE_OP_ALWAYS)
+                         .setColorBlend(false)
+                         .setColorFormat(kOutFormat)
+                         .setLayout(gfxPipelineLayout_)
+                         .build(gfx_.device());
   } catch (...) {
+    if (shadeFrag) {
+      vkDestroyShaderModule(gfx_.device(), shadeFrag, nullptr);
+    }
+    if (fullscreenVert) {
+      vkDestroyShaderModule(gfx_.device(), fullscreenVert, nullptr);
+    }
+    if (visFrag) {
+      vkDestroyShaderModule(gfx_.device(), visFrag, nullptr);
+    }
+    if (proxyVert) {
+      vkDestroyShaderModule(gfx_.device(), proxyVert, nullptr);
+    }
     if (slimMod) {
       vkDestroyShaderModule(gfx_.device(), slimMod, nullptr);
     }
@@ -670,6 +884,18 @@ void VoxelRenderer::createPipelines() {
     throw;
   }
 
+  if (shadeFrag) {
+    vkDestroyShaderModule(gfx_.device(), shadeFrag, nullptr);
+  }
+  if (fullscreenVert) {
+    vkDestroyShaderModule(gfx_.device(), fullscreenVert, nullptr);
+  }
+  if (visFrag) {
+    vkDestroyShaderModule(gfx_.device(), visFrag, nullptr);
+  }
+  if (proxyVert) {
+    vkDestroyShaderModule(gfx_.device(), proxyVert, nullptr);
+  }
   if (slimMod) {
     vkDestroyShaderModule(gfx_.device(), slimMod, nullptr);
   }
@@ -680,31 +906,27 @@ void VoxelRenderer::createPipelines() {
 }
 
 void VoxelRenderer::updateDescriptors(VoxelScene& scene) {
-  if (outImage_.view == VK_NULL_HANDLE || scene.gridSampler() == VK_NULL_HANDLE ||
-      scene.dummyGridImage().view == VK_NULL_HANDLE ||
+  if (outImage_.view == VK_NULL_HANDLE || scene.coarsePoolBuffer().buffer == VK_NULL_HANDLE ||
       scene.dummyBrickSlabBuffer().buffer == VK_NULL_HANDLE ||
-      scene.objectBuffer().buffer == VK_NULL_HANDLE ||
+      scene.objectBuffer(0).buffer == VK_NULL_HANDLE ||
       scene.paletteBuffer().buffer == VK_NULL_HANDLE ||
       scene.occMipBuffer().buffer == VK_NULL_HANDLE || !scene.hasSky() ||
-      dummyBeamImage_.view == VK_NULL_HANDLE) {
+      dummyBeamImage_.view == VK_NULL_HANDLE || hitImage_.view == VK_NULL_HANDLE ||
+      depthSnapshot_.view == VK_NULL_HANDLE || hitSampler_ == VK_NULL_HANDLE) {
     return;
   }
 
   // All frame sets are rewritten together, only on infrequent resource changes.
   gfx_.waitIdle();
-  for (auto& frame : frames_) {
+  for (uint32_t fi = 0; fi < frames_.size(); ++fi) {
+    auto& frame = frames_[fi];
     VkDescriptorBufferInfo uboInfo{};
     uboInfo.buffer = frame.frameUBO.buffer;
     uboInfo.range = sizeof(VoxelDdaUBO);
 
-    VkDescriptorImageInfo gridInfos[VoxelScene::kGridTexCount]{};
-    for (uint32_t i = 0; i < VoxelScene::kGridTexCount; ++i) {
-      const AllocatedImage& img = scene.gridImage(i);
-      const VkImageView view = img.view != VK_NULL_HANDLE ? img.view : scene.dummyGridImage().view;
-      gridInfos[i].sampler = scene.gridSampler();
-      gridInfos[i].imageView = view;
-      gridInfos[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    }
+    VkDescriptorBufferInfo coarseInfo{};
+    coarseInfo.buffer = scene.coarsePoolBuffer().buffer;
+    coarseInfo.range = scene.coarsePoolBuffer().size;
 
     VkDescriptorImageInfo imageInfo{};
     imageInfo.imageView = outImage_.view;
@@ -726,9 +948,10 @@ void VoxelRenderer::updateDescriptors(VoxelScene& scene) {
     skyInfo.imageView = scene.sky().image.view;
     skyInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
+    const AllocatedBuffer& objectBuf = scene.objectBuffer(fi);
     VkDescriptorBufferInfo objectInfo{};
-    objectInfo.buffer = scene.objectBuffer().buffer;
-    objectInfo.range = scene.objectBuffer().size;
+    objectInfo.buffer = objectBuf.buffer;
+    objectInfo.range = objectBuf.size;
 
     VkDescriptorBufferInfo paletteInfo{};
     paletteInfo.buffer = scene.paletteBuffer().buffer;
@@ -754,9 +977,9 @@ void VoxelRenderer::updateDescriptors(VoxelScene& scene) {
     writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[1].dstSet = frame.frameSet;
     writes[1].dstBinding = 1;
-    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    writes[1].descriptorCount = VoxelScene::kGridTexCount;
-    writes[1].pImageInfo = gridInfos;
+    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[1].descriptorCount = 1;
+    writes[1].pBufferInfo = &coarseInfo;
 
     writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[2].dstSet = frame.frameSet;
@@ -808,24 +1031,91 @@ void VoxelRenderer::updateDescriptors(VoxelScene& scene) {
     writes[8].pImageInfo = &beamInfo;
 
     vkUpdateDescriptorSets(gfx_.device(), 9, writes, 0, nullptr);
+
+    VkDescriptorBufferInfo gfxUboInfo{};
+    gfxUboInfo.buffer = frame.gfxUBO.buffer;
+    gfxUboInfo.range = sizeof(VoxelGfxUBO);
+
+    VkDescriptorImageInfo hitInfo{};
+    hitInfo.sampler = hitSampler_;
+    hitInfo.imageView = hitImage_.view;
+    hitInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+    VkDescriptorBufferInfo visibleInfo{};
+    visibleInfo.buffer = frame.visibleInstances.buffer != VK_NULL_HANDLE
+                             ? frame.visibleInstances.buffer
+                             : dummyVisibleInstances_.buffer;
+    visibleInfo.range = frame.visibleInstances.buffer != VK_NULL_HANDLE
+                            ? frame.visibleInstances.size
+                            : dummyVisibleInstances_.size;
+
+    VkDescriptorImageInfo depthSnapInfo{};
+    depthSnapInfo.sampler = hitSampler_;
+    depthSnapInfo.imageView = depthSnapshot_.view;
+    depthSnapInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+    VkWriteDescriptorSet gfxWrites[10]{};
+    gfxWrites[0] = writes[0];
+    gfxWrites[0].dstSet = frame.gfxSet;
+    gfxWrites[0].pBufferInfo = &gfxUboInfo;
+
+    gfxWrites[1] = writes[1];
+    gfxWrites[1].dstSet = frame.gfxSet;
+
+    gfxWrites[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    gfxWrites[2].dstSet = frame.gfxSet;
+    gfxWrites[2].dstBinding = 2;
+    gfxWrites[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    gfxWrites[2].descriptorCount = 1;
+    gfxWrites[2].pImageInfo = &hitInfo;
+
+    gfxWrites[3] = writes[3];
+    gfxWrites[3].dstSet = frame.gfxSet;
+
+    gfxWrites[4] = writes[4];
+    gfxWrites[4].dstSet = frame.gfxSet;
+
+    gfxWrites[5] = writes[5];
+    gfxWrites[5].dstSet = frame.gfxSet;
+
+    gfxWrites[6] = writes[6];
+    gfxWrites[6].dstSet = frame.gfxSet;
+
+    gfxWrites[7] = writes[7];
+    gfxWrites[7].dstSet = frame.gfxSet;
+
+    gfxWrites[8].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    gfxWrites[8].dstSet = frame.gfxSet;
+    gfxWrites[8].dstBinding = 8;
+    gfxWrites[8].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    gfxWrites[8].descriptorCount = 1;
+    gfxWrites[8].pBufferInfo = &visibleInfo;
+
+    gfxWrites[9].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    gfxWrites[9].dstSet = frame.gfxSet;
+    gfxWrites[9].dstBinding = 9;
+    gfxWrites[9].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    gfxWrites[9].descriptorCount = 1;
+    gfxWrites[9].pImageInfo = &depthSnapInfo;
+
+    vkUpdateDescriptorSets(gfx_.device(), 10, gfxWrites, 0, nullptr);
   }
 
-  boundGridSampler_ = scene.gridSampler();
-  boundGridViews_.fill(VK_NULL_HANDLE);
-  for (uint32_t i = 0; i < VoxelScene::kGridTexCount; ++i) {
-    const AllocatedImage& img = scene.gridImage(i);
-    boundGridViews_[i] = img.view != VK_NULL_HANDLE ? img.view : scene.dummyGridImage().view;
-  }
+  boundCoarsePoolBuffer_ = scene.coarsePoolBuffer().buffer;
   boundBrickSlabCount_ = scene.brickSlabCount();
   boundBrickSlabs_.fill(VK_NULL_HANDLE);
   for (uint32_t i = 0; i < boundBrickSlabCount_; ++i) {
     boundBrickSlabs_[i] = scene.brickSlabBuffer(i).buffer;
   }
-  boundObjectBuffer_ = scene.objectBuffer().buffer;
+  for (uint32_t i = 0; i < GfxDevice::kFramesInFlight; ++i) {
+    boundObjectBuffers_[i] = scene.objectBuffer(i).buffer;
+  }
   boundPaletteBuffer_ = scene.paletteBuffer().buffer;
   boundOccMipBuffer_ = scene.occMipBuffer().buffer;
   boundSkyView_ = scene.sky().image.view;
   boundBeamView_ = beamImage_.view != VK_NULL_HANDLE ? beamImage_.view : dummyBeamImage_.view;
+  boundHitView_ = hitImage_.view;
+  boundDepthSnapshotView_ = depthSnapshot_.view;
 }
 
 void VoxelRenderer::updateFrameUBO(VoxelScene& scene, uint32_t frameIndex) {
@@ -871,6 +1161,177 @@ void VoxelRenderer::updateFrameUBO(VoxelScene& scene, uint32_t frameIndex) {
   }
 }
 
+void VoxelRenderer::updateGfxUBO(VoxelScene& scene, uint32_t frameIndex, uint32_t width,
+                                 uint32_t height) {
+  const glm::mat4 view = scene.camera().view();
+  const glm::mat4 proj = scene.camera().proj();
+  const glm::mat4 viewProj = proj * view;
+
+  VoxelGfxUBO ubo{};
+  writeMat4(ubo.invView, glm::inverse(view));
+  writeMat4(ubo.invProj, glm::inverse(proj));
+  writeMat4(ubo.viewProj, viewProj);
+  writeVec3(ubo.cameraPos, scene.camera().position());
+  ubo.pad0 = 0.0f;
+  writeVec3(ubo.lightDir, glm::normalize(scene.lightDir()));
+  ubo.ambient = scene.ambient();
+  ubo.projX = proj[0][0];
+  ubo.projY = proj[1][1];
+  ubo.maxSteps = scene.maxSteps();
+  ubo.renderMode = static_cast<uint32_t>(std::max(0, scene.renderMode()));
+  writeVec3(ubo.skyColor, scene.skyColor());
+  ubo.traceStage = static_cast<uint32_t>(std::clamp(traceStage_, 0, 5));
+  ubo.aoStrength = scene.aoStrength();
+  ubo.aoPower = scene.aoPower();
+  ubo.skyYaw = scene.skyYaw();
+  ubo.skyIntensity = scene.skyIntensity();
+  ubo.useSky = (scene.showSky() && scene.hasSky()) ? 1u : 0u;
+  ubo.objectCount = scene.objectCount();
+  ubo.solidColor = scene.solidColorOutput() ? 1u : 0u;
+  ubo.dirMaskCoarse = dirMaskCoarse_ ? 1u : 0u;
+  ubo.brickBitSkip = brickBitSkip_ ? 1u : 0u;
+  ubo.beamSkip = 0u;
+  ubo.beamMargin = 0.0f;
+  ubo.dirMaskBrick = dirMaskBrick_ ? 1u : 0u;
+  writeVec3(ubo.solidRgb, scene.solidColor());
+  ubo.screenWidth = width;
+  ubo.screenHeight = height;
+  ubo.depthSnapshotEnabled = (boxFragmentPath_ && snapshotBatchCount_ > 0) ? 1u : 0u;
+  ubo.depthOcclusionMargin = std::max(0.0f, depthOcclusionMargin_);
+  ubo.padGfx0 = 0;
+
+  void* mapped = frames_[frameIndex].gfxUBO.info.pMappedData;
+  if (!mapped) {
+    throw std::runtime_error("Voxel graphics UBO is not host-mapped");
+  }
+  std::memcpy(mapped, &ubo, sizeof(ubo));
+  if (vmaFlushAllocation(gfx_.allocator(), frames_[frameIndex].gfxUBO.allocation, 0,
+                         sizeof(ubo)) != VK_SUCCESS) {
+    throw std::runtime_error("Failed to flush voxel graphics UBO");
+  }
+}
+
+void VoxelRenderer::buildVisibleInstances(VoxelScene& scene, uint32_t frameIndex) {
+  const std::vector<GpuVoxelObject>& objects = scene.gpuObjects();
+  const glm::mat4 view = scene.camera().view();
+  const glm::mat4 proj = scene.camera().proj();
+  const glm::mat4 viewProj = proj * view;
+  const glm::vec3 cam = scene.camera().position();
+  const float nearZ = scene.camera().nearZ();
+
+  // Extract frustum planes from viewProj (row-vector clip: plane.xyz · p + w >= 0 inside).
+  auto row = [&](int r) {
+    return glm::vec4(viewProj[0][r], viewProj[1][r], viewProj[2][r], viewProj[3][r]);
+  };
+  const glm::vec4 planes[6] = {
+      row(3) + row(0), row(3) - row(0), row(3) + row(1),
+      row(3) - row(1), row(3) + row(2), row(3) - row(2),
+  };
+
+  struct Item {
+    VisibleInstance inst;
+    float sortKey = 0.0f;
+  };
+  std::vector<Item> boxes;
+  std::vector<Item> specials;
+  boxes.reserve(objects.size());
+  specials.reserve(objects.size());
+
+  for (uint32_t i = 0; i < objects.size(); ++i) {
+    const GpuVoxelObject& g = objects[i];
+    if ((g.flags & VoxelObject::kFlagEnabled) == 0) {
+      continue;
+    }
+    if (!(g.occMax[0] > g.occMin[0] && g.occMax[1] > g.occMin[1] && g.occMax[2] > g.occMin[2])) {
+      continue;
+    }
+
+    const glm::mat4 objectToWorld = glm::make_mat4(g.objectToWorld);
+    glm::vec3 worldMin(std::numeric_limits<float>::max());
+    glm::vec3 worldMax(std::numeric_limits<float>::lowest());
+    glm::vec3 viewMin(std::numeric_limits<float>::max());
+    glm::vec3 viewMax(std::numeric_limits<float>::lowest());
+    for (int c = 0; c < 8; ++c) {
+      const glm::vec3 localVoxel(c & 1 ? g.occMax[0] : g.occMin[0], c & 2 ? g.occMax[1] : g.occMin[1],
+                                 c & 4 ? g.occMax[2] : g.occMin[2]);
+      const glm::vec3 world =
+          glm::vec3(objectToWorld * glm::vec4(localVoxel * g.voxelSize, 1.0f));
+      worldMin = glm::min(worldMin, world);
+      worldMax = glm::max(worldMax, world);
+      const glm::vec3 viewP = glm::vec3(view * glm::vec4(world, 1.0f));
+      viewMin = glm::min(viewMin, viewP);
+      viewMax = glm::max(viewMax, viewP);
+    }
+
+    bool outside = false;
+    for (const glm::vec4& plane : planes) {
+      float maxDist = -std::numeric_limits<float>::max();
+      for (int c = 0; c < 8; ++c) {
+        const glm::vec3 p(c & 1 ? worldMax.x : worldMin.x, c & 2 ? worldMax.y : worldMin.y,
+                          c & 4 ? worldMax.z : worldMin.z);
+        maxDist = std::max(maxDist, glm::dot(glm::vec3(plane), p) + plane.w);
+      }
+      if (maxDist < 0.0f) {
+        outside = true;
+        break;
+      }
+    }
+    if (outside) {
+      continue;
+    }
+
+    const bool camInside =
+        cam.x >= worldMin.x && cam.x <= worldMax.x && cam.y >= worldMin.y && cam.y <= worldMax.y &&
+        cam.z >= worldMin.z && cam.z <= worldMax.z;
+    // View-space -Z forward: near plane at z = -nearZ. Intersects if AABB straddles it.
+    const bool nearIntersect =
+        viewMin.z <= -nearZ && viewMax.z >= -nearZ * 0.999f;
+    const bool behindAndFront = viewMax.z >= 0.0f && viewMin.z < -nearZ;
+
+    Item item;
+    item.inst.objectGpuIndex = i;
+    item.inst.flags = (camInside || nearIntersect || behindAndFront) ? 1u : 0u;
+    const glm::vec3 nearest = glm::clamp(cam, worldMin, worldMax);
+    item.sortKey = glm::dot(nearest - cam, nearest - cam);
+
+    if (item.inst.flags & 1u) {
+      specials.push_back(item);
+    } else {
+      boxes.push_back(item);
+    }
+  }
+
+  auto byNear = [](const Item& a, const Item& b) { return a.sortKey < b.sortKey; };
+  std::sort(boxes.begin(), boxes.end(), byNear);
+  std::sort(specials.begin(), specials.end(), byNear);
+
+  std::vector<VisibleInstance> upload;
+  upload.reserve(boxes.size() + specials.size());
+  for (const Item& it : boxes) {
+    upload.push_back(it.inst);
+  }
+  for (const Item& it : specials) {
+    upload.push_back(it.inst);
+  }
+  boxInstanceCount_ = static_cast<uint32_t>(boxes.size());
+  specialInstanceCount_ = static_cast<uint32_t>(specials.size());
+
+  AllocatedBuffer& buf = frames_[frameIndex].visibleInstances;
+  const VkDeviceSize need = sizeof(VisibleInstance) * std::max<size_t>(upload.size(), 1);
+  if (buf.buffer == VK_NULL_HANDLE || buf.size < need) {
+    gfx_.waitIdle();
+    gfx_.destroyBuffer(buf);
+    buf = gfx_.createBuffer(need, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                            VMA_MEMORY_USAGE_AUTO_PREFER_HOST);
+    boundCoarsePoolBuffer_ = VK_NULL_HANDLE;  // force descriptor refresh
+  }
+  if (!upload.empty() && buf.info.pMappedData) {
+    std::memcpy(buf.info.pMappedData, upload.data(), sizeof(VisibleInstance) * upload.size());
+    vmaFlushAllocation(gfx_.allocator(), buf.allocation, 0,
+                       sizeof(VisibleInstance) * upload.size());
+  }
+}
+
 bool VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
   displayFps_ = displayFps;
 
@@ -894,7 +1355,7 @@ bool VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
       scene.rebuildVoxels(gfx_);
     }
     importRequested_ = removeImportRequested_ = rebuildRequested_ = false;
-    boundGridSampler_ = VK_NULL_HANDLE;
+    boundCoarsePoolBuffer_ = VK_NULL_HANDLE;
   }
 
   if (gfx_.swapchainWasRecreated()) {
@@ -905,22 +1366,19 @@ bool VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
   if (outImage_.image == VK_NULL_HANDLE) {
     createOutputImage();
   }
-  scene.uploadObjectTransforms(gfx_);
   bool brickSlabsChanged = scene.brickSlabCount() != boundBrickSlabCount_;
   for (uint32_t i = 0; i < scene.brickSlabCount() && !brickSlabsChanged; ++i) {
     brickSlabsChanged = scene.brickSlabBuffer(i).buffer != boundBrickSlabs_[i];
   }
-  bool gridsChanged = scene.gridSampler() != boundGridSampler_;
-  for (uint32_t i = 0; i < VoxelScene::kGridTexCount && !gridsChanged; ++i) {
-    const AllocatedImage& img = scene.gridImage(i);
-    const VkImageView view = img.view != VK_NULL_HANDLE ? img.view : scene.dummyGridImage().view;
-    gridsChanged = view != boundGridViews_[i];
+  bool objectBuffersChanged = false;
+  for (uint32_t i = 0; i < GfxDevice::kFramesInFlight && !objectBuffersChanged; ++i) {
+    objectBuffersChanged = scene.objectBuffer(i).buffer != boundObjectBuffers_[i];
   }
-  if (gridsChanged || brickSlabsChanged ||
-      scene.objectBuffer().buffer != boundObjectBuffer_ ||
-      scene.paletteBuffer().buffer != boundPaletteBuffer_ ||
+  if (scene.coarsePoolBuffer().buffer != boundCoarsePoolBuffer_ || brickSlabsChanged ||
+      objectBuffersChanged || scene.paletteBuffer().buffer != boundPaletteBuffer_ ||
       scene.occMipBuffer().buffer != boundOccMipBuffer_ ||
       scene.sky().image.view != boundSkyView_ || outImage_.view == VK_NULL_HANDLE ||
+      hitImage_.view != boundHitView_ || depthSnapshot_.view != boundDepthSnapshotView_ ||
       (beamImage_.view != VK_NULL_HANDLE ? beamImage_.view : dummyBeamImage_.view) !=
           boundBeamView_) {
     updateDescriptors(scene);
@@ -931,102 +1389,324 @@ bool VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
     return false;
   }
 
-  if (outImage_.image == VK_NULL_HANDLE || scene.gridSampler() == VK_NULL_HANDLE ||
-      scene.gridImage(0).view == VK_NULL_HANDLE ||
-      scene.objectBuffer().buffer == VK_NULL_HANDLE) {
+  if (outImage_.image == VK_NULL_HANDLE || scene.coarsePoolBuffer().buffer == VK_NULL_HANDLE ||
+      scene.objectBuffer(frame.frameIndex).buffer == VK_NULL_HANDLE) {
     gfx_.endFrame(frame);
     return false;
   }
 
+  scene.uploadObjectTransforms(gfx_, frame.frameIndex);
   collectGpuTiming(frame.frameIndex);
   updateFrameUBO(scene, frame.frameIndex);
+  updateGfxUBO(scene, frame.frameIndex, frame.extent.width, frame.extent.height);
+  if (boxFragmentPath_) {
+    buildVisibleInstances(scene, frame.frameIndex);
+    if (boundCoarsePoolBuffer_ == VK_NULL_HANDLE) {
+      updateDescriptors(scene);
+    }
+  }
   VkDescriptorSet frameSet = frames_[frame.frameIndex].frameSet;
+  VkDescriptorSet gfxSet = frames_[frame.frameIndex].gfxSet;
 
   const uint32_t tsBase = frame.frameIndex * kTsPerFrame;
   if (timestampPool_) {
     vkCmdResetQueryPool(frame.cmd, timestampPool_, tsBase, kTsPerFrame);
   }
 
-  // Images are shared across frame slots. Order the previous blit/main reads before reuse;
-  // unchanged scenes no longer implicitly drain the queue through a transform upload.
-  gfx_.transitionImage(frame.cmd, outImage_.image, outImage_.layout,
-                       VK_IMAGE_LAYOUT_GENERAL,
-                       outImage_.layout == VK_IMAGE_LAYOUT_UNDEFINED
-                           ? VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_2_TRANSFER_BIT,
-                       outImage_.layout == VK_IMAGE_LAYOUT_UNDEFINED ? 0 : VK_ACCESS_2_TRANSFER_READ_BIT,
-                       VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT);
-  if (beamImage_.image && (beamSkip_ || beamImage_.layout == VK_IMAGE_LAYOUT_UNDEFINED)) {
-    gfx_.transitionImage(frame.cmd, beamImage_.image, beamImage_.layout, VK_IMAGE_LAYOUT_GENERAL,
-                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                          VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT,
-                          VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                          VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT);
-  }
+  VkViewport vp{0, 0, static_cast<float>(frame.extent.width),
+                static_cast<float>(frame.extent.height), 0, 1};
+  VkRect2D scissor{{0, 0}, frame.extent};
 
-  // Start at compute, after reuse dependencies, not at TOP while the previous frame runs.
-  if (timestampPool_) {
-    writeTimestamp(frame.cmd, tsBase + kTsFrameBegin, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
-  }
-
-  vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_, 0, 1,
-                          &frameSet, 0, nullptr);
-
-  if (beamSkip_ && traceStage_ < kStageCoarse && scene.nestedMicroVoxels() &&
-      beamPipeline_ && beamImage_.image != VK_NULL_HANDLE) {
-    vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, beamPipeline_);
-    const uint32_t beamX = (beamImage_.extent.width + 7u) / 8u;
-    const uint32_t beamY = (beamImage_.extent.height + 7u) / 8u;
-    vkCmdDispatch(frame.cmd, beamX, beamY, 1);
-    gfx_.transitionImage(frame.cmd, beamImage_.image, VK_IMAGE_LAYOUT_GENERAL,
-                         VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                         VK_ACCESS_2_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                         VK_ACCESS_2_SHADER_READ_BIT);
-  }
-
-  if (timestampPool_) {
-    writeTimestamp(frame.cmd, tsBase + kTsAfterBeam, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
-  }
-
-  VkPipeline ddaPipe = computePipeline_;
-  activeKernelName_ = "FULL generic";
-  if (traceStage_ >= kStageCoarse) {
-    ddaPipe = coarsePipeline_;
-    activeKernelName_ = "COARSE";
-  } else if (!scene.nestedMicroVoxels()) {
-    ddaPipe = (traceStage_ >= kStageNoShade) ? coarsePipeline_ : slimPipeline_;
-    activeKernelName_ = (traceStage_ >= kStageNoShade) ? "COARSE" : "SLIM shaded";
-  } else if (!forceGenericShader_ && traceStage_ == kStageFull && scene.renderMode() == 0 &&
-             !scene.solidColorOutput()) {
-    if (scene.objectCount() == 1 &&
-        (scene.objectFlags(0) & (VoxelObject::kFlagNestedMicro | VoxelObject::kFlagNestedFine)) ==
-            (VoxelObject::kFlagNestedMicro | VoxelObject::kFlagNestedFine)) {
-      const bool colored = (scene.objectFlags(0) & VoxelObject::kFlagImportPalette) != 0;
-      ddaPipe = colored ? specializedColorPipeline_ : specializedSinglePipeline_;
-      activeKernelName_ = colored ? "FULL specialized (fine, sampled color)" : "FULL specialized (fine)";
-    } else {
-      ddaPipe = specializedFullPipeline_;
-      activeKernelName_ = "FULL specialized (shaded, dynamic object count)";
+  if (boxFragmentPath_ && visibilityPipeline_ && shadePipeline_) {
+    activeKernelName_ = "Box Fragment DDA";
+    if (timestampPool_) {
+      writeTimestamp(frame.cmd, tsBase + kTsFrameBegin, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT);
+      writeTimestamp(frame.cmd, tsBase + kTsAfterBeam, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT);
     }
-  }
-  if (benchmark_ && submittedFrames_ == 0) {
-    std::cout << "DDA kernel: " << activeKernelName_
-              << " generic_override=" << forceGenericShader_ << std::endl;
-  }
-  vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ddaPipe);
-  const uint32_t groupsX = (frame.extent.width + 7u) / 8u;
-  const uint32_t groupHeight = 8u;
-  const uint32_t groupsY = (frame.extent.height + groupHeight - 1u) / groupHeight;
-  vkCmdDispatch(frame.cmd, groupsX, groupsY, 1);
 
-  if (timestampPool_) {
-    writeTimestamp(frame.cmd, tsBase + kTsAfterCompute, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
-  }
+    gfx_.transitionImage(frame.cmd, hitImage_.image, hitImage_.layout,
+                         VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                         hitImage_.layout == VK_IMAGE_LAYOUT_UNDEFINED
+                             ? VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT
+                             : VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                         hitImage_.layout == VK_IMAGE_LAYOUT_UNDEFINED
+                             ? 0
+                             : VK_ACCESS_2_SHADER_READ_BIT,
+                         VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+    gfx_.transitionImage(frame.cmd, visibilityDepth_.image, visibilityDepth_.layout,
+                         VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                         visibilityDepth_.layout == VK_IMAGE_LAYOUT_UNDEFINED
+                             ? VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT
+                             : VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                         visibilityDepth_.layout == VK_IMAGE_LAYOUT_UNDEFINED
+                             ? 0
+                             : VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                         VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                             VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                         VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                             VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT,
+                         VK_IMAGE_ASPECT_DEPTH_BIT);
 
-  // Blit compute output into the swapchain.
-  gfx_.transitionImage(frame.cmd, outImage_.image, VK_IMAGE_LAYOUT_GENERAL,
-                       VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                       VK_ACCESS_2_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
-                       VK_ACCESS_2_TRANSFER_READ_BIT);
+    const uint32_t batchCount =
+        (snapshotBatchCount_ > 0) ? static_cast<uint32_t>(snapshotBatchCount_) : 1u;
+    const bool useSnapshots = snapshotBatchCount_ > 0 && depthSnapshot_.image != VK_NULL_HANDLE;
+
+    // Clear snapshot to reverse-Z far (0) so batch 0 samples "no occluder".
+    if (useSnapshots) {
+      gfx_.transitionImage(frame.cmd, depthSnapshot_.image, depthSnapshot_.layout,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                           depthSnapshot_.layout == VK_IMAGE_LAYOUT_UNDEFINED
+                               ? VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT
+                               : VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                           depthSnapshot_.layout == VK_IMAGE_LAYOUT_UNDEFINED
+                               ? 0
+                               : VK_ACCESS_2_SHADER_READ_BIT,
+                           VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                           VK_IMAGE_ASPECT_DEPTH_BIT);
+      VkClearDepthStencilValue clearDs{0.0f, 0};
+      VkImageSubresourceRange clearRange{};
+      clearRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+      clearRange.levelCount = 1;
+      clearRange.layerCount = 1;
+      vkCmdClearDepthStencilImage(frame.cmd, depthSnapshot_.image,
+                                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clearDs, 1, &clearRange);
+      gfx_.transitionImage(frame.cmd, depthSnapshot_.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                           VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                           VK_ACCESS_2_SHADER_READ_BIT, VK_IMAGE_ASPECT_DEPTH_BIT);
+      depthSnapshot_.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    }
+
+    VkClearValue hitClear{};
+    hitClear.color.uint32[0] = hitClear.color.uint32[1] = hitClear.color.uint32[2] =
+        hitClear.color.uint32[3] = 0;
+    VkClearValue depthClear{};
+    depthClear.depthStencil = {0.0f, 0};
+
+    VkBuffer vb = cubeVbo_.buffer;
+    VkDeviceSize vbOffset = 0;
+
+    for (uint32_t batch = 0; batch < batchCount; ++batch) {
+      const uint32_t boxBase = boxInstanceCount_ / batchCount;
+      const uint32_t boxRem = boxInstanceCount_ % batchCount;
+      const uint32_t boxStart = batch * boxBase + std::min(batch, boxRem);
+      const uint32_t boxCount = boxBase + (batch < boxRem ? 1u : 0u);
+
+      VkRenderingAttachmentInfo hitAttach{};
+      hitAttach.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+      hitAttach.imageView = hitImage_.view;
+      hitAttach.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+      hitAttach.loadOp =
+          (batch == 0) ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+      hitAttach.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+      hitAttach.clearValue = hitClear;
+
+      VkRenderingAttachmentInfo depthAttach{};
+      depthAttach.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+      depthAttach.imageView = visibilityDepth_.view;
+      depthAttach.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+      depthAttach.loadOp =
+          (batch == 0) ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+      depthAttach.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+      depthAttach.clearValue = depthClear;
+
+      VkRenderingInfo visInfo{};
+      visInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+      visInfo.renderArea.extent = frame.extent;
+      visInfo.layerCount = 1;
+      visInfo.colorAttachmentCount = 1;
+      visInfo.pColorAttachments = &hitAttach;
+      visInfo.pDepthAttachment = &depthAttach;
+      vkCmdBeginRendering(frame.cmd, &visInfo);
+      vkCmdSetViewport(frame.cmd, 0, 1, &vp);
+      vkCmdSetScissor(frame.cmd, 0, 1, &scissor);
+      vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, gfxPipelineLayout_, 0, 1,
+                              &gfxSet, 0, nullptr);
+      vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, visibilityPipeline_);
+      vkCmdBindVertexBuffers(frame.cmd, 0, 1, &vb, &vbOffset);
+      vkCmdBindIndexBuffer(frame.cmd, cubeIbo_.buffer, 0, VK_INDEX_TYPE_UINT16);
+
+      // Specials (near-clip / in-box) in batch 0 so they establish depth early.
+      if (batch == 0 && specialInstanceCount_ > 0) {
+        vkCmdDraw(frame.cmd, 3, specialInstanceCount_, 0, boxInstanceCount_);
+      }
+      if (boxCount > 0) {
+        vkCmdDrawIndexed(frame.cmd, 36, boxCount, 0, 0, boxStart);
+      }
+      vkCmdEndRendering(frame.cmd);
+
+      if (useSnapshots && batch + 1u < batchCount) {
+        gfx_.transitionImage(frame.cmd, visibilityDepth_.image,
+                             VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                             VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                             VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                             VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                             VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+                             VK_IMAGE_ASPECT_DEPTH_BIT);
+        gfx_.transitionImage(frame.cmd, depthSnapshot_.image,
+                             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                             VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT,
+                             VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                             VK_IMAGE_ASPECT_DEPTH_BIT);
+
+        VkImageCopy copy{};
+        copy.srcSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+        copy.srcSubresource.layerCount = 1;
+        copy.dstSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+        copy.dstSubresource.layerCount = 1;
+        copy.extent = {frame.extent.width, frame.extent.height, 1};
+        vkCmdCopyImage(frame.cmd, visibilityDepth_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       depthSnapshot_.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+
+        gfx_.transitionImage(frame.cmd, depthSnapshot_.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                             VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                             VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT,
+                             VK_IMAGE_ASPECT_DEPTH_BIT);
+        gfx_.transitionImage(frame.cmd, visibilityDepth_.image,
+                             VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                             VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                             VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+                             VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                                 VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                             VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                                 VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT,
+                             VK_IMAGE_ASPECT_DEPTH_BIT);
+        depthSnapshot_.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        visibilityDepth_.layout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+      }
+    }
+
+    gfx_.transitionImage(frame.cmd, hitImage_.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                         VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                         VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT);
+    gfx_.transitionImage(
+        frame.cmd, outImage_.image, outImage_.layout, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        outImage_.layout == VK_IMAGE_LAYOUT_UNDEFINED ? VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT
+                                                      : VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+        outImage_.layout == VK_IMAGE_LAYOUT_UNDEFINED ? 0 : VK_ACCESS_2_TRANSFER_READ_BIT,
+        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+
+    VkRenderingAttachmentInfo colorAttach{};
+    colorAttach.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    colorAttach.imageView = outImage_.view;
+    colorAttach.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    colorAttach.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    colorAttach.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+
+    VkRenderingInfo shadeInfo{};
+    shadeInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+    shadeInfo.renderArea.extent = frame.extent;
+    shadeInfo.layerCount = 1;
+    shadeInfo.colorAttachmentCount = 1;
+    shadeInfo.pColorAttachments = &colorAttach;
+    vkCmdBeginRendering(frame.cmd, &shadeInfo);
+    vkCmdSetViewport(frame.cmd, 0, 1, &vp);
+    vkCmdSetScissor(frame.cmd, 0, 1, &scissor);
+    vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, gfxPipelineLayout_, 0, 1,
+                            &gfxSet, 0, nullptr);
+    vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, shadePipeline_);
+    vkCmdDraw(frame.cmd, 3, 1, 0, 0);
+    vkCmdEndRendering(frame.cmd);
+
+    if (timestampPool_) {
+      writeTimestamp(frame.cmd, tsBase + kTsAfterCompute,
+                     VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT);
+    }
+
+    gfx_.transitionImage(frame.cmd, outImage_.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                         VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                         VK_ACCESS_2_TRANSFER_READ_BIT);
+    hitImage_.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    visibilityDepth_.layout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+  } else {
+    // Images are shared across frame slots. Order the previous blit/main reads before reuse.
+    gfx_.transitionImage(frame.cmd, outImage_.image, outImage_.layout, VK_IMAGE_LAYOUT_GENERAL,
+                         outImage_.layout == VK_IMAGE_LAYOUT_UNDEFINED
+                             ? VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT
+                             : VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                         outImage_.layout == VK_IMAGE_LAYOUT_UNDEFINED ? 0
+                                                                      : VK_ACCESS_2_TRANSFER_READ_BIT,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT);
+    if (beamImage_.image && (beamSkip_ || beamImage_.layout == VK_IMAGE_LAYOUT_UNDEFINED)) {
+      gfx_.transitionImage(frame.cmd, beamImage_.image, beamImage_.layout, VK_IMAGE_LAYOUT_GENERAL,
+                           VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                           VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT,
+                           VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                           VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT);
+    }
+
+    if (timestampPool_) {
+      writeTimestamp(frame.cmd, tsBase + kTsFrameBegin, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+    }
+
+    vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_, 0, 1,
+                            &frameSet, 0, nullptr);
+
+    if (beamSkip_ && traceStage_ < kStageCoarse && scene.nestedMicroVoxels() && beamPipeline_ &&
+        beamImage_.image != VK_NULL_HANDLE) {
+      vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, beamPipeline_);
+      const uint32_t beamX = (beamImage_.extent.width + 7u) / 8u;
+      const uint32_t beamY = (beamImage_.extent.height + 7u) / 8u;
+      vkCmdDispatch(frame.cmd, beamX, beamY, 1);
+      gfx_.transitionImage(frame.cmd, beamImage_.image, VK_IMAGE_LAYOUT_GENERAL,
+                           VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                           VK_ACCESS_2_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                           VK_ACCESS_2_SHADER_READ_BIT);
+    }
+
+    if (timestampPool_) {
+      writeTimestamp(frame.cmd, tsBase + kTsAfterBeam, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+    }
+
+    VkPipeline ddaPipe = computePipeline_;
+    activeKernelName_ = "FULL generic";
+    if (traceStage_ >= kStageCoarse) {
+      ddaPipe = coarsePipeline_;
+      activeKernelName_ = "COARSE";
+    } else if (!scene.nestedMicroVoxels()) {
+      ddaPipe = (traceStage_ >= kStageNoShade) ? coarsePipeline_ : slimPipeline_;
+      activeKernelName_ = (traceStage_ >= kStageNoShade) ? "COARSE" : "SLIM shaded";
+    } else if (!forceGenericShader_ && traceStage_ == kStageFull && scene.renderMode() == 0 &&
+               !scene.solidColorOutput()) {
+      if (scene.objectCount() == 1 &&
+          (scene.objectFlags(0) & (VoxelObject::kFlagNestedMicro | VoxelObject::kFlagNestedFine)) ==
+              (VoxelObject::kFlagNestedMicro | VoxelObject::kFlagNestedFine)) {
+        const bool colored = (scene.objectFlags(0) & VoxelObject::kFlagImportPalette) != 0;
+        ddaPipe = colored ? specializedColorPipeline_ : specializedSinglePipeline_;
+        activeKernelName_ =
+            colored ? "FULL specialized (fine, sampled color)" : "FULL specialized (fine)";
+      } else {
+        ddaPipe = specializedFullPipeline_;
+        activeKernelName_ = "FULL specialized (shaded, dynamic object count)";
+      }
+    }
+    if (benchmark_ && submittedFrames_ == 0) {
+      std::cout << "DDA kernel: " << activeKernelName_
+                << " generic_override=" << forceGenericShader_ << std::endl;
+    }
+    vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ddaPipe);
+    const uint32_t groupsX = (frame.extent.width + 7u) / 8u;
+    const uint32_t groupHeight = 8u;
+    const uint32_t groupsY = (frame.extent.height + groupHeight - 1u) / groupHeight;
+    vkCmdDispatch(frame.cmd, groupsX, groupsY, 1);
+
+    if (timestampPool_) {
+      writeTimestamp(frame.cmd, tsBase + kTsAfterCompute, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+    }
+
+    gfx_.transitionImage(frame.cmd, outImage_.image, VK_IMAGE_LAYOUT_GENERAL,
+                         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
+                         VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+  }
 
   gfx_.transitionImage(frame.cmd, frame.swapchainImage, VK_IMAGE_LAYOUT_UNDEFINED,
                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_TRANSFER_BIT, 0,
@@ -1056,10 +1736,6 @@ bool VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
                        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
                        VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
                        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT);
-
-  VkViewport vp{0, 0, static_cast<float>(frame.extent.width),
-                static_cast<float>(frame.extent.height), 0, 1};
-  VkRect2D scissor{{0, 0}, frame.extent};
 
   VkRenderingAttachmentInfo uiAttach{};
   uiAttach.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
@@ -1202,12 +1878,46 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
   ImGui::Text("GPU total:   %.2f ms  (%.0f FPS)", gpuFrameMs_,
               gpuFrameMs_ > 1e-3f ? 1000.0f / gpuFrameMs_ : 0.0f);
   ImGui::Text("  compute:   %.2f ms", gpuComputeMs_);
-  if (beamSkip_) {
+  if (!boxFragmentPath_ && beamSkip_) {
     ImGui::Text("    beam 8x8: %.2f ms", gpuBeamMs_);
     ImGui::Text("    main DDA: %.2f ms", gpuMainMs_);
   }
   ImGui::Text("  blit:      %.2f ms", gpuBlitMs_);
   ImGui::Text("  ui/other:  %.2f ms", gpuUiMs_);
+  ImGui::Checkbox("Box Fragment Path", &boxFragmentPath_);
+  ImGui::TextDisabled("On = back-face OBB + Fragment DDA (Phase 1). Off = compute reference.");
+  if (boxFragmentPath_) {
+    ImGui::Text("Visible boxes: %u  special: %u", boxInstanceCount_, specialInstanceCount_);
+    const char* snapBatches[] = {"0 (off)", "2", "4", "8"};
+    int snapIdx = 0;
+    if (snapshotBatchCount_ == 2) {
+      snapIdx = 1;
+    } else if (snapshotBatchCount_ == 4) {
+      snapIdx = 2;
+    } else if (snapshotBatchCount_ == 8) {
+      snapIdx = 3;
+    }
+    if (ImGui::Combo("Snapshot batches", &snapIdx, snapBatches, IM_ARRAYSIZE(snapBatches))) {
+      const int map[] = {0, 2, 4, 8};
+      snapshotBatchCount_ = map[std::clamp(snapIdx, 0, 3)];
+    }
+    ImGui::SliderFloat("Occlusion margin (m)", &depthOcclusionMargin_, 0.0f, 0.05f, "%.4f");
+    ImGui::TextDisabled("Phase 2: copy VisibilityDepth between near→far batches; 0 = baseline.");
+    ImGui::Separator();
+    ImGui::Text("Scale test (scatter boxes)");
+    static int scatterCount = 100;
+    ImGui::SliderInt("Scatter count", &scatterCount, 1, 1000);
+    if (ImGui::Button("Spawn scatter")) {
+      scene.spawnScatterBoxes(gfx_, static_cast<uint32_t>(scatterCount));
+      boundCoarsePoolBuffer_ = VK_NULL_HANDLE;  // refresh descriptors after pool resize
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Clear scatter")) {
+      scene.clearScatterBoxes(gfx_);
+      boundCoarsePoolBuffer_ = VK_NULL_HANDLE;
+    }
+    ImGui::TextDisabled("Keeps ground + object[1]; adds small solid boxes for multi-object load.");
+  }
   const char* stages[] = {
       "Full (DDA + nest + AO + light)",
       "No shade (DDA + nest, skip AO/light)",

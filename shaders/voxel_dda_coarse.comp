@@ -35,7 +35,9 @@ layout(set = 0, binding = 0, std140) uniform VoxelDdaUBO {
     float _padSolidEnd;
 } ubo;
 
-layout(set = 0, binding = 1) uniform usampler3D grids[2];
+layout(set = 0, binding = 1, std430) readonly buffer CoarsePool {
+    uvec2 cells[];  // material, brickPage — matches CoarseCell
+} coarsePool;
 layout(set = 0, binding = 2, rgba8) writeonly uniform image2D outImage;
 layout(set = 0, binding = 4) uniform sampler2D skyMap;
 
@@ -48,7 +50,7 @@ struct GpuVoxelObject {
     float _pad2;
     uvec3 gridSize;
     uint flags;
-    uint voxelOffset;
+    uint voxelOffset;  // coarse cell index into shared CoarsePool
     uint occMipOffset;
     uint occMipWords;
     uint _pad4;
@@ -98,10 +100,9 @@ vec3 sampleSky(vec3 dir) {
 }
 
 uint readMaterial(GpuVoxelObject o, ivec3 p) {
-    if (o.voxelOffset == 0u) {
-        return texelFetch(grids[0], p, 0).x;
-    }
-    return texelFetch(grids[1], p, 0).x;
+    uint n = o.gridSize.x;
+    uint idx = o.voxelOffset + uint(p.x) + uint(p.y) * n + uint(p.z) * n * n;
+    return coarsePool.cells[idx].x;
 }
 
 bvec3 stepMask(vec3 sideDist) {
