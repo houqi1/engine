@@ -6,6 +6,7 @@
 #include "scene/VoxelScene.h"
 
 #include <algorithm>
+#include <chrono>
 
 namespace physics {
 
@@ -71,7 +72,7 @@ void PhysicsWorld::rebuildFromScene() {
     classes_[static_cast<size_t>(i)].dirty = scene_->slotOccupied(i);
   }
   rebuildDirty();
-  accumulator_ = 0.0f;
+  clock_.accumulator = 0.0f;
 }
 
 void PhysicsWorld::markDirty(int objectIndex) {
@@ -231,6 +232,7 @@ void PhysicsWorld::substep() {
   if (!scene_) {
     return;
   }
+  const auto t0 = std::chrono::steady_clock::now();
   for (RigidBody& b : bodies_) {
     if (b.awake && b.invM > 0.0f && b.dynamic) {
       b.v += kGravity * kSubDt;
@@ -248,6 +250,9 @@ void PhysicsWorld::substep() {
       }
       RigidBody& A = bodies_[static_cast<size_t>(i)];
       RigidBody& B = bodies_[static_cast<size_t>(j)];
+      if (!A.dynamic && !B.dynamic) {
+        continue;
+      }
       if (!A.awake && !B.awake) {
         continue;
       }
@@ -265,9 +270,17 @@ void PhysicsWorld::substep() {
       bodies_[static_cast<size_t>(c.b)].sleepTimer = 0.0f;
     }
   }
+  const auto t1 = std::chrono::steady_clock::now();
   solveContacts(bodies_, contacts, kSubDt, kContactIters);
+  recordSubstepImpulses(contacts, substepIndex_);
+  ++substepIndex_;
+  const auto t2 = std::chrono::steady_clock::now();
   integrateBodies(bodies_, kSubDt);
   syncTransformsToScene();
+  const auto t3 = std::chrono::steady_clock::now();
+  debug_.collideMs += std::chrono::duration<float, std::milli>(t1 - t0).count();
+  debug_.contactSolveMs += std::chrono::duration<float, std::milli>(t2 - t1).count();
+  debug_.integrateMs += std::chrono::duration<float, std::milli>(t3 - t2).count();
   debug_.contacts = static_cast<int>(contacts.size());
   debug_.lastContacts = contacts;
   debug_.maxD = 0.0f;
@@ -306,35 +319,102 @@ void PhysicsWorld::updateSleep(float h) {
   }
 }
 
-void PhysicsWorld::step(float frameDt) {
+void PhysicsWorld::recordSubstepImpulses(const std::vector<Contact>& contacts, int substep) {
   if (!scene_) {
     return;
   }
-  const int n = scene_->cpuObjectCount();
-  // Grow body tables when the scene adds slots. Do not wipe velocities of existing bodies.
-  if (static_cast<int>(bodies_.size()) < n) {
-    const int oldN = static_cast<int>(bodies_.size());
-    ensureBodyCapacity(n);
-    for (int i = oldN; i < n; ++i) {
-      initBodyFromObject(i, bodies_[static_cast<size_t>(i)], false);
-      classes_[static_cast<size_t>(i)].dirty = scene_->slotOccupied(i);
+  const uint64_t tick = clock_.tickId;
+  for (const Contact& c : contacts) {
+    if (c.a < 0 || c.b < 0 || c.a >= static_cast<int>(bodies_.size()) ||
+        c.b >= static_cast<int>(bodies_.size())) {
+      continue;
     }
-  } else if (static_cast<int>(bodies_.size()) > n) {
-    bodies_.resize(static_cast<size_t>(n));
-    classes_.resize(static_cast<size_t>(n));
-  }
-  rebuildDirty();
-  accumulator_ =
-      std::min(accumulator_ + std::max(frameDt, 0.0f), kDt * static_cast<float>(kMaxStepsPerFrame));
-  int guard = 0;
-  while (accumulator_ >= kDt && guard < kMaxStepsPerFrame) {
-    for (int s = 0; s < kSubsteps; ++s) {
-      substep();
+    const glm::vec3 JA = contactImpulseOnA(c);
+    if (glm::dot(JA, JA) <= 1e-20f) {
+      continue;
     }
-    updateSleep(kDt);
-    accumulator_ -= kDt;
-    ++guard;
+    const RigidBody& A = bodies_[static_cast<size_t>(c.a)];
+    const RigidBody& B = bodies_[static_cast<size_t>(c.b)];
+    if (!A.dynamic && !B.dynamic) {
+      continue;
+    }
+    blast::WorldContactImpulse rec;
+    rec.idA = scene_->objectIdAt(c.a);
+    rec.idB = scene_->objectIdAt(c.b);
+    rec.worldPoint = c.p;
+    rec.JA = JA;
+    rec.xA = A.x;
+    rec.xB = B.x;
+    rec.qA = A.q;
+    rec.qB = B.q;
+    rec.fineA = c.fineA;
+    rec.fineB = c.fineB;
+    rec.fineNA = (c.a < static_cast<int>(classes_.size())) ? classes_[static_cast<size_t>(c.a)].fineN : 0;
+    rec.fineNB = (c.b < static_cast<int>(classes_.size())) ? classes_[static_cast<size_t>(c.b)].fineN : 0;
+    rec.tickId = tick;
+    rec.substep = substep;
+    tickImpulses_.push_back(rec);
   }
+}
+
+void PhysicsWorld::setFixedTickCallback(FixedPhysicsTickFn fn, void* user) {
+  tickFn_ = fn;
+  tickUser_ = user;
+}
+
+void PhysicsWorld::resetTickSession() { clock_.resetSession(); }
+
+void PhysicsWorld::step(float frameDt) {
+  const auto tRebuild0 = std::chrono::steady_clock::now();
+  if (scene_) {
+    const int n = scene_->cpuObjectCount();
+    // Grow body tables when the scene adds slots. Do not wipe velocities of existing bodies.
+    if (static_cast<int>(bodies_.size()) < n) {
+      const int oldN = static_cast<int>(bodies_.size());
+      ensureBodyCapacity(n);
+      for (int i = oldN; i < n; ++i) {
+        initBodyFromObject(i, bodies_[static_cast<size_t>(i)], false);
+        classes_[static_cast<size_t>(i)].dirty = scene_->slotOccupied(i);
+      }
+    } else if (static_cast<int>(bodies_.size()) > n) {
+      bodies_.resize(static_cast<size_t>(n));
+      classes_.resize(static_cast<size_t>(n));
+    }
+    rebuildDirty();
+  }
+  debug_.rebuildMs = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - tRebuild0).count();
+  debug_.physicsTicksThisFrame = 0;
+  clock_.advance(frameDt, [this](uint64_t id, float dt) {
+    debug_.collideMs = 0.0f;
+    debug_.contactSolveMs = 0.0f;
+    debug_.integrateMs = 0.0f;
+    debug_.structureCallbackMs = 0.0f;
+    debug_.awakeBodies = 0;
+    debug_.occupiedBodies = 0;
+    tickImpulses_.clear();
+    substepIndex_ = 0;
+    if (scene_) {
+      for (int s = 0; s < kSubsteps; ++s) {
+        substep();
+      }
+      updateSleep(dt);
+      for (size_t i = 0; i < bodies_.size(); ++i) {
+        if (scene_->slotOccupied(static_cast<int>(i))) {
+          ++debug_.occupiedBodies;
+          if (bodies_[i].awake) {
+            ++debug_.awakeBodies;
+          }
+        }
+      }
+    }
+    const auto tCb0 = std::chrono::steady_clock::now();
+    if (tickFn_ != nullptr) {
+      tickFn_(tickUser_, id, dt);
+    }
+    debug_.structureCallbackMs =
+        std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - tCb0).count();
+    ++debug_.physicsTicksThisFrame;
+  });
 }
 
 void PhysicsWorld::syncTransformsToScene() {

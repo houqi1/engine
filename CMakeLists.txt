@@ -143,6 +143,59 @@ target_include_directories(voxel_connectivity_tests PRIVATE
 )
 target_compile_features(voxel_connectivity_tests PRIVATE cxx_std_20)
 
+include(cmake/NvBlast.cmake)
+
+add_library(ve_structure_core STATIC
+  src/blast/BlastMemory.cpp
+  src/blast/VoxelGraph.cpp
+  src/blast/ContactLoads.cpp
+  src/blast/OccupancySampler.cpp
+  src/blast/StructureWorld.cpp
+)
+target_include_directories(ve_structure_core PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(ve_structure_core PUBLIC nvblast glm::glm)
+target_compile_features(ve_structure_core PUBLIC cxx_std_20)
+target_compile_definitions(ve_structure_core PUBLIC
+  GLM_FORCE_RADIANS
+  GLM_FORCE_DEPTH_ZERO_TO_ONE
+)
+if(MSVC)
+  target_compile_definitions(ve_structure_core PUBLIC NOMINMAX)
+endif()
+
+target_link_libraries(vulkan_engine_voxel PRIVATE ve_structure_core)
+
+function(ve_blast_test target_name)
+  add_executable(${target_name} ${ARGN})
+  target_link_libraries(${target_name} PRIVATE ve_structure_core)
+  target_compile_features(${target_name} PRIVATE cxx_std_20)
+endfunction()
+
+ve_blast_test(blast_p0_tests tests/blast_p0_tests.cpp)
+ve_blast_test(blast_p1_tests
+  tests/blast_p1_tests.cpp
+  src/blast/CylinderGraph.cpp
+)
+ve_blast_test(blast_p2_tests
+  tests/blast_p2_tests.cpp
+  src/blast/CylinderGraph.cpp
+  src/blast/ActorBodies.cpp
+)
+ve_blast_test(blast_p3_tests tests/blast_p3_tests.cpp)
+ve_blast_test(blast_p4_tests tests/blast_p4_tests.cpp)
+ve_blast_test(blast_graph_regression_tests tests/blast_graph_regression_tests.cpp)
+ve_blast_test(blast_e0_tests tests/blast_e0_tests.cpp)
+ve_blast_test(blast_e1_tests tests/blast_e1_tests.cpp)
+ve_blast_test(blast_e2_tests tests/blast_e2_tests.cpp)
+ve_blast_test(blast_e2_perf tests/blast_e2_perf.cpp)
+ve_blast_test(blast_probe_export_tests tests/blast_probe_export_tests.cpp)
+ve_blast_test(blast_e3_tests
+  tests/blast_e3_tests.cpp
+  src/physics/Solver.cpp
+)
+
 # ---- Shader compilation ----
 find_program(GLSLC glslc HINTS /opt/homebrew/bin ENV VULKAN_SDK PATH_SUFFIXES bin REQUIRED)
 

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "blast/StructureWorld.h"
 #include "core/Camera.h"
 #include "gfx/GfxDevice.h"
 #include "gfx/GpuTypes.h"
@@ -78,8 +79,11 @@ struct VoxelObject {
   bool slotOccupied = true;
   bool isScatter = false;
   MotionType motionType = MotionType::Dynamic;
+  float density = 600.0f;
   // Bumped when occupancy, material connectivity rules, or anchors change.
   uint64_t topologyRevision = 1;
+  // Parent-grid fine origin of local (0,0,0). Graph voxels stay in the family sample grid.
+  glm::ivec3 structureFineOrigin{0};
 
   std::vector<CoarseCell> cells;
   uint32_t voxelOffset = 0;  // coarse cell index into shared CoarsePool
@@ -123,7 +127,12 @@ public:
   // Soft cap for scatter / fracture objects (Phase 3 scale tests).
   static constexpr uint32_t kMaxVoxelObjects = 1024;
 
-  void init(GfxDevice& gfx);
+  VoxelScene() = default;
+  ~VoxelScene();
+  VoxelScene(const VoxelScene&) = delete;
+  VoxelScene& operator=(const VoxelScene&) = delete;
+
+  void init(GfxDevice& gfx, blast::BlastRuntime& runtime);
   void cleanup(GfxDevice& gfx);
   void update(float dt);
   void handleEditInput(GLFWwindow* window, GfxDevice& gfx);
@@ -215,6 +224,8 @@ public:
 
   bool simulate() const { return simulate_; }
   void setSimulate(GfxDevice& gfx, bool on);
+  bool spawnTestBoxOnSimulate() const { return spawnTestBoxOnSimulate_; }
+  void setSpawnTestBoxOnSimulate(GfxDevice& gfx, bool on);
   int cpuObjectCount() const { return static_cast<int>(objects_.size()); }
   const VoxelObject& cpuObject(int i) const { return objects_.at(static_cast<size_t>(i)); }
   VoxelObject& cpuObject(int i) { return objects_.at(static_cast<size_t>(i)); }
@@ -236,6 +247,23 @@ public:
   uint32_t physicsCornerCount(int objectIndex) const;
   uint32_t physicsEdgeCount(int objectIndex) const;
   physics::DebugSolve physicsDebug() const { return physics_.debugSolve(); }
+  blast::StructureWorld& structures() { return structures_; }
+  const blast::StructureWorld& structures() const { return structures_; }
+  VoxelObjectId stressCylinderId() const { return stressCylinderId_; }
+  bool spawnStressCylinder(GfxDevice& gfx);
+  bool resetStressCylinder(GfxDevice& gfx);
+  bool cutStressCylinder270(GfxDevice& gfx);
+  bool setStressCylinderDoubleDensity(bool on);
+  void setStressCylinderSolverIters(uint32_t iters);
+  void setStressCylinderDisplay(GfxDevice& gfx, bool on);
+  // After beginFrame: upload stress colors without waitIdle. No-op if display is off
+  // or the solver has not produced a new probe snapshot since the last paint.
+  void refreshStressColors(GfxDevice& gfx);
+  void commitStructureSplits(GfxDevice& gfx);
+  bool stressCylinderCut() const { return stressCylinderCut_; }
+  bool stressCylinderDoubleDensity() const { return stressCylinderDoubleDensity_; }
+  bool stressCylinderDisplay() const { return stressCylinderDisplay_; }
+  void splitFineIndex(int fx, int fy, int fz, glm::ivec3& coarse, glm::ivec3& micro, glm::ivec3& fine) const;
   void gatherCornerNormals(int fromObj, int againstObj,
                            std::vector<physics::DebugCornerNormal>& out) const;
 
@@ -274,6 +302,8 @@ private:
   void buildGroundObject(VoxelObject& o);
   void buildSpinnerObject(VoxelObject& o);
   void buildTestBoxObject(VoxelObject& o);
+  void fillTestSlot(VoxelObject& o);
+  void rebuildTestSlot(GfxDevice& gfx);
   void clearObjectPages(VoxelObject& o);
   uint32_t allocObjectSlot();
   void freeObjectSlot(uint32_t slot);
@@ -302,6 +332,12 @@ private:
   void destroyGridImages(GfxDevice& gfx);
   void flushObject(GfxDevice& gfx, int objectIndex);
   void flushDirtyPages(GfxDevice& gfx);
+  void bindStructureTicks();
+  void stopStructureTicks();
+  void resetStructureSession();
+  bool mountCylinderFromOccupancy(GfxDevice& gfx);
+  void paintCylinderStress(GfxDevice& gfx);
+  void destroyStressCylinderObject();
 
   int applyCoarseSphereBrush(VoxelObject& o, const glm::ivec3& center, float radius,
                              uint32_t material, bool placeOnlyEmpty,
@@ -338,6 +374,15 @@ private:
   bool extractFragmentFromMasks(GfxDevice& gfx, VoxelObject& parent, int parentIndex,
                                 const voxel::FinalizedComponent& comp, VoxelObjectId parentId,
                                 const physics::BodyState& parentState, glm::dvec3 parentComLocal);
+  bool extractIslandFromFines(GfxDevice& gfx, VoxelObject& parent, int parentIndex,
+                              const std::vector<voxel::FineCoord>& fines, VoxelObjectId parentId,
+                              const physics::BodyState& parentState, glm::dvec3 parentComLocal,
+                              MotionType motion, uint32_t minFines, VoxelObjectId* outId = nullptr);
+  bool commitOccupancySplit(GfxDevice& gfx, VoxelObjectId parentId,
+                            const std::vector<std::vector<voxel::FineCoord>>& islands,
+                            const std::vector<uint8_t>& anchored, uint32_t minFines);
+  VoxelObjectId objectOwningFamilyFine(const glm::ivec3& absFine) const;
+  bool familyFinesOnObject(VoxelObjectId id, const std::vector<voxel::FineCoord>& fines) const;
   glm::dvec3 computeLocalCom(int objectIndex) const;
   uint32_t countSolidFines(int objectIndex) const;
   uint32_t readFineRgb(uint32_t page, uint32_t colorIndex) const;
@@ -416,7 +461,14 @@ private:
   float spinSpeed_ = 0.8f;
   bool spinnerEnabled_ = false;
   bool simulate_ = false;
+  bool spawnTestBoxOnSimulate_ = false;
   physics::PhysicsWorld physics_;
+  blast::StructureWorld structures_;
+  VoxelObjectId stressCylinderId_{};
+  bool stressCylinderCut_ = false;
+  bool stressCylinderDoubleDensity_ = false;
+  bool stressCylinderDisplay_ = false;
+  uint64_t lastStressPaintSolveEpoch_ = 0;
 
   bool prevLmb_ = false;
   bool prevF_ = false;

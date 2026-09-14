@@ -1,5 +1,6 @@
 #include "render/VoxelRenderer.h"
 
+#include "blast/CylinderVoxels.h"
 #include "gfx/PipelineBuilder.h"
 
 #include <imgui.h>
@@ -1276,8 +1277,21 @@ bool VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
   displayFps_ = displayFps;
 
   // UI requests must not destroy resources referenced by an unsubmitted command buffer.
+  // Fracture/strength only flip CPU flags; do not stall the GPU or repaint the cylinder.
+  if (cylinderFractureRequested_) {
+    scene.structures().setFractureEnabled(pendingCylinderFracture_);
+    cylinderFractureRequested_ = false;
+  }
+  if (cylinderStrengthRequested_) {
+    scene.structures().setStrengthPa(pendingCylinderFailStrength_ ? blast::kE2StrengthFailPa
+                                                                  : blast::kE2StrengthHoldPa);
+    cylinderStrengthRequested_ = false;
+  }
+
   if (importRequested_ || removeImportRequested_ || rebuildRequested_ || scatterSpawnRequested_ ||
-      scatterClearRequested_ || simulateRequested_) {
+      scatterClearRequested_ || simulateRequested_ || spawnTestBoxRequested_ || spawnCylinderRequested_ ||
+      resetCylinderRequested_ || cutCylinderRequested_ || cylinderDensityRequested_ ||
+      cylinderItersRequested_ || cylinderDisplayRequested_) {
     gfx_.waitIdle();
     if (importRequested_) {
       MeshVoxelizeConfig cfg;
@@ -1301,11 +1315,34 @@ bool VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
     if (scatterSpawnRequested_) {
       scene.spawnScatterBoxes(gfx_, scatterSpawnCount_);
     }
+    if (spawnTestBoxRequested_) {
+      scene.setSpawnTestBoxOnSimulate(gfx_, pendingSpawnTestBox_);
+    }
     if (simulateRequested_) {
       scene.setSimulate(gfx_, pendingSimulate_);
     }
+    if (spawnCylinderRequested_) {
+      scene.spawnStressCylinder(gfx_);
+    }
+    if (resetCylinderRequested_) {
+      scene.resetStressCylinder(gfx_);
+    }
+    if (cutCylinderRequested_) {
+      scene.cutStressCylinder270(gfx_);
+    }
+    if (cylinderDensityRequested_) {
+      scene.setStressCylinderDoubleDensity(pendingCylinderDoubleDensity_);
+    }
+    if (cylinderItersRequested_) {
+      scene.setStressCylinderSolverIters(static_cast<uint32_t>(pendingCylinderIters_));
+    }
+    if (cylinderDisplayRequested_) {
+      scene.setStressCylinderDisplay(gfx_, pendingCylinderDisplay_);
+    }
     importRequested_ = removeImportRequested_ = rebuildRequested_ = false;
-    scatterSpawnRequested_ = scatterClearRequested_ = simulateRequested_ = false;
+    scatterSpawnRequested_ = scatterClearRequested_ = simulateRequested_ = spawnTestBoxRequested_ = false;
+    spawnCylinderRequested_ = resetCylinderRequested_ = cutCylinderRequested_ = false;
+    cylinderDensityRequested_ = cylinderItersRequested_ = cylinderDisplayRequested_ = false;
     boundCoarsePoolBuffer_ = VK_NULL_HANDLE;
   }
 
@@ -1348,6 +1385,8 @@ bool VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
   }
 
   scene.uploadObjectTransforms(gfx_, frame.frameIndex);
+  // Brick uploads are safe here: beginFrame already waited this slot's fence.
+  scene.refreshStressColors(gfx_);
   collectGpuTiming(frame.frameIndex);
   updateFrameUBO(scene, frame.frameIndex);
   updateGfxUBO(scene, frame.frameIndex, frame.extent.width, frame.extent.height);
@@ -1938,10 +1977,19 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
       pendingSimulate_ = sim;
       simulateRequested_ = true;
     }
+    bool spawnBox = scene.spawnTestBoxOnSimulate();
+    if (ImGui::Checkbox("Spawn test box", &spawnBox)) {
+      if (scene.simulate() || simulateRequested_) {
+        pendingSpawnTestBox_ = spawnBox;
+        spawnTestBoxRequested_ = true;
+      } else {
+        scene.setSpawnTestBoxOnSimulate(gfx_, spawnBox);
+      }
+    }
     ImGui::Checkbox("Fracture on dig", &scene.fractureEnabled());
     ImGui::TextDisabled("On = digging a dynamic object can split it into falling pieces.");
-    ImGui::TextDisabled("On = solid test box falls on 3.2 m ground. Off = spinner.");
-    if (scene.simulate()) {
+    ImGui::TextDisabled("Spawn test box: drop a solid cube onto the 3.2 m ground (off by default).");
+    if (scene.simulate() && scene.spawnTestBoxOnSimulate()) {
       const int testSlot = scene.testObjectId().valid() ? static_cast<int>(scene.testObjectId().slot) : 1;
       ImGui::Text("Test box corners: %u   edges: %u", scene.physicsCornerCount(testSlot),
                   scene.physicsEdgeCount(testSlot));
@@ -1949,6 +1997,69 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
       ImGui::Text("Solve contacts=%d  maxD=%.3f  minNy=%.2f", ds.contacts, ds.maxD, ds.minNy);
       ImGui::Text("Box v=(%.2f,%.2f,%.2f) |w|=%.2f", ds.v.x, ds.v.y, ds.v.z, glm::length(ds.w));
     }
+  }
+  {
+    const blast::StructureWorld& sw = scene.structures();
+    const blast::StructureDebugSnapshot& st = sw.debug();
+    ImGui::Separator();
+    ImGui::TextUnformatted("Structure (E2 stress fracture)");
+    ImGui::Text("State: %s", sw.initialized() ? "initialized" : "not initialized");
+    if (ImGui::Button("Spawn / reset cylinder")) {
+      spawnCylinderRequested_ = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Cut 270 deg base")) {
+      cutCylinderRequested_ = true;
+    }
+    bool dbl = scene.stressCylinderDoubleDensity();
+    if (ImGui::Checkbox("Double density", &dbl)) {
+      pendingCylinderDoubleDensity_ = dbl;
+      cylinderDensityRequested_ = true;
+    }
+    ImGui::SliderInt("Solver iters", &pendingCylinderIters_, 25, 200);
+    if (ImGui::IsItemDeactivatedAfterEdit()) {
+      cylinderItersRequested_ = true;
+    }
+    bool disp = scene.stressCylinderDisplay();
+    if (ImGui::Checkbox("Stress colors (fixed 0-2 MPa)", &disp)) {
+      pendingCylinderDisplay_ = disp;
+      cylinderDisplayRequested_ = true;
+    }
+    bool frac = st.fractureEnabled;
+    if (ImGui::Checkbox("Stress fracture", &frac)) {
+      pendingCylinderFracture_ = frac;
+      cylinderFractureRequested_ = true;
+    }
+    bool failS = st.strengthPa < 1.0e6f;
+    if (ImGui::Checkbox("Fail strength (0.25 MPa); off = 50 MPa hold", &failS)) {
+      pendingCylinderFailStrength_ = failS;
+      cylinderStrengthRequested_ = true;
+    }
+    ImGui::Text("Instances: %u   cylinder: %s   cut: %s", sw.instanceCount(),
+                scene.stressCylinderId().valid() ? "yes" : "no", scene.stressCylinderCut() ? "yes" : "no");
+    ImGui::Text("Occupied fines: %u  mass: %.3f kg  weight: %.1f N", st.occupied, st.mass, st.weight);
+    ImGui::Text("Nodes: %u  bonds: %u  world bonds: %u", st.nodes, st.bonds, st.worldBonds);
+    ImGui::Text("Status: %s  lin=%.3g ang=%.3g", st.status, st.linErr, st.angErr);
+    ImGui::Text("Reaction Ry=%.1f N   strip max=%.3g Pa   S=%.3g Pa", st.reactionY, st.stripMaxStress,
+                st.strengthPa);
+    ImGui::Text("Candidates: %u (strip %u)  fractured bonds: %u  actors: %u  bindings: %u",
+                st.candidateCount, st.candidateInStrip, st.fracturedBonds, st.splitActors, st.bindingCount);
+    ImGui::Text("max T/C/S: %.3g / %.3g / %.3g Pa", st.maxTension, st.maxCompression, st.maxShear);
+    ImGui::Text("extract %.2f ms  asset %.2f ms  solve %.2f ms  iters %u", st.extractMs, st.assetMs, st.solveMs,
+                st.solverIters);
+    ImGui::Text("probe %.2f ms  stats %.2f ms  candidates %.2f ms  exports %u", st.probeMs, st.statsMs,
+                st.candidateMs, st.probeExportCount);
+    const physics::DebugSolve phys = scene.physicsDebug();
+    ImGui::Text("phys collide %.2f  contacts %.2f  integrate %.2f  rebuild %.2f  struct-cb %.2f",
+                phys.collideMs, phys.contactSolveMs, phys.integrateMs, phys.rebuildMs,
+                phys.structureCallbackMs);
+    ImGui::Text("phys bodies occupied=%d awake=%d contacts=%d", phys.occupiedBodies, phys.awakeBodies,
+                phys.contacts);
+    ImGui::Text("Physics ticks: %llu  last dt: %.6f s",
+                static_cast<unsigned long long>(sw.physicsTicksReceived()), sw.lastDt());
+    ImGui::Text("Blast live bytes: %zu  (baseline %zu)  errors: %d", sw.blastLiveBytes(),
+                sw.blastRuntimeBaselineBytes(), sw.blastErrorCount());
+    ImGui::TextDisabled("Simulate on, then Stress fracture. Intact should hold; cut should drop.");
   }
   ImGui::Checkbox("Show Rotating Object", &scene.spinnerEnabled());
   ImGui::SliderFloat("Spin Speed", &scene.spinSpeed(), -3.0f, 3.0f, "%.2f rad/s");

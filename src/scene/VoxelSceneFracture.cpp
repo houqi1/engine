@@ -1,11 +1,19 @@
 #include "scene/VoxelScene.h"
 
+#include "blast/CylinderVoxels.h"
+#include "blast/HardFracture.h"
+#include "blast/StructureWorld.h"
+
+#include "NvBlast.h"
+#include "NvBlastTypes.h"
+
 #include <glm/gtc/quaternion.hpp>
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <iostream>
+#include <unordered_map>
 
 namespace {
 
@@ -311,7 +319,7 @@ bool VoxelScene::extractFragmentFromMasks(GfxDevice& /*gfx*/, VoxelObject& paren
   glm::dvec3 fragMoment(0.0);
   double fragMass = 0.0;
   const double s = static_cast<double>(parent.voxelSize) / static_cast<double>(kFinePerCoarse);
-  const double mi = static_cast<double>(physics::kDensityWood) * s * s * s;
+  const double mi = static_cast<double>(parent.density > 0.0f ? parent.density : physics::kDensityWood) * s * s * s;
   uint32_t copied = 0;
 
   for (const FineSample& sample : samples) {
@@ -449,4 +457,439 @@ void VoxelScene::commitReadyFractures(GfxDevice& gfx) {
                                               j.phase == FractureJob::Phase::Cancelled;
                                      }),
                       fractureJobs_.end());
+}
+
+namespace {
+
+void sceneBlastLog(int type, const char* msg, const char* file, int line) {
+  if (type <= NvBlastMessage::Error) {
+    std::cerr << "NvBlastLL " << file << ":" << line << ": " << (msg ? msg : "") << "\n";
+  }
+}
+
+}  // namespace
+
+bool VoxelScene::extractIslandFromFines(GfxDevice& /*gfx*/, VoxelObject& parent, int parentIndex,
+                                        const std::vector<voxel::FineCoord>& fines, VoxelObjectId parentId,
+                                        const physics::BodyState& parentState, glm::dvec3 parentComLocal,
+                                        MotionType motion, uint32_t minFines, VoxelObjectId* outId) {
+  if (outId != nullptr) {
+    *outId = {};
+  }
+  if (fines.empty()) {
+    return true;
+  }
+  struct FineSample {
+    glm::ivec3 absFine{0};
+    uint32_t material = 1;
+    uint32_t rgb = 0;
+    bool hasRgb = false;
+  };
+  std::vector<FineSample> samples;
+  samples.reserve(fines.size());
+  const glm::ivec3 origin = parent.structureFineOrigin;
+  auto toLocal = [&](const glm::ivec3& absFine) { return absFine - origin; };
+  for (const voxel::FineCoord& fc : fines) {
+    const glm::ivec3 absFine(fc.x, fc.y, fc.z);
+    const glm::ivec3 local = toLocal(absFine);
+    glm::ivec3 c, m, f;
+    splitAbsFine(local, c, m, f);
+    if (local.x < 0 || local.y < 0 || local.z < 0 || !getFine(parent, c, m, f)) {
+      continue;
+    }
+    FineSample sample;
+    sample.absFine = absFine;
+    sample.material = occupancyMaterial(parentIndex, c);
+    const uint32_t srcPage = coarseBrickPage(parentIndex, c);
+    if (srcPage != kInvalidBrickPage) {
+      sample.rgb = readFineRgb(srcPage, fineColorIndex(m, f));
+      sample.hasRgb = (sample.rgb & 0xFF000000u) != 0;
+    }
+    samples.push_back(sample);
+  }
+  if (samples.empty()) {
+    return true;
+  }
+  if (samples.size() < minFines) {
+    for (const FineSample& sample : samples) {
+      glm::ivec3 c, m, f;
+      splitAbsFine(toLocal(sample.absFine), c, m, f);
+      setFineCpu(parent, c, m, f, false);
+    }
+    return true;
+  }
+
+  glm::ivec3 fineMn = toLocal(samples[0].absFine);
+  glm::ivec3 fineMx = fineMn;
+  for (const FineSample& sample : samples) {
+    const glm::ivec3 local = toLocal(sample.absFine);
+    fineMn = glm::min(fineMn, local);
+    fineMx = glm::max(fineMx, local);
+  }
+  const glm::ivec3 coarseMin(fineMn.x / kFinePerCoarse, fineMn.y / kFinePerCoarse, fineMn.z / kFinePerCoarse);
+  const glm::ivec3 coarseMax(fineMx.x / kFinePerCoarse, fineMx.y / kFinePerCoarse, fineMx.z / kFinePerCoarse);
+  const glm::ivec3 extent = coarseMax - coarseMin + glm::ivec3(1);
+  const int newGridSize = std::max({1, extent.x, extent.y, extent.z});
+
+  uint32_t slot = 0;
+  try {
+    slot = allocObjectSlot();
+  } catch (const std::exception& ex) {
+    std::cerr << "Structure split: allocObjectSlot failed: " << ex.what() << "\n";
+    return false;
+  }
+
+  VoxelObject& frag = objects_[slot];
+  frag.gridSize = newGridSize;
+  frag.voxelSize = parent.voxelSize;
+  frag.nestedMicro = parent.nestedMicro;
+  frag.editable = true;
+  frag.enabled = true;
+  frag.slotOccupied = true;
+  frag.isScatter = true;
+  frag.motionType = motion;
+  frag.density = parent.density;
+  frag.topologyRevision = 1;
+  frag.structureFineOrigin = origin + coarseMin * kFinePerCoarse;
+  frag.useImportPalette = parent.useImportPalette;
+  frag.rotation = parent.rotation;
+  const glm::vec3 gridCenterParent = 0.5f * static_cast<float>(parent.gridSize) * parent.voxelSize * glm::vec3(1.0f);
+  const glm::vec3 gridCenterFrag = 0.5f * static_cast<float>(newGridSize) * parent.voxelSize * glm::vec3(1.0f);
+  const glm::vec3 shiftMeters = glm::vec3(coarseMin) * parent.voxelSize;
+  frag.position = parent.position + parent.rotation * (shiftMeters + gridCenterFrag - gridCenterParent);
+  frag.cells.assign(static_cast<size_t>(newGridSize) * static_cast<size_t>(newGridSize) *
+                        static_cast<size_t>(newGridSize),
+                    CoarseCell{});
+
+  const glm::ivec3 fineShift = coarseMin * kFinePerCoarse;
+  glm::dvec3 fragMoment(0.0);
+  double fragMass = 0.0;
+  const double s = static_cast<double>(parent.voxelSize) / static_cast<double>(kFinePerCoarse);
+  const double mi = static_cast<double>(parent.density > 0.0f ? parent.density : physics::kDensityWood) * s * s * s;
+  uint32_t copied = 0;
+  for (const FineSample& sample : samples) {
+    const glm::ivec3 localFine = toLocal(sample.absFine) - fineShift;
+    glm::ivec3 c, m, f;
+    splitAbsFine(localFine, c, m, f);
+    if (!inBounds(frag, c) || !microInBounds(m) || !fineInBounds(f)) {
+      continue;
+    }
+    ensureCoarseBrick(frag, c, sample.material);
+    if (sample.hasRgb) {
+      setFineCpu(frag, c, m, f, true, true, sample.rgb & 0x00FFFFFFu);
+    } else {
+      setFineCpu(frag, c, m, f, true);
+    }
+    ++copied;
+    fragMass += mi;
+    fragMoment += mi * glm::dvec3((static_cast<double>(localFine.x) + 0.5) * s,
+                                  (static_cast<double>(localFine.y) + 0.5) * s,
+                                  (static_cast<double>(localFine.z) + 0.5) * s);
+  }
+  if (copied == 0) {
+    freeObjectSlot(slot);
+    return true;
+  }
+
+  const glm::dvec3 fragComLocalParent =
+      (fragMass > 1e-12 ? (fragMoment / fragMass) : glm::dvec3(gridCenterFrag)) + glm::dvec3(shiftMeters);
+  const glm::vec3 deltaWorld = parent.rotation * glm::vec3(fragComLocalParent - parentComLocal);
+  physics::BodyState childState = parentState;
+  childState.x = frag.position;
+  childState.q = frag.rotation;
+  if (motion == MotionType::Dynamic) {
+    childState.v = parentState.v + glm::cross(parentState.w, deltaWorld);
+    childState.w = parentState.w;
+    childState.awake = true;
+  } else {
+    childState.v = glm::vec3(0.0f);
+    childState.w = glm::vec3(0.0f);
+    childState.awake = false;
+  }
+  childState.sleepTimer = 0.0f;
+  if (!physics_.addBody(makeObjectId(slot), childState)) {
+    freeObjectSlot(slot);
+    return false;
+  }
+  for (const FineSample& sample : samples) {
+    glm::ivec3 c, m, f;
+    splitAbsFine(toLocal(sample.absFine), c, m, f);
+    setFineCpu(parent, c, m, f, false);
+  }
+  (void)parentId;
+  if (outId != nullptr) {
+    *outId = makeObjectId(slot);
+  }
+  return true;
+}
+
+bool VoxelScene::familyFinesOnObject(VoxelObjectId id, const std::vector<voxel::FineCoord>& fines) const {
+  const VoxelObject* o = tryGetObject(id);
+  if (o == nullptr || fines.empty()) {
+    return false;
+  }
+  const int slot = static_cast<int>(id.slot);
+  const size_t nCheck = fines.size() < 8 ? fines.size() : 8;
+  for (size_t i = 0; i < nCheck; ++i) {
+    const glm::ivec3 absFine(fines[i].x, fines[i].y, fines[i].z);
+    const glm::ivec3 local = absFine - o->structureFineOrigin;
+    if (local.x < 0 || local.y < 0 || local.z < 0) {
+      continue;
+    }
+    glm::ivec3 c, m, f;
+    splitFineIndex(local.x, local.y, local.z, c, m, f);
+    if (occupancyFine(slot, c, m, f)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+VoxelObjectId VoxelScene::objectOwningFamilyFine(const glm::ivec3& absFine) const {
+  for (int i = 0; i < cpuObjectCount(); ++i) {
+    if (!slotOccupied(i)) {
+      continue;
+    }
+    const VoxelObject& o = cpuObject(i);
+    const glm::ivec3 local = absFine - o.structureFineOrigin;
+    if (local.x < 0 || local.y < 0 || local.z < 0) {
+      continue;
+    }
+    glm::ivec3 c, m, f;
+    splitFineIndex(local.x, local.y, local.z, c, m, f);
+    if (!inBounds(o, c) || !occupancyFine(i, c, m, f)) {
+      continue;
+    }
+    return objectIdAt(i);
+  }
+  return {};
+}
+
+bool VoxelScene::commitOccupancySplit(GfxDevice& gfx, VoxelObjectId parentId,
+                                      const std::vector<std::vector<voxel::FineCoord>>& islands,
+                                      const std::vector<uint8_t>& anchored, uint32_t minFines) {
+  VoxelObject* parent = tryGetObject(parentId);
+  if (!parent || islands.empty()) {
+    return false;
+  }
+  size_t keep = 0;
+  size_t keepN = 0;
+  for (size_t i = 0; i < islands.size(); ++i) {
+    if (islands[i].size() > keepN) {
+      keepN = islands[i].size();
+      keep = i;
+    }
+  }
+  physics::BodyState parentState{};
+  if (!physics_.getBodyState(parentId, parentState)) {
+    parentState.x = parent->position;
+    parentState.q = parent->rotation;
+  }
+  const glm::dvec3 parentCom = computeLocalCom(static_cast<int>(parentId.slot));
+  const int parentIndex = static_cast<int>(parentId.slot);
+  const uint32_t before = countSolidFines(parentIndex);
+
+  std::vector<blast::ActorObjectLink> links(islands.size());
+  links[keep].objectId = parentId;
+  links[keep].fineOrigin = parent->structureFineOrigin;
+  links[keep].fineN = parent->gridSize * kFinePerCoarse;
+
+  uint32_t created = 0;
+  for (size_t i = 0; i < islands.size(); ++i) {
+    if (i == keep || islands[i].empty()) {
+      continue;
+    }
+    const MotionType motion = (i < anchored.size() && anchored[i] != 0) ? MotionType::Static : MotionType::Dynamic;
+    VoxelObjectId childId{};
+    if (!extractIslandFromFines(gfx, *parent, parentIndex, islands[i], parentId, parentState, parentCom, motion,
+                                minFines, &childId)) {
+      std::cerr << "Structure split: island extract failed\n";
+      return false;
+    }
+    links[i].objectId = childId;
+    if (childId.valid()) {
+      ++created;
+    }
+    if (const VoxelObject* child = tryGetObject(childId)) {
+      links[i].fineOrigin = child->structureFineOrigin;
+      links[i].fineN = child->gridSize * kFinePerCoarse;
+    }
+  }
+
+  const bool keepAnchored = keep < anchored.size() && anchored[keep] != 0;
+  parent->motionType = keepAnchored ? MotionType::Static : MotionType::Dynamic;
+  parent->topologyRevision += 1;
+  if (blast::StructureInstance* st = structures_.instance()) {
+    if (st->objectId == parentId) {
+      st->topologyRevision = parent->topologyRevision;
+    }
+  }
+  const uint32_t left = countSolidFines(parentIndex);
+  if (left == 0) {
+    parent->enabled = false;
+    physics_.removeBody(parentId);
+  } else {
+    parentState.awake = parent->motionType == MotionType::Dynamic;
+    parentState.sleepTimer = 0.0f;
+    if (parent->motionType == MotionType::Dynamic) {
+      const glm::dvec3 newCom = computeLocalCom(parentIndex);
+      parentState.v = parentState.v + glm::cross(parentState.w, glm::vec3(parent->rotation * glm::vec3(newCom - parentCom)));
+    } else {
+      parentState.v = glm::vec3(0.0f);
+      parentState.w = glm::vec3(0.0f);
+    }
+    physics_.replaceShape(parentId, &parentState);
+  }
+
+  if (created == 0) {
+    structures_.bindVisibleActors(links);
+    return true;
+  }
+  gfx.waitIdle();
+  packObjectPool();
+  fillGpuObjectRecords();
+  ensureGpuBuffers(gfx);
+  uploadCoarsePool(gfx);
+  flushDirtyPages(gfx);
+  uploadOccMip(gfx);
+  for (uint32_t i = 0; i < GfxDevice::kFramesInFlight; ++i) {
+    uploadObjectTransforms(gfx, i);
+  }
+  ++gpuResourceSerial_;
+  physics_.activateBodiesInBounds(parentState.x - glm::vec3(2.0f), parentState.x + glm::vec3(2.0f));
+  structures_.bindVisibleActors(links);
+  std::cout << "Structure split: parent slot=" << parentId.slot << " islands=" << islands.size()
+            << " fines " << before << " -> " << left << " keepAnchored=" << (keepAnchored ? 1 : 0)
+            << " bindings=" << structures_.bindings().size() << "\n";
+  return true;
+}
+
+void VoxelScene::commitStructureSplits(GfxDevice& gfx) {
+  blast::StructureInstance* inst = structures_.instance();
+  if (inst == nullptr || inst->blast.actor == nullptr) {
+    return;
+  }
+  if (!structures_.pendingFracture().valid || structures_.pendingFracture().candidates.empty()) {
+    return;
+  }
+  if (!structures_.pendingSnapshotMatches(structures_.pendingFracture())) {
+    structures_.recachePendingFromProbes();
+    if (!structures_.pendingSnapshotMatches(structures_.pendingFracture()) ||
+        !structures_.pendingFracture().valid || structures_.pendingFracture().candidates.empty()) {
+      structures_.clearPendingFracture();
+      return;
+    }
+  }
+
+  const blast::PendingFracture& pending = structures_.pendingFracture();
+  for (const blast::FractureCandidate& c : pending.candidates) {
+    for (uint64_t f : c.faces) {
+      inst->grid.brokenFaces.insert(f);
+    }
+    if (c.stableId != 0) {
+      inst->grid.bondDamage[blast::packBondKey(c.nodeA, c.nodeB)] = 1.0f;
+    }
+  }
+
+  const uint32_t nfrac = structures_.applyPendingCandidates(pending);
+  inst->debug.fracturedBonds = nfrac;
+  structures_.clearPendingFracture();
+  if (nfrac == 0) {
+    return;
+  }
+
+  const uint32_t actors = structures_.splitAllRequired();
+  inst->debug.splitActors = actors;
+  inst->debug.candidateCount = 0;
+
+  if (actors <= 1) {
+    std::cout << "Structure fracture: bonds=" << nfrac << " no new actor (graph updated)\n";
+    return;
+  }
+  if (actors > 128) {
+    std::cerr << "Structure fracture: bonds=" << nfrac << " actors=" << actors
+              << " occupancy extract skipped (too many islands)\n";
+    return;
+  }
+
+  const NvBlastChunk* chunks = NvBlastAssetGetChunks(inst->blast.asset, sceneBlastLog);
+  const uint32_t nA = NvBlastFamilyGetActorCount(inst->blast.family, sceneBlastLog);
+  std::vector<NvBlastActor*> actorList(nA, nullptr);
+  NvBlastFamilyGetActors(actorList.data(), nA, inst->blast.family, sceneBlastLog);
+  std::unordered_map<uint32_t, const blast::GraphNode*> nodeById;
+  for (const blast::GraphNode& n : inst->graph.nodes) {
+    nodeById[n.stableId] = &n;
+  }
+
+  struct Piece {
+    std::vector<voxel::FineCoord> fines;
+    uint8_t anchored = 0;
+    VoxelObjectId owner{};
+  };
+  std::vector<Piece> pieces;
+  for (uint32_t i = 0; i < nA; ++i) {
+    NvBlastActor* a = actorList[i];
+    if (a == nullptr) {
+      continue;
+    }
+    const uint32_t nv = NvBlastActorGetVisibleChunkCount(a, sceneBlastLog);
+    if (nv == 0) {
+      continue;
+    }
+    std::vector<uint32_t> vis(nv);
+    NvBlastActorGetVisibleChunkIndices(vis.data(), nv, a, sceneBlastLog);
+    std::vector<voxel::FineCoord> fines;
+    for (uint32_t ci : vis) {
+      const uint32_t stable = chunks[ci].userData;
+      const auto it = nodeById.find(stable);
+      if (it == nodeById.end()) {
+        continue;
+      }
+      for (const blast::VoxelCoord& p : it->second->voxels) {
+        fines.push_back(voxel::FineCoord{p.x, p.y, p.z});
+      }
+    }
+    if (fines.empty()) {
+      continue;
+    }
+    Piece piece;
+    piece.fines = std::move(fines);
+    piece.anchored = NvBlastActorHasExternalBonds(a, sceneBlastLog) ? 1 : 0;
+    piece.owner = objectOwningFamilyFine(glm::ivec3(piece.fines[0].x, piece.fines[0].y, piece.fines[0].z));
+    if (!piece.owner.valid()) {
+      piece.owner = inst->objectId;
+    }
+    pieces.push_back(std::move(piece));
+  }
+
+  std::unordered_map<uint32_t, std::vector<size_t>> bySlot;
+  for (size_t i = 0; i < pieces.size(); ++i) {
+    if (pieces[i].owner.valid()) {
+      bySlot[pieces[i].owner.slot].push_back(i);
+    }
+  }
+  for (const auto& kv : bySlot) {
+    if (kv.second.size() <= 1) {
+      continue;
+    }
+    VoxelObjectId owner = pieces[kv.second.front()].owner;
+    uint32_t liveIslands = 0;
+    for (size_t idx : kv.second) {
+      if (familyFinesOnObject(owner, pieces[idx].fines)) {
+        ++liveIslands;
+      }
+    }
+    if (liveIslands <= 1) {
+      continue;
+    }
+    std::vector<std::vector<voxel::FineCoord>> islands;
+    std::vector<uint8_t> anchored;
+    islands.reserve(kv.second.size());
+    anchored.reserve(kv.second.size());
+    for (size_t idx : kv.second) {
+      islands.push_back(std::move(pieces[idx].fines));
+      anchored.push_back(pieces[idx].anchored);
+    }
+    commitOccupancySplit(gfx, owner, islands, anchored, 1);
+  }
 }

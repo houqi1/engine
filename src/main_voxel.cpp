@@ -1,5 +1,8 @@
+#include "blast/BlastMemory.h"
+#include "blast/CylinderVoxels.h"
 #include "core/Window.h"
 #include "gfx/GfxDevice.h"
+#include "physics/PhysicsTypes.h"
 #include "render/VoxelRenderer.h"
 #include "scene/VoxelScene.h"
 
@@ -24,6 +27,9 @@
 #include <iomanip>
 #include <iostream>
 #include <locale>
+#include <cstdio>
+#include <ostream>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -41,6 +47,7 @@ namespace {
 
 struct Options {
   bool benchmark = false;
+  bool e2Perf = false;
   bool help = false;
   uint32_t frames = 300;
   uint32_t warmup = 60;
@@ -78,6 +85,8 @@ Options parseOptions(int argc, char** argv) {
     };
     if (arg == "--benchmark") {
       options.benchmark = true;
+    } else if (arg == "--e2-perf") {
+      options.e2Perf = true;
     } else if (arg == "--help" || arg == "-h") {
       options.help = true;
     } else if (arg == "--frames") {
@@ -120,7 +129,10 @@ Options parseOptions(int argc, char** argv) {
       throw std::runtime_error("Unknown option: " + std::string(arg));
     }
   }
-  if (argc > 1 && !options.benchmark && !options.help) {
+  if (options.benchmark && options.e2Perf) {
+    throw std::runtime_error("Use either --benchmark or --e2-perf, not both");
+  }
+  if (argc > 1 && !options.benchmark && !options.e2Perf && !options.help) {
     throw std::runtime_error("Rendering options require --benchmark; use --help for usage");
   }
   auto outputPath = [](const std::string& text) -> std::filesystem::path {
@@ -391,6 +403,362 @@ void runBenchmark(const Options& options, Window& window, GfxDevice& gfx, VoxelS
   std::cout << "Benchmark complete: " << quality << std::endl;
 }
 
+struct E2PerfSample {
+  double updateMs = 0;
+  double commitMs = 0;
+  float solveMs = 0;
+  float probeMs = 0;
+  float statsMs = 0;
+  float candidateMs = 0;
+  float collideMs = 0;
+  float contactSolveMs = 0;
+  float integrateMs = 0;
+  float rebuildMs = 0;
+  float structureCbMs = 0;
+  int awake = 0;
+  int occupied = 0;
+  int contacts = 0;
+  uint32_t candidates = 0;
+  uint32_t actors = 1;
+  uint32_t probeExports = 0;
+};
+
+struct PerfLog {
+  FILE* f = nullptr;
+  explicit PerfLog(const std::filesystem::path& path) {
+    f = std::fopen(path.string().c_str(), "w");
+    if (f != nullptr) {
+      std::setvbuf(f, nullptr, _IONBF, 0);
+    }
+  }
+  PerfLog(const PerfLog&) = delete;
+  PerfLog& operator=(const PerfLog&) = delete;
+  ~PerfLog() {
+    if (f != nullptr) {
+      std::fflush(f);
+      std::fclose(f);
+      f = nullptr;
+    }
+  }
+  void line(const std::string& s) {
+    if (f != nullptr) {
+      std::fwrite(s.data(), 1, s.size(), f);
+      std::fputc('\n', f);
+      std::fflush(f);
+    }
+#ifdef _WIN32
+    OutputDebugStringA(s.c_str());
+    OutputDebugStringA("\n");
+#endif
+  }
+};
+
+void printE2PerfPhase(PerfLog& out, const char* name, const std::vector<E2PerfSample>& samples) {
+  auto med = [](std::vector<double> v) -> double {
+    if (v.empty()) {
+      return 0.0;
+    }
+    std::sort(v.begin(), v.end());
+    const size_t n = v.size();
+    return 0.5 * (v[(n - 1) / 2] + v[n / 2]);
+  };
+  std::vector<double> update, commit, solve, probe, stats, cand, collide, contact, integ, rebuild, structCb, engine;
+  update.reserve(samples.size());
+  for (const E2PerfSample& s : samples) {
+    update.push_back(s.updateMs);
+    commit.push_back(s.commitMs);
+    solve.push_back(s.solveMs);
+    probe.push_back(s.probeMs);
+    stats.push_back(s.statsMs);
+    cand.push_back(s.candidateMs);
+    collide.push_back(s.collideMs);
+    contact.push_back(s.contactSolveMs);
+    integ.push_back(s.integrateMs);
+    rebuild.push_back(s.rebuildMs);
+    structCb.push_back(s.structureCbMs);
+    engine.push_back(s.updateMs - static_cast<double>(s.structureCbMs) + s.commitMs);
+  }
+  E2PerfSample last{};
+  if (!samples.empty()) {
+    last = samples.back();
+  }
+  std::ostringstream row;
+  row << std::fixed << std::setprecision(3);
+  row << "## D " << name << "  n=" << samples.size() << "  occupiedBodies=" << last.occupied
+      << " awake=" << last.awake << " contacts=" << last.contacts << " cand=" << last.candidates
+      << " actors=" << last.actors << " exports=" << last.probeExports;
+  out.line(row.str());
+  row.str(std::string());
+  row.clear();
+  row << std::fixed << std::setprecision(3);
+  row << "median update=" << med(update) << "  commit=" << med(commit) << "  A solve=" << med(solve)
+      << "  B probe=" << med(probe) << "  C stats=" << med(stats) << " cand=" << med(cand);
+  out.line(row.str());
+  row.str(std::string());
+  row.clear();
+  row << std::fixed << std::setprecision(3);
+  row << "median collide=" << med(collide) << "  contactSolve=" << med(contact)
+      << "  integrate=" << med(integ) << "  rebuild=" << med(rebuild) << "  struct-cb=" << med(structCb);
+  out.line(row.str());
+  row.str(std::string());
+  row.clear();
+  row << std::fixed << std::setprecision(3);
+  row << "median engine-without-structure (D)=" << med(engine) << " ms / tick";
+  out.line(row.str());
+}
+
+struct E2FpsSample {
+  double frameMs = 0;
+  double updateMs = 0;
+  double commitMs = 0;
+  double drawMs = 0;
+  float solveMs = 0;
+  float probeMs = 0;
+  float statsMs = 0;
+  float candidateMs = 0;
+  float collideMs = 0;
+  float structureCbMs = 0;
+  uint32_t candidates = 0;
+  uint32_t actors = 1;
+  uint32_t fractured = 0;
+  uint32_t exports = 0;
+  int awake = 0;
+  int contacts = 0;
+};
+
+void printE2FpsPhase(PerfLog& out, const char* name, const std::vector<E2FpsSample>& samples) {
+  auto med = [](std::vector<double> v) -> double {
+    if (v.empty()) {
+      return 0.0;
+    }
+    std::sort(v.begin(), v.end());
+    const size_t n = v.size();
+    return 0.5 * (v[(n - 1) / 2] + v[n / 2]);
+  };
+  auto p95 = [](std::vector<double> v) -> double {
+    if (v.empty()) {
+      return 0.0;
+    }
+    std::sort(v.begin(), v.end());
+    const size_t n = v.size();
+    return v[static_cast<size_t>(std::ceil(0.95 * static_cast<double>(n))) - 1];
+  };
+  std::vector<double> frame, update, commit, draw, solve, probe, collide, structCb;
+  frame.reserve(samples.size());
+  for (const E2FpsSample& s : samples) {
+    frame.push_back(s.frameMs);
+    update.push_back(s.updateMs);
+    commit.push_back(s.commitMs);
+    draw.push_back(s.drawMs);
+    solve.push_back(s.solveMs);
+    probe.push_back(s.probeMs);
+    collide.push_back(s.collideMs);
+    structCb.push_back(s.structureCbMs);
+  }
+  E2FpsSample last{};
+  if (!samples.empty()) {
+    last = samples.back();
+  }
+  const double medFrame = med(frame);
+  const double fps = medFrame > 1e-6 ? 1000.0 / medFrame : 0.0;
+  const double fpsP95 = p95(frame) > 1e-6 ? 1000.0 / p95(frame) : 0.0;
+  const double maxFrame = frame.empty() ? 0.0 : *std::max_element(frame.begin(), frame.end());
+  std::ostringstream row;
+  row << std::fixed << std::setprecision(2);
+  row << "## FPS " << name << "  n=" << samples.size() << "  median=" << fps << " fps  p95=" << fpsP95
+      << " fps  frame=" << medFrame << " ms (p95 " << p95(frame) << " max " << maxFrame << ")";
+  out.line(row.str());
+  row.str(std::string());
+  row.clear();
+  row << std::fixed << std::setprecision(2);
+  row << "  update=" << med(update) << "  commit=" << med(commit) << "  draw=" << med(draw)
+      << "  solve=" << med(solve) << "  probe=" << med(probe) << "  collide=" << med(collide)
+      << "  struct-cb=" << med(structCb);
+  out.line(row.str());
+  row.str(std::string());
+  row.clear();
+  row << "  last cand=" << last.candidates << " actors=" << last.actors << " fractured=" << last.fractured
+      << " exports=" << last.exports << " awake=" << last.awake << " contacts=" << last.contacts;
+  out.line(row.str());
+}
+
+void runE2PerfLiveFps(Window& window, GfxDevice& gfx, VoxelScene& scene, PerfLog& out) {
+  out.line("live FPS: 1280x720 DDA + ImGui, wall-clock dt (same loop as the demo)");
+  out.line(std::string("present=") + gfx.presentModeName());
+  VoxelRenderer renderer(gfx);
+  renderer.init(scene);
+  const float aspect = (gfx.swapchainExtent().height > 0)
+                           ? static_cast<float>(gfx.swapchainExtent().width) /
+                                 static_cast<float>(gfx.swapchainExtent().height)
+                           : 16.0f / 9.0f;
+  scene.camera().update(aspect);
+
+  auto last = std::chrono::steady_clock::now();
+  auto step = [&]() -> E2FpsSample {
+    window.pollEvents();
+    const auto now = std::chrono::steady_clock::now();
+    float dt = std::chrono::duration<float>(now - last).count();
+    last = now;
+    if (!(dt > 0.0f) || dt > 0.25f) {
+      dt = physics::kDt;
+    }
+    E2FpsSample s;
+    const auto t0 = std::chrono::steady_clock::now();
+    scene.camera().update(aspect);
+    scene.update(dt);
+    const auto t1 = std::chrono::steady_clock::now();
+    scene.commitStructureSplits(gfx);
+    const auto t2 = std::chrono::steady_clock::now();
+    const float fps = dt > 0.0f ? 1.0f / dt : 0.0f;
+    (void)renderer.draw(scene, fps);
+    const auto t3 = std::chrono::steady_clock::now();
+    s.frameMs = std::chrono::duration<double, std::milli>(t3 - t0).count();
+    s.updateMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    s.commitMs = std::chrono::duration<double, std::milli>(t2 - t1).count();
+    s.drawMs = std::chrono::duration<double, std::milli>(t3 - t2).count();
+    const blast::StructureDebugSnapshot& st = scene.structures().debug();
+    const physics::DebugSolve ds = scene.physicsDebug();
+    s.solveMs = st.solveMs;
+    s.probeMs = st.probeMs;
+    s.statsMs = st.statsMs;
+    s.candidateMs = st.candidateMs;
+    s.collideMs = ds.collideMs;
+    s.structureCbMs = ds.structureCallbackMs;
+    s.candidates = st.candidateCount;
+    s.actors = st.splitActors;
+    s.fractured = st.fracturedBonds;
+    s.exports = st.probeExportCount;
+    s.awake = ds.awakeBodies;
+    s.contacts = ds.contacts;
+    return s;
+  };
+
+  auto measure = [&](int warmup, int frames, const char* name) {
+    for (int i = 0; i < warmup; ++i) {
+      (void)step();
+    }
+    std::vector<E2FpsSample> samples;
+    samples.reserve(static_cast<size_t>(frames));
+    for (int i = 0; i < frames; ++i) {
+      samples.push_back(step());
+    }
+    printE2FpsPhase(out, name, samples);
+  };
+
+  scene.setStressCylinderSolverIters(200);
+  scene.structures().setFractureEnabled(false);
+  scene.structures().setStrengthPa(blast::kE2StrengthHoldPa);
+  measure(10, 30, "intact, fracture off");
+
+  // Panel order the user hits: Stress fracture, Fail strength, then Cut 270.
+  scene.structures().setFractureEnabled(true);
+  scene.structures().setStrengthPa(blast::kE2StrengthFailPa);
+  measure(10, 30, "intact, fracture + fail, before cut");
+
+  if (!scene.cutStressCylinder270(gfx)) {
+    throw std::runtime_error("cutStressCylinder270 failed in FPS run");
+  }
+  {
+    std::vector<E2FpsSample> cascade;
+    bool split = false;
+    for (int i = 0; i < 45; ++i) {
+      cascade.push_back(step());
+      if (cascade.back().actors > 1) {
+        split = true;
+      }
+    }
+    printE2FpsPhase(out, split ? "cut + colors + fracture + fail cascade" : "cut + colors + fracture + fail (no split)",
+                    cascade);
+  }
+  measure(10, 90, "cut + colors + fracture + fail after cascade");
+  out.line("OK e2-perf live FPS");
+}
+
+void runE2PerfEngine(Window& window, GfxDevice& gfx, VoxelScene& scene, PerfLog& out) {
+  out.line("blast e2-perf D: same cylinder in VoxelScene + PhysicsWorld (no DDA draw)");
+  out.line("spawn...");
+  if (!scene.spawnStressCylinder(gfx)) {
+    throw std::runtime_error("spawnStressCylinder failed");
+  }
+  out.line("spawn ok");
+  scene.setStressCylinderSolverIters(200);
+  scene.structures().setFractureEnabled(false);
+  scene.structures().setStrengthPa(blast::kE2StrengthHoldPa);
+
+  auto drive = [&](int frames) -> std::vector<E2PerfSample> {
+    std::vector<E2PerfSample> samples;
+    samples.reserve(static_cast<size_t>(frames));
+    for (int i = 0; i < frames; ++i) {
+      window.pollEvents();
+      E2PerfSample s;
+      const auto t0 = std::chrono::steady_clock::now();
+      scene.update(physics::kDt);
+      const auto t1 = std::chrono::steady_clock::now();
+      scene.commitStructureSplits(gfx);
+      const auto t2 = std::chrono::steady_clock::now();
+      s.updateMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+      s.commitMs = std::chrono::duration<double, std::milli>(t2 - t1).count();
+      const blast::StructureDebugSnapshot& st = scene.structures().debug();
+      const physics::DebugSolve ds = scene.physicsDebug();
+      s.solveMs = st.solveMs;
+      s.probeMs = st.probeMs;
+      s.statsMs = st.statsMs;
+      s.candidateMs = st.candidateMs;
+      s.collideMs = ds.collideMs;
+      s.contactSolveMs = ds.contactSolveMs;
+      s.integrateMs = ds.integrateMs;
+      s.rebuildMs = ds.rebuildMs;
+      s.structureCbMs = ds.structureCallbackMs;
+      s.awake = ds.awakeBodies;
+      s.occupied = ds.occupiedBodies;
+      s.contacts = ds.contacts;
+      s.candidates = st.candidateCount;
+      s.actors = st.splitActors;
+      s.probeExports = st.probeExportCount;
+      samples.push_back(s);
+    }
+    return samples;
+  };
+
+  out.line("warmup intact...");
+  (void)drive(4);
+  printE2PerfPhase(out, "intact standing, fracture off", drive(12));
+
+  out.line("cut 270...");
+  if (!scene.cutStressCylinder270(gfx)) {
+    throw std::runtime_error("cutStressCylinder270 failed");
+  }
+  out.line("cut ok");
+  scene.structures().setFractureEnabled(false);
+  scene.structures().setStrengthPa(blast::kE2StrengthHoldPa);
+  (void)drive(3);
+  printE2PerfPhase(out, "cut, fracture off", drive(8));
+
+  scene.structures().setStrengthPa(blast::kE2StrengthFailPa);
+  scene.structures().setFractureEnabled(true);
+  out.line("fracture on, wait split...");
+  std::vector<E2PerfSample> untilSplit;
+  bool split = false;
+  for (int i = 0; i < 16; ++i) {
+    auto one = drive(1);
+    untilSplit.insert(untilSplit.end(), one.begin(), one.end());
+    if (!untilSplit.empty() && untilSplit.back().actors > 1) {
+      split = true;
+      break;
+    }
+  }
+  printE2PerfPhase(out, "cut + fail-S until first split", untilSplit);
+  out.line(std::string("split=") + (split ? "yes" : "no"));
+  if (split) {
+    printE2PerfPhase(out, "fragments after split", drive(12));
+  }
+  out.line("OK e2-perf D");
+  if (!scene.resetStressCylinder(gfx)) {
+    throw std::runtime_error("resetStressCylinder failed before FPS run");
+  }
+  runE2PerfLiveFps(window, gfx, scene, out);
+}
+
 void appendCrashLog(const char* message) {
   std::ofstream log("vulkan_engine_voxel_crash.log", std::ios::app);
   if (!log) {
@@ -416,10 +784,12 @@ void showFatal(const char* message, bool dialogs) {
 int main(int argc, char** argv) {
   // CLI failures must not block automation, including errors before --benchmark is parsed.
   const bool dialogs = argc == 1;
+  blast::BlastRuntime blastRt;
   try {
     const Options options = parseOptions(argc, argv);
     if (options.help) {
-      std::cout << "Usage: vulkan_engine_voxel --benchmark [options]\n"
+      std::cout << "Usage: vulkan_engine_voxel [--benchmark options | --e2-perf]\n"
+                   "  --e2-perf        Headless-ish E2 layer D: spawn cylinder, time scene+collision, exit\n"
                    "  --frames N       Measured submitted frames (default 300, >0)\n"
                    "  --warmup N       Excluded submitted frames (default 60, >=0)\n"
                    "  --width N --height N  Exact framebuffer pixels (default 2560 1440)\n"
@@ -434,6 +804,10 @@ int main(int argc, char** argv) {
                    "No arguments starts the interactive demo.\n";
       return 0;
     }
+    if (!blastRt.init()) {
+      showFatal("Blast runtime failed to initialize", dialogs);
+      return 1;
+    }
     Window window(WindowConfig{
         .title = "Vulkan Engine - Voxel Demo",
         .width = options.benchmark ? options.width : 1280,
@@ -444,18 +818,47 @@ int main(int argc, char** argv) {
       sizeBenchmarkWindow(window, options);
     }
 #ifdef _WIN32
-    if (!options.benchmark) {
+    if (!options.benchmark && !options.e2Perf) {
       if (HWND hwnd = glfwGetWin32Window(window.handle())) {
         SetWindowPos(hwnd, HWND_TOPMOST, 160, 160, 0, 0, SWP_SHOWWINDOW | SWP_NOSIZE);
         SetForegroundWindow(hwnd);
         SetWindowPos(hwnd, HWND_NOTOPMOST, 160, 160, 0, 0, SWP_SHOWWINDOW | SWP_NOSIZE);
       }
     }
+    if (options.e2Perf) {
+      if (AttachConsole(ATTACH_PARENT_PROCESS) || AllocConsole()) {
+        FILE* fp = nullptr;
+        freopen_s(&fp, "CONOUT$", "w", stdout);
+        freopen_s(&fp, "CONOUT$", "w", stderr);
+      }
+    }
 #endif
 
     GfxDevice gfx(window);
     VoxelScene scene;
-    scene.init(gfx);
+    scene.init(gfx, blastRt);
+
+    if (options.e2Perf) {
+      const std::filesystem::path reportPath =
+          std::filesystem::path(VE_ASSETS_DIR).parent_path() / "docs" / "blast-e2-perf-engine.txt";
+      PerfLog log(reportPath);
+      if (log.f == nullptr) {
+        throw std::runtime_error("Cannot open " + reportPath.string());
+      }
+      log.line(std::string("report=") + reportPath.string());
+      try {
+        runE2PerfEngine(window, gfx, scene, log);
+      } catch (const std::exception& ex) {
+        log.line(std::string("ERROR: ") + ex.what());
+        gfx.waitIdle();
+        scene.cleanup(gfx);
+        throw;
+      }
+      gfx.waitIdle();
+      scene.cleanup(gfx);
+      blastRt.shutdown();
+      return 0;
+    }
 
     if (options.benchmark) {
       try {
@@ -467,6 +870,7 @@ int main(int argc, char** argv) {
       }
       gfx.waitIdle();
       scene.cleanup(gfx);
+      blastRt.shutdown();
       return 0;
     }
 
@@ -503,13 +907,16 @@ int main(int argc, char** argv) {
       scene.advanceFractureWork(dt);
       scene.commitReadyFractures(gfx);
       scene.update(dt);
+      scene.commitStructureSplits(gfx);
       renderer.draw(scene, fps);
     }
 
     gfx.waitIdle();
     scene.cleanup(gfx);
+    blastRt.shutdown();
   } catch (const std::exception& ex) {
     showFatal(ex.what(), dialogs);
+    blastRt.shutdown();
     return 1;
   }
   return 0;

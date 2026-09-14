@@ -1,5 +1,6 @@
 #pragma once
 
+#include "blast/ContactLoads.h"
 #include "physics/PhysicsTypes.h"
 #include "physics/RigidBody.h"
 #include "scene/VoxelTypes.h"
@@ -23,11 +24,17 @@ struct BodyState {
 
 class PhysicsWorld {
 public:
+  using FixedPhysicsTickFn = void (*)(void* user, uint64_t tickId, float dt);
+
   void attach(VoxelScene& scene);
   void rebuildFromScene();
   void markDirty(int objectIndex);
   void step(float frameDt);
   void syncTransformsToScene();
+  // Non-owning. Physics does not include Blast; the scene forwards to StructureWorld.
+  void setFixedTickCallback(FixedPhysicsTickFn fn, void* user);
+  void resetTickSession();
+  uint64_t tickId() const { return clock_.tickId; }
 
   bool getBodyState(VoxelObjectId id, BodyState& out) const;
   bool addBody(VoxelObjectId id, const BodyState& state);
@@ -38,6 +45,7 @@ public:
 
   const ShapeClass* shapeClass(int objectIndex) const;
   DebugSolve debugSolve() const { return debug_; }
+  const std::vector<blast::WorldContactImpulse>& tickImpulses() const { return tickImpulses_; }
 
 private:
   void ensureBodyCapacity(int n);
@@ -45,12 +53,17 @@ private:
   void rebuildDirty();
   void substep();
   void updateSleep(float h);
+  void recordSubstepImpulses(const std::vector<Contact>& contacts, int substep);
 
   VoxelScene* scene_ = nullptr;
   std::vector<RigidBody> bodies_;
   std::vector<ShapeClass> classes_;
-  float accumulator_ = 0.0f;
+  FixedStepClock clock_{};
+  FixedPhysicsTickFn tickFn_ = nullptr;
+  void* tickUser_ = nullptr;
   DebugSolve debug_{};
+  std::vector<blast::WorldContactImpulse> tickImpulses_;
+  int substepIndex_ = 0;
 };
 
 }  // namespace physics

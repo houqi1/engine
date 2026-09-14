@@ -183,7 +183,8 @@ void computeMassProperties(VoxelScene& scene, int objectIndex, RigidBody& body) 
   const int F = VoxelScene::kFinePerCoarse;
   const float s = o.voxelSize / static_cast<float>(F);
   const double s3 = static_cast<double>(s) * static_cast<double>(s) * static_cast<double>(s);
-  const double miFine = static_cast<double>(kDensityWood) * s3;
+  const float rho = o.density > 0.0f ? o.density : kDensityWood;
+  const double miFine = static_cast<double>(rho) * s3;
   const glm::vec3 gridCenter = 0.5f * static_cast<float>(o.gridSize) * o.voxelSize * glm::vec3(1.0f);
 
   double mass = 0.0;

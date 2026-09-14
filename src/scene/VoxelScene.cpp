@@ -1,5 +1,8 @@
 #include "scene/VoxelScene.h"
 
+#include "blast/CylinderVoxels.h"
+#include "blast/HardFracture.h"
+#include "blast/OccupancySampler.h"
 #include "gfx/GfxDevice.h"
 #include "gfx/Texture.h"
 #include "physics/VoxelCollide.h"
@@ -20,6 +23,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -179,9 +183,36 @@ void VoxelScene::freeObjectSlot(uint32_t slot) {
   if (testObjectId_.slot == slot) {
     testObjectId_ = {};
   }
+  if (stressCylinderId_.slot == slot) {
+    structures_.unmount(stressCylinderId_);
+    stressCylinderId_ = {};
+  }
 }
 
-void VoxelScene::init(GfxDevice& gfx) {
+VoxelScene::~VoxelScene() { stopStructureTicks(); }
+
+void VoxelScene::bindStructureTicks() {
+  physics_.setFixedTickCallback(
+      [](void* user, uint64_t tickId, float dt) {
+        auto* scene = static_cast<VoxelScene*>(user);
+        const auto& imps = scene->physics_.tickImpulses();
+        scene->structures_.onPhysicsTick(tickId, dt, imps.data(), static_cast<uint32_t>(imps.size()));
+      },
+      this);
+}
+
+void VoxelScene::stopStructureTicks() { physics_.setFixedTickCallback(nullptr, nullptr); }
+
+void VoxelScene::resetStructureSession() {
+  structures_.clear();
+  physics_.resetTickSession();
+  stressCylinderId_ = {};
+  stressCylinderCut_ = false;
+  stressCylinderDoubleDensity_ = false;
+  stressCylinderDisplay_ = false;
+}
+
+void VoxelScene::init(GfxDevice& gfx, blast::BlastRuntime& runtime) {
   // Ground top is 2 coarse cells (3.2 m at default). Orbit from about eye height above it.
   camera_.setOrbitTarget(glm::vec3(0.0f, 4.0f, 0.0f));
   camera_.setOrbitDistance(24.0f);
@@ -198,6 +229,10 @@ void VoxelScene::init(GfxDevice& gfx) {
 
   rebuildVoxels(gfx);
   physics_.attach(*this);
+  if (!structures_.init(runtime)) {
+    throw std::runtime_error("StructureWorld init failed: Blast runtime is not initialized");
+  }
+  bindStructureTicks();
 
   const std::string pirateObj =
       std::string(VE_ASSETS_DIR) + "/meshes/pirate-building/Piratebuilding.obj";
@@ -207,6 +242,8 @@ void VoxelScene::init(GfxDevice& gfx) {
 }
 
 void VoxelScene::cleanup(GfxDevice& gfx) {
+  stopStructureTicks();
+  structures_.shutdown();
   voxelizeGpu_.destroy(gfx);
   destroyGridImages(gfx);
   gfx.destroyBuffer(dummyBrickSlabBuffer_);
@@ -249,8 +286,10 @@ void VoxelScene::update(float dt) {
     o.nestedMicro = nestedMicroVoxels_;
   }
   if (simulate_) {
-    if (VoxelObject* test = tryGetObject(testObjectId_)) {
-      test->enabled = true;
+    if (spawnTestBoxOnSimulate_) {
+      if (VoxelObject* test = tryGetObject(testObjectId_)) {
+        test->enabled = true;
+      }
     }
     physics_.step(dt);
     physics_.syncTransformsToScene();
@@ -1242,29 +1281,51 @@ void VoxelScene::buildTestBoxObject(VoxelObject& o) {
   }
 }
 
-void VoxelScene::setSimulate(GfxDevice& gfx, bool on) {
-  if (simulate_ == on) {
+void VoxelScene::fillTestSlot(VoxelObject& o) {
+  if (simulate_ && spawnTestBoxOnSimulate_) {
+    buildTestBoxObject(o);
     return;
   }
-  simulate_ = on;
+  buildSpinnerObject(o);
+  if (simulate_) {
+    o.enabled = false;
+  }
+}
+
+void VoxelScene::rebuildTestSlot(GfxDevice& gfx) {
   VoxelObject* test = tryGetObject(testObjectId_);
   if (!test) {
     return;
   }
   const int testSlot = static_cast<int>(testObjectId_.slot);
   clearObjectPages(*test);
-  if (on) {
-    buildTestBoxObject(*test);
-    test->enabled = true;
-  } else {
-    buildSpinnerObject(*test);
-    test->enabled = spinnerEnabled_;
-  }
+  fillTestSlot(*test);
   testObjectId_ = makeObjectId(testObjectId_.slot);
   packObjectPool();
   flushObject(gfx, testSlot);
   physics_.attach(*this);
   physics_.rebuildFromScene();
+}
+
+void VoxelScene::setSimulate(GfxDevice& gfx, bool on) {
+  if (simulate_ == on) {
+    return;
+  }
+  simulate_ = on;
+  rebuildTestSlot(gfx);
+  if (tryGetObject(testObjectId_)) {
+    resetStructureSession();
+  }
+}
+
+void VoxelScene::setSpawnTestBoxOnSimulate(GfxDevice& gfx, bool on) {
+  if (spawnTestBoxOnSimulate_ == on) {
+    return;
+  }
+  spawnTestBoxOnSimulate_ = on;
+  if (simulate_) {
+    rebuildTestSlot(gfx);
+  }
 }
 
 void VoxelScene::clearScatterBoxes(GfxDevice& gfx) {
@@ -1486,11 +1547,7 @@ void VoxelScene::rebuildVoxels(GfxDevice& gfx) {
   buildGroundObject(objects_[0]);
   groundObjectId_ = makeObjectId(0);
   objects_[1].slotOccupied = true;
-  if (simulate_) {
-    buildTestBoxObject(objects_[1]);
-  } else {
-    buildSpinnerObject(objects_[1]);
-  }
+  fillTestSlot(objects_[1]);
   testObjectId_ = makeObjectId(1);
 
   packObjectPool();
@@ -1500,6 +1557,7 @@ void VoxelScene::rebuildVoxels(GfxDevice& gfx) {
   dirtyPages_.clear();
   physics_.attach(*this);
   physics_.rebuildFromScene();
+  resetStructureSession();
 
   if (!lastImportedPath_.empty()) {
     MeshVoxelizeConfig cfg;
@@ -1508,6 +1566,279 @@ void VoxelScene::rebuildVoxels(GfxDevice& gfx) {
     cfg.sampleColor = importSampleColor_;
     cfg.conservative = importConservative_;
     importSurfaceMesh(gfx, lastImportedPath_, cfg);
+  }
+}
+
+void VoxelScene::splitFineIndex(int fx, int fy, int fz, glm::ivec3& coarse, glm::ivec3& micro,
+                                glm::ivec3& fine) const {
+  const int stride = kFinePerCoarse;
+  coarse = {fx / stride, fy / stride, fz / stride};
+  const int rx = fx - coarse.x * stride;
+  const int ry = fy - coarse.y * stride;
+  const int rz = fz - coarse.z * stride;
+  micro = {rx / kFineRes, ry / kFineRes, rz / kFineRes};
+  fine = {rx - micro.x * kFineRes, ry - micro.y * kFineRes, rz - micro.z * kFineRes};
+}
+
+void VoxelScene::destroyStressCylinderObject() {
+  if (!stressCylinderId_.valid()) {
+    return;
+  }
+  structures_.unmount(stressCylinderId_);
+  const uint32_t slot = stressCylinderId_.slot;
+  stressCylinderId_ = {};
+  freeObjectSlot(slot);
+}
+
+namespace {
+
+class CylinderObjectView final : public blast::OccupancyView {
+public:
+  CylinderObjectView(const VoxelScene& scene, int objectIndex, const blast::CylinderRaster& spec)
+      : scene_(scene), objectIndex_(objectIndex), spec_(spec) {}
+  int nx() const override { return spec_.nx; }
+  int ny() const override { return spec_.ny; }
+  int nz() const override { return spec_.nz; }
+  float voxelSize() const override { return spec_.voxelSize; }
+  float density() const override { return blast::kE1Density; }
+  bool solid(int x, int y, int z) const override {
+    glm::ivec3 c, m, f;
+    scene_.splitFineIndex(x, y, z, c, m, f);
+    return scene_.occupancyFine(objectIndex_, c, m, f);
+  }
+  bool anchor(int x, int y, int z) const override {
+    return solid(x, y, z) && blast::isBaseAnchorFine(x, y, z, spec_);
+  }
+
+private:
+  const VoxelScene& scene_;
+  int objectIndex_;
+  blast::CylinderRaster spec_;
+};
+
+}  // namespace
+
+bool VoxelScene::mountCylinderFromOccupancy(GfxDevice& gfx) {
+  VoxelObject* o = tryGetObject(stressCylinderId_);
+  if (o == nullptr) {
+    return false;
+  }
+  const blast::CylinderRaster spec{};
+  CylinderObjectView view(*this, static_cast<int>(stressCylinderId_.slot), spec);
+  blast::OccupancySampleOpts opts;
+  opts.agg = blast::kE1Agg;
+  const auto t0 = std::chrono::steady_clock::now();
+  blast::OccupancySample sample = blast::sampleOccupancy(view, opts);
+  const auto t1 = std::chrono::steady_clock::now();
+  if (sample.error != blast::BlastError::Ok) {
+    std::cerr << "OccupancySampler: " << sample.message << "\n";
+    return false;
+  }
+  const blast::BlastError err = structures_.mountSample(
+      stressCylinderId_, std::move(sample), 200, blast::kE1StrengthHoldPa, blast::cylinderAxisX(spec),
+      blast::cylinderAxisZ(spec));
+  if (err != blast::BlastError::Ok) {
+    std::cerr << "StructureWorld mount: " << structures_.lastError() << "\n";
+    return false;
+  }
+  if (blast::StructureInstance* inst = structures_.instance()) {
+    inst->debug.extractMs = std::chrono::duration<float, std::milli>(t1 - t0).count();
+    inst->topologyRevision = o->topologyRevision;
+    inst->debug.topologyRevision = o->topologyRevision;
+    inst->cutApplied = stressCylinderCut_;
+    inst->debug.cut = stressCylinderCut_;
+  }
+  if (stressCylinderDoubleDensity_) {
+    structures_.setDensityScale(2.0f);
+  }
+  o->topologyRevision += 1;
+  packObjectPool();
+  flushObject(gfx, static_cast<int>(stressCylinderId_.slot));
+  notifyOccupancyChanged(static_cast<int>(stressCylinderId_.slot));
+  physics_.rebuildFromScene();
+  if (stressCylinderDisplay_) {
+    paintCylinderStress(gfx);
+  }
+  (void)gfx;
+  return true;
+}
+
+void VoxelScene::paintCylinderStress(GfxDevice& gfx) {
+  VoxelObject* o = tryGetObject(stressCylinderId_);
+  const blast::StructureInstance* inst = structures_.instance();
+  if (o == nullptr || inst == nullptr) {
+    return;
+  }
+  o->useImportPalette = true;
+  std::unordered_map<uint32_t, float> nodeStress;
+  const uint32_t nProbe = inst->probeCount;
+  for (uint32_t sdk = 0; sdk < inst->bondMeta.size(); ++sdk) {
+    const blast::BondMeta& m = inst->bondMeta[sdk];
+    if (m.world != 0 || m.graphIndex >= inst->graph.bonds.size() || sdk >= nProbe) {
+      continue;
+    }
+    const float s = blast::probeMaxStress(inst->probes[sdk]);
+    const blast::GraphBond& b = inst->graph.bonds[m.graphIndex];
+    nodeStress[b.nodeA] = std::max(nodeStress[b.nodeA], s);
+    nodeStress[b.nodeB] = std::max(nodeStress[b.nodeB], s);
+  }
+  auto rgbFor = [](float s) {
+    const float t = std::clamp(s / blast::kE1StressColorMaxPa, 0.0f, 1.0f);
+    const uint32_t r = static_cast<uint32_t>(t * 255.0f);
+    const uint32_t bl = static_cast<uint32_t>((1.0f - t) * 255.0f);
+    return (r << 16) | (32u << 8) | bl;
+  };
+  for (const blast::GraphNode& n : inst->graph.nodes) {
+    const float s = nodeStress.count(n.stableId) ? nodeStress[n.stableId] : 0.0f;
+    const uint32_t rgb = rgbFor(s);
+    const uint32_t packed = packRgb888a(rgb);
+    for (const blast::VoxelCoord& p : n.voxels) {
+      glm::ivec3 c, m, f;
+      splitFineIndex(p.x, p.y, p.z, c, m, f);
+      if (!inBounds(*o, c)) {
+        continue;
+      }
+      const uint32_t page = cellAt(*o, indexOf(*o, c)).brickPage;
+      if (page == kInvalidBrickPage) {
+        continue;
+      }
+      const uint32_t ci = fineColorIndex(m, f);
+      if (readFineRgb(page, ci) == packed) {
+        continue;
+      }
+      writeFineRgb(page, ci, rgb);
+      dirtyPages_.insert(page);
+    }
+  }
+  flushDirtyPages(gfx);
+  lastStressPaintSolveEpoch_ = inst->solveEpoch;
+}
+
+void VoxelScene::refreshStressColors(GfxDevice& gfx) {
+  if (!stressCylinderDisplay_ || !stressCylinderId_.valid()) {
+    return;
+  }
+  const blast::StructureInstance* inst = structures_.instance();
+  if (inst == nullptr || inst->probeCount == 0) {
+    return;
+  }
+  if (inst->solveEpoch == lastStressPaintSolveEpoch_) {
+    return;
+  }
+  paintCylinderStress(gfx);
+}
+
+bool VoxelScene::spawnStressCylinder(GfxDevice& gfx) {
+  nestedMicroVoxels_ = true;
+  nestedFineVoxels_ = true;
+  if (!simulate_) {
+    setSimulate(gfx, true);
+  }
+  if (VoxelObject* test = tryGetObject(testObjectId_)) {
+    test->enabled = false;
+    physics_.removeBody(testObjectId_);
+  }
+  destroyStressCylinderObject();
+  const blast::CylinderRaster spec{};
+  const uint32_t slot = allocObjectSlot();
+  VoxelObject& o = objects_[slot];
+  o.gridSize = spec.nx / kFinePerCoarse;
+  o.voxelSize = voxelSize_;
+  o.nestedMicro = true;
+  o.editable = true;
+  o.enabled = true;
+  o.slotOccupied = true;
+  o.isScatter = false;
+  o.motionType = MotionType::Static;
+  o.density = blast::kE1Density;
+  o.topologyRevision = 1;
+  o.useImportPalette = false;
+  o.rotation = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+  const float extent = static_cast<float>(o.gridSize) * o.voxelSize;
+  o.position = glm::vec3(0.0f, 3.2f + 0.5f * extent, 0.0f);
+  o.cells.assign(static_cast<size_t>(o.gridSize * o.gridSize * o.gridSize), CoarseCell{});
+  blast::forEachCylinderFine(spec, [&](int x, int y, int z) {
+    glm::ivec3 c, m, f;
+    splitFineIndex(x, y, z, c, m, f);
+    ensureCoarseBrick(o, c, 2u);
+    setFineCpu(o, c, m, f, true);
+  });
+  stressCylinderId_ = makeObjectId(slot);
+  stressCylinderCut_ = false;
+  const bool ok = mountCylinderFromOccupancy(gfx);
+  if (!ok) {
+    destroyStressCylinderObject();
+    packObjectPool();
+    fillGpuObjectRecords();
+    ensureGpuBuffers(gfx);
+    uploadWorldAndObjects(gfx);
+    physics_.rebuildFromScene();
+    return false;
+  }
+  return true;
+}
+
+bool VoxelScene::resetStressCylinder(GfxDevice& gfx) { return spawnStressCylinder(gfx); }
+
+bool VoxelScene::cutStressCylinder270(GfxDevice& gfx) {
+  VoxelObject* o = tryGetObject(stressCylinderId_);
+  if (o == nullptr) {
+    return false;
+  }
+  const blast::CylinderRaster spec{};
+  std::vector<glm::ivec3> removed;
+  blast::forEachCylinderFine(spec, [&](int x, int y, int z) {
+    if (!blast::inBaseCut270(x, y, z, spec)) {
+      return;
+    }
+    glm::ivec3 c, m, f;
+    splitFineIndex(x, y, z, c, m, f);
+    if (setFineCpu(*o, c, m, f, false)) {
+      removed.push_back({x, y, z});
+    }
+  });
+  std::cout << "Cut 270: removed " << removed.size() << " fines (expect a 0.8 m slot above the base)\n";
+  if (removed.empty()) {
+    std::cerr << "Cut 270: no fines removed; cylinder occupancy did not match the cut mask\n";
+    return false;
+  }
+  stressCylinderCut_ = true;
+  o->topologyRevision += 1;
+  if (!mountCylinderFromOccupancy(gfx)) {
+    for (const glm::ivec3& p : removed) {
+      glm::ivec3 c, m, f;
+      splitFineIndex(p.x, p.y, p.z, c, m, f);
+      ensureCoarseBrick(*o, c, 2u);
+      setFineCpu(*o, c, m, f, true);
+    }
+    stressCylinderCut_ = false;
+    o->topologyRevision += 1;
+    mountCylinderFromOccupancy(gfx);
+    return false;
+  }
+  return true;
+}
+
+bool VoxelScene::setStressCylinderDoubleDensity(bool on) {
+  stressCylinderDoubleDensity_ = on;
+  return structures_.setDensityScale(on ? 2.0f : 1.0f);
+}
+
+void VoxelScene::setStressCylinderSolverIters(uint32_t iters) { structures_.setSolverIters(iters); }
+
+void VoxelScene::setStressCylinderDisplay(GfxDevice& gfx, bool on) {
+  stressCylinderDisplay_ = on;
+  VoxelObject* o = tryGetObject(stressCylinderId_);
+  if (o == nullptr) {
+    return;
+  }
+  if (on) {
+    lastStressPaintSolveEpoch_ = 0;
+    paintCylinderStress(gfx);
+  } else {
+    o->useImportPalette = false;
+    fillGpuObjectRecords();
+    uploadObjectTransforms(gfx, 0);
   }
 }
 

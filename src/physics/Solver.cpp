@@ -74,19 +74,24 @@ void solveContacts(std::vector<RigidBody>& bodies, std::vector<Contact>& contact
 
     // Target normal velocity: speculative gap limits approach; penetration gets
     // Baumgarte push-out; flush / within slop wants vn == 0.
-    float targetVn = 0.0f;
+    float targetVnColl = 0.0f;
+    float targetVnBaum = 0.0f;
     if (hSub > 0.0f) {
       if (c.d < 0.0f) {
-        targetVn = c.d / hSub;
+        targetVnColl = c.d / hSub;
       } else if (c.d > kSlop) {
-        targetVn = kBaumgarte * (c.d - kSlop) / hSub;
+        targetVnBaum = kBaumgarte * (c.d - kSlop) / hSub;
       }
     }
+    const float targetVn = targetVnColl + targetVnBaum;
     float dLam = (targetVn - vn) / k;
     const float lambdaN = std::max(0.0f, c.lambdaN + dLam);
     dLam = lambdaN - c.lambdaN;
     c.lambdaN = lambdaN;
     applyImpulse(A, B, c.rA, c.rB, dLam * c.n);
+    float dLamVel = (targetVnColl - vn) / k;
+    const float lambdaNVel = std::max(0.0f, c.lambdaNVel + dLamVel);
+    c.lambdaNVel = lambdaNVel;
 
     // No friction while still separated — otherwise speculative contacts brake in air.
     if (c.d < 0.0f || c.lambdaN <= 0.0f) {
@@ -112,9 +117,12 @@ void solveContacts(std::vector<RigidBody>& bodies, std::vector<Contact>& contact
     dLamT = lambdaT - c.lambdaT;
     c.lambdaT = lambdaT;
     applyImpulse(A, B, c.rA, c.rB, dLamT * t);
+    c.JtWorld += dLamT * t;
   }
   }
 }
+
+glm::vec3 contactImpulseOnA(const Contact& c) { return c.lambdaNVel * c.n + c.JtWorld; }
 
 void integrateBodies(std::vector<RigidBody>& bodies, float hSub) {
   for (RigidBody& b : bodies) {

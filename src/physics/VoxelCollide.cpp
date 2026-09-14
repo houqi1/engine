@@ -2,6 +2,8 @@
 
 #include "scene/VoxelScene.h"
 
+#include <glm/gtc/matrix_inverse.hpp>
+
 #include <algorithm>
 #include <cmath>
 #include <vector>
@@ -38,8 +40,8 @@ bool occupiedAt(const VoxelScene& scene, int objectIndex, int n, const glm::ivec
 }
 
 bool probeOccupancy(const VoxelScene& scene, int objectIndex, const VoxelObject& o,
-                    const glm::vec3& worldP, glm::ivec3& hitFine) {
-  const glm::vec3 localP = glm::vec3(o.worldToObject() * glm::vec4(worldP, 1.0f));
+                    const glm::mat4& w2o, const glm::vec3& worldP, glm::ivec3& hitFine) {
+  const glm::vec3 localP = glm::vec3(w2o * glm::vec4(worldP, 1.0f));
   const float s = fineSize(o);
   if (s <= 1e-8f) {
     return false;
@@ -61,9 +63,9 @@ bool probeOccupancy(const VoxelScene& scene, int objectIndex, const VoxelObject&
 }
 
 glm::vec3 contactNormal(const VoxelScene& scene, int objectIndex, const VoxelObject& o,
-                        const glm::ivec3& hitFine, const glm::vec3& fromWorld, int& nFace) {
+                        const glm::mat4& o2w, const glm::ivec3& hitFine, const glm::vec3& fromWorld,
+                        int& nFace) {
   const int n = finePerAxis(o);
-  const glm::mat4 o2w = o.objectToWorld();
   const glm::vec3 hitW = glm::vec3(o2w * glm::vec4(fineCenterLocal(o, hitFine), 1.0f));
   const glm::vec3 towardA = fromWorld - hitW;
   glm::vec3 best(0.0f, 1.0f, 0.0f);
@@ -96,21 +98,21 @@ glm::vec3 contactNormal(const VoxelScene& scene, int objectIndex, const VoxelObj
 
 void considerContact(const VoxelScene& scene, const RigidBody& a, const RigidBody& b,
                      const VoxelObject& oa, const VoxelObject& ob, const glm::ivec3& pA,
+                     const glm::mat4& a2w, const glm::mat4& b2w, const glm::mat4& b2o,
                      std::vector<Contact>& out) {
-  const glm::vec3 worldP = glm::vec3(oa.objectToWorld() * glm::vec4(fineCenterLocal(oa, pA), 1.0f));
+  const glm::vec3 worldP = glm::vec3(a2w * glm::vec4(fineCenterLocal(oa, pA), 1.0f));
   glm::ivec3 hitFine(0);
-  if (!probeOccupancy(scene, b.shapeIndex, ob, worldP, hitFine)) {
+  if (!probeOccupancy(scene, b.shapeIndex, ob, b2o, worldP, hitFine)) {
     return;
   }
   Contact c;
   c.a = a.shapeIndex;
   c.b = b.shapeIndex;
   c.p = worldP;
-  c.n = contactNormal(scene, b.shapeIndex, ob, hitFine, worldP, c.nFace);
+  c.n = contactNormal(scene, b.shapeIndex, ob, b2w, hitFine, worldP, c.nFace);
   c.rA = worldP - a.x;
   c.rB = worldP - b.x;
-  const glm::vec3 cB =
-      glm::vec3(ob.objectToWorld() * glm::vec4(fineCenterLocal(ob, hitFine), 1.0f));
+  const glm::vec3 cB = glm::vec3(b2w * glm::vec4(fineCenterLocal(ob, hitFine), 1.0f));
   // Two spheres of radius r: faces flush when centers are 2r apart (d == 0).
   // d < 0 is a gap (speculative); d > 0 is overlap. Keep look-ahead contacts so the
   // solver can limit approach speed; drop hits beyond the 6-neighbor fine range.
@@ -154,13 +156,21 @@ FineBox makeFineBox(const VoxelObject& o, const glm::vec3& lmn, const glm::vec3&
 
 void testList(const VoxelScene& scene, const RigidBody& a, const RigidBody& b,
               const VoxelObject& oa, const VoxelObject& ob, const ShapeClass& ca,
+              const glm::mat4& a2w, const glm::mat4& b2w, const glm::mat4& b2o,
               const std::vector<uint32_t>& ids, const FineBox& box, std::vector<Contact>& out) {
-  for (uint32_t id : ids) {
-    const glm::ivec3 p = unpackFine(id, ca.fineN);
-    if (!box.contains(p)) {
-      continue;
+  if (ids.empty() || box.mx.x < box.mn.x || box.mx.y < box.mn.y || box.mx.z < box.mn.z) {
+    return;
+  }
+  const int n = ca.fineN;
+  for (int z = box.mn.z; z <= box.mx.z; ++z) {
+    for (int y = box.mn.y; y <= box.mx.y; ++y) {
+      const uint32_t lo = packFine(box.mn.x, y, z, n);
+      const uint32_t hi = packFine(box.mx.x, y, z, n);
+      auto it = std::lower_bound(ids.begin(), ids.end(), lo);
+      for (; it != ids.end() && *it <= hi; ++it) {
+        considerContact(scene, a, b, oa, ob, unpackFine(*it, n), a2w, b2w, b2o, out);
+      }
     }
-    considerContact(scene, a, b, oa, ob, p, out);
   }
 }
 
@@ -367,17 +377,30 @@ void collidePair(VoxelScene& scene, const RigidBody& a, const RigidBody& b, cons
     return;
   }
 
-  glm::vec3 bInA_mn, bInA_mx, aInB_mn, aInB_mx;
-  transformAabb(oa.worldToObject(), bmn, bmx, bInA_mn, bInA_mx);
-  transformAabb(ob.worldToObject(), amn, amx, aInB_mn, aInB_mx);
-  const FineBox boxA = makeFineBox(oa, bInA_mn - pad, bInA_mx + pad);
-  const FineBox boxB = makeFineBox(ob, aInB_mn - pad, aInB_mx + pad);
+  // Features only need testing in the *overlap* of the two world AABBs. Using the
+  // other body's full AABB (a 100 m ground slab) would mark every cylinder surface
+  // voxel as a candidate and cost tens of milliseconds per tick after Cut.
+  const glm::vec3 overlapMn = glm::max(amn, bmn) - glm::vec3(pad);
+  const glm::vec3 overlapMx = glm::min(amx, bmx) + glm::vec3(pad);
+  if (overlapMn.x > overlapMx.x || overlapMn.y > overlapMx.y || overlapMn.z > overlapMx.z) {
+    return;
+  }
+
+  const glm::mat4 a2w = oa.objectToWorld();
+  const glm::mat4 b2w = ob.objectToWorld();
+  const glm::mat4 a2o = glm::inverse(a2w);
+  const glm::mat4 b2o = glm::inverse(b2w);
+  glm::vec3 overlapInA_mn, overlapInA_mx, overlapInB_mn, overlapInB_mx;
+  transformAabb(a2o, overlapMn, overlapMx, overlapInA_mn, overlapInA_mx);
+  transformAabb(b2o, overlapMn, overlapMx, overlapInB_mn, overlapInB_mx);
+  const FineBox boxA = makeFineBox(oa, overlapInA_mn, overlapInA_mx);
+  const FineBox boxB = makeFineBox(ob, overlapInB_mn, overlapInB_mx);
 
   const size_t before = out.size();
-  testList(scene, a, b, oa, ob, ca, ca.corners, boxA, out);
-  testList(scene, a, b, oa, ob, ca, ca.edges, boxA, out);
-  testList(scene, b, a, ob, oa, cb, cb.corners, boxB, out);
-  testList(scene, b, a, ob, oa, cb, cb.edges, boxB, out);
+  testList(scene, a, b, oa, ob, ca, a2w, b2w, b2o, ca.corners, boxA, out);
+  testList(scene, a, b, oa, ob, ca, a2w, b2w, b2o, ca.edges, boxA, out);
+  testList(scene, b, a, ob, oa, cb, b2w, a2w, a2o, cb.corners, boxB, out);
+  testList(scene, b, a, ob, oa, cb, b2w, a2w, a2o, cb.edges, boxB, out);
   reducePairContacts(out, before);
 }
 
@@ -390,21 +413,23 @@ void gatherCornerNormals(const VoxelScene& scene, const ShapeClass& fromClass, i
   }
   const VoxelObject& oa = scene.cpuObject(fromObj);
   const VoxelObject& ob = scene.cpuObject(againstObj);
+  const glm::mat4 a2w = oa.objectToWorld();
+  const glm::mat4 b2w = ob.objectToWorld();
+  const glm::mat4 b2o = glm::inverse(b2w);
   out.reserve(fromClass.corners.size());
   for (uint32_t id : fromClass.corners) {
     const glm::ivec3 p = unpackFine(id, fromClass.fineN);
     DebugCornerNormal dn;
-    dn.p = glm::vec3(oa.objectToWorld() * glm::vec4(fineCenterLocal(oa, p), 1.0f));
+    dn.p = glm::vec3(a2w * glm::vec4(fineCenterLocal(oa, p), 1.0f));
     glm::ivec3 hitFine(0);
-    if (!probeOccupancy(scene, againstObj, ob, dn.p, hitFine)) {
+    if (!probeOccupancy(scene, againstObj, ob, b2o, dn.p, hitFine)) {
       out.push_back(dn);
       continue;
     }
     dn.hit = true;
     int nFace = 2;
-    dn.n = contactNormal(scene, againstObj, ob, hitFine, dn.p, nFace);
-    const glm::vec3 cB =
-        glm::vec3(ob.objectToWorld() * glm::vec4(fineCenterLocal(ob, hitFine), 1.0f));
+    dn.n = contactNormal(scene, againstObj, ob, b2w, hitFine, dn.p, nFace);
+    const glm::vec3 cB = glm::vec3(b2w * glm::vec4(fineCenterLocal(ob, hitFine), 1.0f));
     dn.d = 2.0f * kSphereRadius - glm::dot(dn.p - cB, dn.n);
     out.push_back(dn);
   }

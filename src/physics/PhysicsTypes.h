@@ -3,6 +3,7 @@
 #include <glm/glm.hpp>
 #include <glm/gtc/quaternion.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <vector>
 
@@ -13,6 +14,31 @@ constexpr int kMaxStepsPerFrame = 2;
 constexpr int kSubsteps = 6;
 constexpr float kSubDt = kDt / static_cast<float>(kSubsteps);
 constexpr glm::vec3 kGravity{0.0f, -9.81f, 0.0f};
+
+// Accumulator used by PhysicsWorld::step. Tests must drive this, not a raw tick loop.
+struct FixedStepClock {
+  float accumulator = 0.0f;
+  uint64_t tickId = 0;
+
+  template <typename Fn>
+  int advance(float frameDt, Fn&& onFixedTick) {
+    accumulator = (std::min)(accumulator + (std::max)(frameDt, 0.0f),
+                             kDt * static_cast<float>(kMaxStepsPerFrame));
+    int steps = 0;
+    while (accumulator >= kDt && steps < kMaxStepsPerFrame) {
+      accumulator -= kDt;
+      ++tickId;
+      onFixedTick(tickId, kDt);
+      ++steps;
+    }
+    return steps;
+  }
+
+  void resetSession() {
+    accumulator = 0.0f;
+    tickId = 0;
+  }
+};
 
 constexpr float kVoxel = 0.1f;
 constexpr float kSphereRadius = 0.5f * kVoxel;
@@ -48,6 +74,10 @@ struct Contact {
   uint32_t fineB = 0;
   float lambdaN = 0.0f;
   float lambdaT = 0.0f;
+  // Collision-only normal impulse on A (excludes Baumgarte position correction).
+  float lambdaNVel = 0.0f;
+  // Accumulated world-space friction impulse on A (sum of dLamT * t each iteration).
+  glm::vec3 JtWorld{0.0f};
 };
 
 struct ShapeClass {
@@ -67,6 +97,15 @@ struct DebugSolve {
   float maxD = 0.0f;
   float minNy = 1.0f;
   std::vector<Contact> lastContacts;
+  // Last physics tick only. Structure callback is timed separately from collide/solve.
+  float rebuildMs = 0.0f;
+  float collideMs = 0.0f;
+  float contactSolveMs = 0.0f;
+  float integrateMs = 0.0f;
+  float structureCallbackMs = 0.0f;
+  int awakeBodies = 0;
+  int occupiedBodies = 0;
+  int physicsTicksThisFrame = 0;
 };
 
 inline uint32_t packFine(int x, int y, int z, int n) {
