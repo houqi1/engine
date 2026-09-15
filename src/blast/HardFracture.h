@@ -273,7 +273,7 @@ inline uint32_t splitAllRequired(NvBlastFamily* family, Nv::Blast::ExtStressSolv
     std::vector<char> scratch(NvBlastActorGetRequiredScratchForSplit(actor, logFn));
     const uint32_t nNew = NvBlastActorSplit(&ev, actor, maxNew, scratch.data(), logFn, nullptr);
     for (uint32_t k = 0; k < nNew && k < maxNew; ++k) {
-      if (created[k] != nullptr) {
+      if (created[k] != nullptr && created[k] != ev.deletedActor) {
         solver.notifyActorCreated(*created[k]);
       }
     }

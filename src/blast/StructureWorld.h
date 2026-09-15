@@ -106,6 +106,7 @@ struct ActorBinding {
 };
 
 struct ActorObjectLink {
+  NvBlastActor* actor = nullptr;
   VoxelObjectId objectId{};
   glm::ivec3 fineOrigin{0};
   int fineN = 0;
@@ -145,6 +146,11 @@ struct StructureInstance {
   float axisZ = 0.0f;
   float keepAz0 = 0.0f;
   float keepAz1 = 1.5707963267948966f;
+  bool keepBox = false;
+  float keepX0 = 0.0f;
+  float keepX1 = 0.0f;
+  float keepZ0 = 0.0f;
+  float keepZ1 = 0.0f;
   uint32_t solverIters = 200;
   bool cutApplied = false;
   bool fractureEnabled = false;
@@ -154,6 +160,7 @@ struct StructureInstance {
   std::vector<ActorLoadSnapshot> loadSnapshots;
   uint64_t loadEpoch = 0;
   uint64_t lastLoadTick = 0;
+  uint32_t lastBoundTopologyEpoch = 0xFFFFFFFFu;
 };
 
 class StructureWorld {
@@ -184,6 +191,8 @@ public:
   bool setDensityScale(float scale);
   void setSolverIters(uint32_t iters);
   void markCut(bool cut);
+  void setKeepColumnBox(float x0, float x1, float z0, float z1);
+  uint32_t warmupGravity(uint32_t maxPasses);
   void setFractureEnabled(bool on);
   void setStrengthPa(float strengthPa);
   PendingFracture takePendingFracture();

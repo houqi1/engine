@@ -253,6 +253,8 @@ public:
   bool spawnStressCylinder(GfxDevice& gfx);
   bool resetStressCylinder(GfxDevice& gfx);
   bool cutStressCylinder270(GfxDevice& gfx);
+  bool spawnStressFrame(GfxDevice& gfx);
+  bool cutThreeColumns(GfxDevice& gfx);
   bool setStressCylinderDoubleDensity(bool on);
   void setStressCylinderSolverIters(uint32_t iters);
   void setStressCylinderDisplay(GfxDevice& gfx, bool on);
@@ -336,6 +338,7 @@ private:
   void stopStructureTicks();
   void resetStructureSession();
   bool mountCylinderFromOccupancy(GfxDevice& gfx);
+  bool mountFrameFromOccupancy(GfxDevice& gfx);
   void paintCylinderStress(GfxDevice& gfx);
   void destroyStressCylinderObject();
 
@@ -380,7 +383,8 @@ private:
                               MotionType motion, uint32_t minFines, VoxelObjectId* outId = nullptr);
   bool commitOccupancySplit(GfxDevice& gfx, VoxelObjectId parentId,
                             const std::vector<std::vector<voxel::FineCoord>>& islands,
-                            const std::vector<uint8_t>& anchored, uint32_t minFines);
+                            const std::vector<uint8_t>& anchored, uint32_t minFines,
+                            const std::vector<NvBlastActor*>& actors = {});
   VoxelObjectId objectOwningFamilyFine(const glm::ivec3& absFine) const;
   bool familyFinesOnObject(VoxelObjectId id, const std::vector<voxel::FineCoord>& fines) const;
   glm::dvec3 computeLocalCom(int objectIndex) const;

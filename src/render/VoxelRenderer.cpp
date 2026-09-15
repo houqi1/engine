@@ -1,6 +1,7 @@
 #include "render/VoxelRenderer.h"
 
 #include "blast/CylinderVoxels.h"
+#include "blast/FrameVoxels.h"
 #include "gfx/PipelineBuilder.h"
 
 #include <imgui.h>
@@ -1283,15 +1284,15 @@ bool VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
     cylinderFractureRequested_ = false;
   }
   if (cylinderStrengthRequested_) {
-    scene.structures().setStrengthPa(pendingCylinderFailStrength_ ? blast::kE2StrengthFailPa
-                                                                  : blast::kE2StrengthHoldPa);
+    scene.structures().setStrengthPa(pendingCylinderFailStrength_ ? blast::kFrameStrengthFailPa
+                                                                  : blast::kFrameStrengthHoldPa);
     cylinderStrengthRequested_ = false;
   }
 
   if (importRequested_ || removeImportRequested_ || rebuildRequested_ || scatterSpawnRequested_ ||
       scatterClearRequested_ || simulateRequested_ || spawnTestBoxRequested_ || spawnCylinderRequested_ ||
-      resetCylinderRequested_ || cutCylinderRequested_ || cylinderDensityRequested_ ||
-      cylinderItersRequested_ || cylinderDisplayRequested_) {
+      spawnFrameRequested_ || resetCylinderRequested_ || cutCylinderRequested_ || cutThreeColumnsRequested_ ||
+      cylinderDensityRequested_ || cylinderItersRequested_ || cylinderDisplayRequested_) {
     gfx_.waitIdle();
     if (importRequested_) {
       MeshVoxelizeConfig cfg;
@@ -1330,6 +1331,12 @@ bool VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
     if (cutCylinderRequested_) {
       scene.cutStressCylinder270(gfx_);
     }
+    if (spawnFrameRequested_) {
+      scene.spawnStressFrame(gfx_);
+    }
+    if (cutThreeColumnsRequested_) {
+      scene.cutThreeColumns(gfx_);
+    }
     if (cylinderDensityRequested_) {
       scene.setStressCylinderDoubleDensity(pendingCylinderDoubleDensity_);
     }
@@ -1342,6 +1349,7 @@ bool VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
     importRequested_ = removeImportRequested_ = rebuildRequested_ = false;
     scatterSpawnRequested_ = scatterClearRequested_ = simulateRequested_ = spawnTestBoxRequested_ = false;
     spawnCylinderRequested_ = resetCylinderRequested_ = cutCylinderRequested_ = false;
+    spawnFrameRequested_ = cutThreeColumnsRequested_ = false;
     cylinderDensityRequested_ = cylinderItersRequested_ = cylinderDisplayRequested_ = false;
     boundCoarsePoolBuffer_ = VK_NULL_HANDLE;
   }
@@ -2002,9 +2010,16 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
     const blast::StructureWorld& sw = scene.structures();
     const blast::StructureDebugSnapshot& st = sw.debug();
     ImGui::Separator();
-    ImGui::TextUnformatted("Structure (E2 stress fracture)");
+    ImGui::TextUnformatted("Structure (four-column roof)");
     ImGui::Text("State: %s", sw.initialized() ? "initialized" : "not initialized");
-    if (ImGui::Button("Spawn / reset cylinder")) {
+    if (ImGui::Button("Spawn / reset four columns")) {
+      spawnFrameRequested_ = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Cut 3 columns")) {
+      cutThreeColumnsRequested_ = true;
+    }
+    if (ImGui::Button("Spawn cylinder (legacy)")) {
       spawnCylinderRequested_ = true;
     }
     ImGui::SameLine();
@@ -2030,8 +2045,8 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
       pendingCylinderFracture_ = frac;
       cylinderFractureRequested_ = true;
     }
-    bool failS = st.strengthPa < 1.0e6f;
-    if (ImGui::Checkbox("Fail strength (0.25 MPa); off = 50 MPa hold", &failS)) {
+    bool failS = st.strengthPa < 1.0e7f;
+    if (ImGui::Checkbox("Fail strength (1.0 MPa); off = 50 MPa hold", &failS)) {
       pendingCylinderFailStrength_ = failS;
       cylinderStrengthRequested_ = true;
     }
@@ -2059,7 +2074,7 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
                 static_cast<unsigned long long>(sw.physicsTicksReceived()), sw.lastDt());
     ImGui::Text("Blast live bytes: %zu  (baseline %zu)  errors: %d", sw.blastLiveBytes(),
                 sw.blastRuntimeBaselineBytes(), sw.blastErrorCount());
-    ImGui::TextDisabled("Simulate on, then Stress fracture. Intact should hold; cut should drop.");
+    ImGui::TextDisabled("Simulate on. Intact holds at 1.0 MPa. Cut 3 columns, wait until Status is converged, then fail strength drops the roof.");
   }
   ImGui::Checkbox("Show Rotating Object", &scene.spinnerEnabled());
   ImGui::SliderFloat("Spin Speed", &scene.spinSpeed(), -3.0f, 3.0f, "%.2f rad/s");

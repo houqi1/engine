@@ -1,5 +1,6 @@
 #include "blast/BlastMemory.h"
 #include "blast/CylinderVoxels.h"
+#include "blast/FrameVoxels.h"
 #include "core/Window.h"
 #include "gfx/GfxDevice.h"
 #include "physics/PhysicsTypes.h"
@@ -48,6 +49,7 @@ namespace {
 struct Options {
   bool benchmark = false;
   bool e2Perf = false;
+  bool frameFail = false;
   bool help = false;
   uint32_t frames = 300;
   uint32_t warmup = 60;
@@ -87,6 +89,8 @@ Options parseOptions(int argc, char** argv) {
       options.benchmark = true;
     } else if (arg == "--e2-perf") {
       options.e2Perf = true;
+    } else if (arg == "--frame-fail") {
+      options.frameFail = true;
     } else if (arg == "--help" || arg == "-h") {
       options.help = true;
     } else if (arg == "--frames") {
@@ -132,7 +136,7 @@ Options parseOptions(int argc, char** argv) {
   if (options.benchmark && options.e2Perf) {
     throw std::runtime_error("Use either --benchmark or --e2-perf, not both");
   }
-  if (argc > 1 && !options.benchmark && !options.e2Perf && !options.help) {
+  if (argc > 1 && !options.benchmark && !options.e2Perf && !options.frameFail && !options.help) {
     throw std::runtime_error("Rendering options require --benchmark; use --help for usage");
   }
   auto outputPath = [](const std::string& text) -> std::filesystem::path {
@@ -781,6 +785,54 @@ void showFatal(const char* message, bool dialogs) {
 
 }  // namespace
 
+void runFrameFail(GfxDevice& gfx, VoxelScene& scene, PerfLog& out) {
+  auto dump = [&](const char* tag) {
+    const blast::StructureDebugSnapshot& st = scene.structures().debug();
+    int enabled = 0;
+    for (int i = 0; i < scene.cpuObjectCount(); ++i) {
+      const VoxelObject& o = scene.cpuObject(i);
+      if (o.slotOccupied && o.enabled) {
+        ++enabled;
+      }
+    }
+    const blast::StructureInstance* inst = scene.structures().instance();
+    char line[512];
+    std::snprintf(line, sizeof(line),
+                  "%s conv=%d status=%s strip=%.4g S=%.4g cand=%u fracBonds=%u actors=%u "
+                  "frac=%d keepBox=%d cut=%d enabledObj=%d nodes=%u bonds=%u",
+                  tag, st.converged ? 1 : 0, st.status, st.stripMaxStress, st.strengthPa,
+                  st.candidateCount, st.fracturedBonds, st.splitActors, st.fractureEnabled ? 1 : 0,
+                  (inst && inst->keepBox) ? 1 : 0, st.cut ? 1 : 0, enabled, st.nodes, st.bonds);
+    out.line(line);
+  };
+  auto ticks = [&](int n) {
+    for (int i = 0; i < n; ++i) {
+      scene.update(physics::kDt);
+    }
+  };
+
+  if (!scene.spawnStressFrame(gfx)) {
+    throw std::runtime_error("spawnStressFrame failed");
+  }
+  ticks(24);
+  dump("after-spawn");
+
+  if (!scene.cutThreeColumns(gfx)) {
+    throw std::runtime_error("cutThreeColumns failed");
+  }
+  ticks(32);
+  dump("after-cut");
+
+  scene.structures().setFractureEnabled(true);
+  scene.structures().setStrengthPa(blast::kFrameStrengthFailPa);
+  for (int i = 0; i < 8; ++i) {
+    scene.update(physics::kDt);
+    scene.commitStructureSplits(gfx);
+    dump((std::string("fail-tick-") + std::to_string(i)).c_str());
+  }
+  out.line("OK frame-fail");
+}
+
 int main(int argc, char** argv) {
   // CLI failures must not block automation, including errors before --benchmark is parsed.
   const bool dialogs = argc == 1;
@@ -825,7 +877,7 @@ int main(int argc, char** argv) {
         SetWindowPos(hwnd, HWND_NOTOPMOST, 160, 160, 0, 0, SWP_SHOWWINDOW | SWP_NOSIZE);
       }
     }
-    if (options.e2Perf) {
+    if (options.e2Perf || options.frameFail) {
       if (AttachConsole(ATTACH_PARENT_PROCESS) || AllocConsole()) {
         FILE* fp = nullptr;
         freopen_s(&fp, "CONOUT$", "w", stdout);
@@ -837,6 +889,27 @@ int main(int argc, char** argv) {
     GfxDevice gfx(window);
     VoxelScene scene;
     scene.init(gfx, blastRt);
+
+    if (options.frameFail) {
+      const std::filesystem::path reportPath =
+          std::filesystem::path(VE_ASSETS_DIR).parent_path() / "docs" / "frame-fail.txt";
+      PerfLog log(reportPath);
+      if (log.f == nullptr) {
+        throw std::runtime_error("Cannot open " + reportPath.string());
+      }
+      try {
+        runFrameFail(gfx, scene, log);
+      } catch (const std::exception& ex) {
+        log.line(std::string("ERROR: ") + ex.what());
+        gfx.waitIdle();
+        scene.cleanup(gfx);
+        throw;
+      }
+      gfx.waitIdle();
+      scene.cleanup(gfx);
+      blastRt.shutdown();
+      return 0;
+    }
 
     if (options.e2Perf) {
       const std::filesystem::path reportPath =

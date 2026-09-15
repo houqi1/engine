@@ -1,6 +1,7 @@
 #include "blast/StructureWorld.h"
 
 #include "blast/CylinderVoxels.h"
+#include "blast/FrameVoxels.h"
 #include "blast/HardFracture.h"
 
 #include "NvBlast.h"
@@ -80,6 +81,46 @@ void StructureWorld::markCut(bool cut) {
     instances_.front().cutApplied = cut;
     instances_.front().debug.cut = cut;
   }
+}
+
+uint32_t StructureWorld::warmupGravity(uint32_t maxPasses) {
+  StructureInstance* inst = instance();
+  if (inst == nullptr || inst->blast.solver == nullptr || maxPasses == 0) {
+    return 0;
+  }
+  if (inst->bindings.empty()) {
+    rebuildBindingsFromFamily(*inst);
+  }
+  uint32_t n = 0;
+  for (; n < maxPasses; ++n) {
+    for (ActorBinding& b : inst->bindings) {
+      if (b.actor == nullptr || !b.stressSolve || !b.anchored) {
+        continue;
+      }
+      inst->blast.solver->addGravity(*b.actor, NvcVec3{0.0f, kE1GravityY, 0.0f});
+    }
+    inst->blast.solver->update();
+    ++inst->solveEpoch;
+    refreshDebug(*inst, 0.0f);
+    if (inst->debug.converged) {
+      break;
+    }
+  }
+  collectPendingFracture(*inst);
+  return n + 1;
+}
+
+void StructureWorld::setKeepColumnBox(float x0, float x1, float z0, float z1) {
+  if (instances_.empty()) {
+    return;
+  }
+  StructureInstance& inst = instances_.front();
+  inst.keepBox = true;
+  inst.keepX0 = x0;
+  inst.keepX1 = x1;
+  inst.keepZ0 = z0;
+  inst.keepZ1 = z1;
+  rebuildBondMeta(inst);
 }
 
 BlastError StructureWorld::mountSample(VoxelObjectId objectId, OccupancySample sample, uint32_t solverIters,
@@ -200,8 +241,15 @@ void StructureWorld::rebuildBondMeta(StructureInstance& inst) {
     m.stableId = b.stableId;
     m.graphIndex = gi;
     m.world = b.world ? 1 : 0;
-    const float az = bondAzimuth(b, inst.axisX, inst.axisZ);
-    m.inStrip = (!b.world && az >= inst.keepAz0 && az < inst.keepAz1) ? 1 : 0;
+    if (inst.keepBox) {
+      m.inStrip = (!b.world && b.cx >= inst.keepX0 && b.cx < inst.keepX1 && b.cz >= inst.keepZ0 &&
+                   b.cz < inst.keepZ1)
+                      ? 1
+                      : 0;
+    } else {
+      const float az = bondAzimuth(b, inst.axisX, inst.axisZ);
+      m.inStrip = (!b.world && az >= inst.keepAz0 && az < inst.keepAz1) ? 1 : 0;
+    }
     const float y0 = static_cast<float>(kE1AnchorFines) * kE1FineMeters;
     const float y1 = static_cast<float>(kE1AnchorFines + kE1CutFines) * kE1FineMeters;
     m.inNeck = (m.inStrip != 0 && b.cy >= y0 - 0.05f && b.cy < y1 + 0.05f) ? 1 : 0;
@@ -396,32 +444,78 @@ void StructureWorld::collectPendingFracture(StructureInstance& inst) {
     inst.debug.candidateMs = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - t0).count();
     return;
   }
-  const bool clearlyOver = inst.debug.stripMaxStress > 2.0f * inst.strengthPa;
-  // Intact + fail must not fracture on unconverged garbage. After Cut, clearlyOver
-  // still lets the overloaded neck drop without waiting for convergence.
-  if (!inst.debug.converged && (!inst.cutApplied || !clearlyOver)) {
+  if (!inst.debug.converged) {
     inst.debug.candidateMs = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - t0).count();
     return;
+  }
+  if (inst.keepBox || inst.cutApplied) {
+    for (const ActorBinding& b : inst.bindings) {
+      if (b.actor != nullptr && !b.anchored && b.graphNodeCount > 1) {
+        inst.debug.candidateMs =
+            std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        return;
+      }
+    }
   }
   const NvBlastSupportGraph graph = NvBlastAssetGetSupportGraph(inst.blast.asset, blastLog);
   fillNodeOwners(inst, graph);
   const uint32_t n = inst.probeCount;
   const uint32_t metaN = static_cast<uint32_t>(inst.bondMeta.size());
-  inst.pending.candidates.reserve(n);
+  float peakStrip = 0.0f;
+  float peakY = 0.0f;
+  auto actorAnchored = [&](uint32_t owner) -> bool {
+    if (owner == 0 || owner > inst.actorScratch.size()) {
+      return false;
+    }
+    NvBlastActor* a = inst.actorScratch[owner - 1];
+    return a != nullptr && NvBlastActorHasExternalBonds(a, blastLog);
+  };
   for (uint32_t i = 0; i < n; ++i) {
     const auto& p = inst.probes[i];
-    if (!canTakeDamage(p.health) || owningActorIndex(p, graph, inst.nodeOwner.data()) == 0) {
+    if (p.blastBondIndex >= metaN || !canTakeDamage(p.health)) {
+      continue;
+    }
+    if (!actorAnchored(owningActorIndex(p, graph, inst.nodeOwner.data()))) {
+      continue;
+    }
+    const BondMeta& m = inst.bondMeta[p.blastBondIndex];
+    if (m.inStrip == 0 || m.graphIndex >= inst.graph.bonds.size()) {
       continue;
     }
     const float s = probeMaxStress(p);
-    if (!(s > inst.strengthPa)) {
+    if (s > peakStrip) {
+      peakStrip = s;
+      peakY = inst.graph.bonds[m.graphIndex].cy;
+    }
+  }
+  const float sliceBand = 0.25f;
+  const float roofY = static_cast<float>(kFrameColH) * kE1FineMeters;
+  float sliceY = peakY;
+  if (inst.keepBox && sliceY > roofY - sliceBand * 1.5f) {
+    sliceY = roofY - sliceBand * 1.5f;
+  }
+  const bool sliceHot = peakStrip > inst.strengthPa && (inst.keepBox || inst.cutApplied);
+  inst.pending.candidates.reserve(n);
+  for (uint32_t i = 0; i < n; ++i) {
+    const auto& p = inst.probes[i];
+    const uint32_t owner = owningActorIndex(p, graph, inst.nodeOwner.data());
+    if (!canTakeDamage(p.health) || !actorAnchored(owner)) {
       continue;
     }
-    uint8_t inNeck = 0;
+    const float s = probeMaxStress(p);
+    bool inStrip = false;
+    float cy = 0.0f;
     if (p.blastBondIndex < metaN) {
-      inNeck = inst.bondMeta[p.blastBondIndex].inNeck;
+      const BondMeta& m = inst.bondMeta[p.blastBondIndex];
+      inStrip = m.inStrip != 0;
+      if (m.graphIndex < inst.graph.bonds.size()) {
+        cy = inst.graph.bonds[m.graphIndex].cy;
+      }
     }
-    if (!inst.debug.converged && inNeck == 0) {
+    const bool belowRoof = !inst.keepBox || cy < roofY;
+    const bool inHotSlice =
+        sliceHot && inStrip && belowRoof && std::abs(cy - sliceY) <= sliceBand;
+    if (!(s > inst.strengthPa) && !inHotSlice) {
       continue;
     }
     FractureCandidate c;
@@ -518,25 +612,21 @@ uint32_t StructureWorld::splitAllRequired() {
   if (inst == nullptr || inst->blast.family == nullptr || inst->blast.solver == nullptr) {
     return 0;
   }
-  const uint32_t actors = blast::splitAllRequired(inst->blast.family, *inst->blast.solver, blastLog);
-  const uint32_t nA = NvBlastFamilyGetActorCount(inst->blast.family, blastLog);
-  if (inst->actorScratch.size() < nA) {
-    inst->actorScratch.resize(nA);
-  }
-  NvBlastFamilyGetActors(inst->actorScratch.data(), nA, inst->blast.family, blastLog);
+  inst->bindings.clear();
+  inst->loadSnapshots.clear();
   inst->blast.actor = nullptr;
-  for (uint32_t i = 0; i < nA; ++i) {
-    NvBlastActor* a = inst->actorScratch[i];
-    if (a == nullptr) {
-      continue;
-    }
-    if (NvBlastActorHasExternalBonds(a, blastLog)) {
-      inst->blast.actor = a;
+  const uint32_t actors = blast::splitAllRequired(inst->blast.family, *inst->blast.solver, blastLog);
+  rebuildBindingsFromFamily(*inst);
+  inst->lastBoundTopologyEpoch = inst->blast.solver->topologyEpoch();
+  inst->blast.actor = nullptr;
+  for (ActorBinding& b : inst->bindings) {
+    if (b.actor != nullptr && b.anchored) {
+      inst->blast.actor = b.actor;
       break;
     }
   }
-  if (inst->blast.actor == nullptr && nA > 0) {
-    inst->blast.actor = inst->actorScratch[0];
+  if (inst->blast.actor == nullptr && !inst->bindings.empty()) {
+    inst->blast.actor = inst->bindings.front().actor;
   }
   inst->debug.splitActors = actors;
   return actors;
@@ -549,8 +639,10 @@ void StructureWorld::solveInstance(StructureInstance& inst, const WorldContactIm
   }
   inst.debug.probeExportCount = 0;
   const auto tLoad0 = std::chrono::steady_clock::now();
-  if (inst.bindings.empty()) {
+  const uint32_t topo = inst.blast.solver->topologyEpoch();
+  if (inst.bindings.empty() || inst.lastBoundTopologyEpoch != topo) {
     rebuildBindingsFromFamily(inst);
+    inst.lastBoundTopologyEpoch = topo;
   }
   buildLoadSnapshots(inst, impulses, nImpulses, lastTickId_, lastDt_ > 0.0f ? lastDt_ : (1.0f / 60.0f));
   for (ActorBinding& b : inst.bindings) {
@@ -729,15 +821,23 @@ void StructureWorld::bindVisibleActors(const std::vector<ActorObjectLink>& links
     return;
   }
   rebuildBindingsFromFamily(*inst);
-  uint32_t vis = 0;
+  if (inst->blast.solver != nullptr) {
+    inst->lastBoundTopologyEpoch = inst->blast.solver->topologyEpoch();
+  }
   for (ActorBinding& b : inst->bindings) {
-    if (vis >= links.size()) {
-      break;
+    const ActorObjectLink* found = nullptr;
+    for (const ActorObjectLink& L : links) {
+      if (L.actor != nullptr && L.actor == b.actor) {
+        found = &L;
+        break;
+      }
     }
-    const ActorObjectLink& L = links[vis++];
-    b.objectId = L.objectId;
-    b.fineOrigin = L.fineOrigin;
-    b.fineN = L.fineN;
+    if (found == nullptr) {
+      continue;
+    }
+    b.objectId = found->objectId;
+    b.fineOrigin = found->fineOrigin;
+    b.fineN = found->fineN;
     fillBindingKinematics(*inst, b);
   }
   inst->debug.bindingCount = static_cast<uint32_t>(inst->bindings.size());

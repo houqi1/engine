@@ -236,6 +236,8 @@ private:
   bool spawnCylinderRequested_ = false;
   bool resetCylinderRequested_ = false;
   bool cutCylinderRequested_ = false;
+  bool spawnFrameRequested_ = false;
+  bool cutThreeColumnsRequested_ = false;
   bool cylinderDensityRequested_ = false;
   bool cylinderItersRequested_ = false;
   bool cylinderDisplayRequested_ = false;
