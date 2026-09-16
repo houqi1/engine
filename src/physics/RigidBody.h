@@ -2,6 +2,8 @@
 
 #include "physics/PhysicsTypes.h"
 
+#include <vector>
+
 namespace physics {
 
 struct RigidBody {
@@ -17,7 +19,13 @@ struct RigidBody {
   glm::mat3 IinvW{0.0f};
   bool dynamic = false;
   bool awake = false;
+  bool enableSleep = true;
   float sleepTimer = 0.0f;
+  float extent = 0.0f;
+  int sleepIsland = -1;
+  glm::vec3 xTick0{0.0f};
+  glm::quat qTick0{1.0f, 0.0f, 0.0f, 0.0f};
+  std::vector<SleepSupport> supports;
   uint32_t occupiedFine = 0;
 };
 

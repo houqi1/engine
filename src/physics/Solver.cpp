@@ -11,14 +11,10 @@ void applyImpulse(RigidBody& a, RigidBody& b, const glm::vec3& rA, const glm::ve
   if (a.invM > 0.0f) {
     a.v += a.invM * J;
     a.w += a.IinvW * glm::cross(rA, J);
-    a.awake = true;
-    a.sleepTimer = 0.0f;
   }
   if (b.invM > 0.0f) {
     b.v -= b.invM * J;
     b.w -= b.IinvW * glm::cross(rB, J);
-    b.awake = true;
-    b.sleepTimer = 0.0f;
   }
 }
 

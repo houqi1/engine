@@ -435,4 +435,16 @@ void gatherCornerNormals(const VoxelScene& scene, const ShapeClass& fromClass, i
   }
 }
 
+bool worldPointHitsOccupancy(const VoxelScene& scene, int objectIndex, const glm::vec3& worldP) {
+  if (objectIndex < 0 || objectIndex >= scene.cpuObjectCount() || !scene.slotOccupied(objectIndex)) {
+    return false;
+  }
+  const VoxelObject& o = scene.cpuObject(objectIndex);
+  if (!o.enabled) {
+    return false;
+  }
+  glm::ivec3 hitFine(0);
+  return probeOccupancy(scene, objectIndex, o, o.worldToObject(), worldP, hitFine);
+}
+
 }  // namespace physics

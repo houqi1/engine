@@ -37,6 +37,86 @@ void writeVec3(float* dst, const glm::vec3& v) {
   dst[2] = v.z;
 }
 
+// Draw normals only while the body is still moving. Resting on the ground
+// keeps contacts (and often awake=true) even when it looks still.
+bool physicsBodyShowsNormals(VoxelScene& scene, int slot) {
+  physics::BodyState st;
+  if (!scene.getBodyState(scene.objectIdAt(slot), st) || !st.awake) {
+    return false;
+  }
+  return glm::length(st.v) >= physics::kSleepLin || glm::length(st.w) >= physics::kSleepAng;
+}
+
+bool projectWorld(const glm::mat4& viewProj, ImVec2 display, const glm::vec3& world, ImVec2& out) {
+  const glm::vec4 clip = viewProj * glm::vec4(world, 1.0f);
+  if (clip.w <= 1.0e-4f) {
+    return false;
+  }
+  const float iw = 1.0f / clip.w;
+  const float nx = clip.x * iw;
+  const float ny = clip.y * iw;
+  if (nx < -1.2f || nx > 1.2f || ny < -1.2f || ny > 1.2f) {
+    return false;
+  }
+  out.x = (nx * 0.5f + 0.5f) * display.x;
+  out.y = (ny * 0.5f + 0.5f) * display.y;
+  return true;
+}
+
+void drawContactNormals(VoxelScene& scene, const glm::mat4& viewProj, ImVec2 display) {
+  ImDrawList* dl = ImGui::GetForegroundDrawList();
+  constexpr float kLen = 1.5f;
+  const int ground = scene.groundObjectId().valid() ? static_cast<int>(scene.groundObjectId().slot) : 0;
+
+  std::vector<physics::DebugCornerNormal> corners;
+  for (int i = 0; i < scene.cpuObjectCount(); ++i) {
+    if (i == ground || !scene.slotOccupied(i)) {
+      continue;
+    }
+    const VoxelObject& o = scene.cpuObject(i);
+    if (!o.enabled || o.motionType != MotionType::Dynamic) {
+      continue;
+    }
+    if (!physicsBodyShowsNormals(scene, i)) {
+      continue;
+    }
+    scene.gatherCornerNormals(i, ground, corners);
+    for (const physics::DebugCornerNormal& cn : corners) {
+      ImVec2 a{};
+      if (!projectWorld(viewProj, display, cn.p, a)) {
+        continue;
+      }
+      dl->AddCircleFilled(a, 5.0f, IM_COL32(255, 255, 255, 255));
+      if (!cn.hit) {
+        dl->AddCircle(a, 9.0f, IM_COL32(160, 160, 160, 255), 0, 2.0f);
+        continue;
+      }
+      ImVec2 b{};
+      if (!projectWorld(viewProj, display, cn.p + cn.n * kLen, b)) {
+        continue;
+      }
+      const ImU32 col = cn.n.y >= 0.5f ? IM_COL32(50, 255, 80, 255)
+                      : (cn.n.y <= -0.2f ? IM_COL32(255, 50, 50, 255) : IM_COL32(255, 220, 40, 255));
+      dl->AddLine(a, b, col, 3.0f);
+      dl->AddCircleFilled(b, 4.0f, col);
+    }
+  }
+
+  for (const physics::Contact& c : scene.physicsDebug().lastContacts) {
+    if (!physicsBodyShowsNormals(scene, c.a) && !physicsBodyShowsNormals(scene, c.b)) {
+      continue;
+    }
+    ImVec2 a{};
+    ImVec2 b{};
+    if (!projectWorld(viewProj, display, c.p, a) ||
+        !projectWorld(viewProj, display, c.p + c.n * (kLen * 0.7f), b)) {
+      continue;
+    }
+    dl->AddLine(a, b, IM_COL32(255, 80, 255, 255), 5.0f);
+    dl->AddCircleFilled(a, 7.0f, IM_COL32(255, 80, 255, 220));
+  }
+}
+
 void printPipelineExecutableStatistics(VkDevice device, VkPipeline pipeline) {
   const auto getProperties = reinterpret_cast<PFN_vkGetPipelineExecutablePropertiesKHR>(
       vkGetDeviceProcAddr(device, "vkGetPipelineExecutablePropertiesKHR"));
@@ -1857,6 +1937,11 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
   ImGui_ImplVulkan_NewFrame();
   ImGui_ImplGlfw_NewFrame();
   ImGui::NewFrame();
+
+  if (scene.simulate()) {
+    const glm::mat4 viewProj = scene.camera().proj() * scene.camera().view();
+    drawContactNormals(scene, viewProj, ImGui::GetIO().DisplaySize);
+  }
 
   ImGuiWindowFlags flags = 0;
   if (benchmark_) {

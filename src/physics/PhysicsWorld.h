@@ -7,6 +7,7 @@
 
 #include <glm/glm.hpp>
 
+#include <utility>
 #include <vector>
 
 class VoxelScene;
@@ -53,6 +54,11 @@ private:
   void initBodyFromObject(int objectIndex, RigidBody& body, bool preserveMotion);
   void rebuildDirty();
   void substep();
+  void snapshotTickPoses();
+  void wakeLostStaticSupport();
+  void wakeBodyAndIsland(int objectIndex, float gravityDt);
+  void wakeSleepersSupportedBy(int staticSlot);
+  void wakeFromTouchingContacts(const std::vector<Contact>& contacts, float gravityDt);
   void updateSleep(float h);
   void recordSubstepImpulses(const std::vector<Contact>& contacts, int substep);
 
@@ -64,7 +70,9 @@ private:
   void* tickUser_ = nullptr;
   DebugSolve debug_{};
   std::vector<blast::WorldContactImpulse> tickImpulses_;
+  std::vector<std::pair<int, int>> lastTouching_;
   int substepIndex_ = 0;
+  int nextSleepIsland_ = 1;
 };
 
 }  // namespace physics

@@ -15,6 +15,8 @@ void collidePair(VoxelScene& scene, const RigidBody& a, const RigidBody& b, cons
 bool worldAabb(const VoxelScene& scene, int objectIndex, const ShapeClass& sc, glm::vec3& wmn,
                glm::vec3& wmx);
 
+bool worldPointHitsOccupancy(const VoxelScene& scene, int objectIndex, const glm::vec3& worldP);
+
 struct DebugCornerNormal {
   glm::vec3 p{0.0f};
   glm::vec3 n{0.0f, 1.0f, 0.0f};

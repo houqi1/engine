@@ -56,6 +56,8 @@ constexpr int kContactIters = 8;
 constexpr float kSleepLin = 0.05f;
 constexpr float kSleepAng = 0.2f;
 constexpr float kSleepTime = 0.5f;
+// Box2D v3: position correction folded into sleep velocity (Catto solver.c).
+constexpr float kSleepPositionFactor = 0.5f;
 
 constexpr float kDensityWood = 600.0f;
 
@@ -78,6 +80,13 @@ struct Contact {
   float lambdaNVel = 0.0f;
   // Accumulated world-space friction impulse on A (sum of dLamT * t each iteration).
   glm::vec3 JtWorld{0.0f};
+};
+
+inline bool contactIsTouching(const Contact& c) { return c.d >= -kSlop; }
+
+struct SleepSupport {
+  int staticSlot = -1;
+  glm::vec3 worldP{0.0f};
 };
 
 struct ShapeClass {

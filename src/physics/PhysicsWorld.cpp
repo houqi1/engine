@@ -9,6 +9,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <utility>
+#include <vector>
 
 namespace physics {
 namespace {
@@ -28,6 +31,64 @@ void writeObjectPoseFromCom(VoxelObject& o, const RigidBody& body) {
   const glm::vec3 gc = gridCenterLocal(o);
   o.rotation = body.q;
   o.position = body.x - body.q * (body.comLocal - gc);
+}
+
+bool isStaticEnvironment(const VoxelScene& scene, const RigidBody& b) {
+  if (b.dynamic) {
+    return false;
+  }
+  if (b.shapeIndex < 0 || !scene.slotOccupied(b.shapeIndex)) {
+    return true;
+  }
+  return scene.cpuObject(b.shapeIndex).motionType != MotionType::Kinematic;
+}
+
+bool skipCollidePair(const VoxelScene& scene, const RigidBody& a, const RigidBody& b) {
+  if (!a.dynamic && !b.dynamic) {
+    return true;
+  }
+  const bool aKin = !a.dynamic && !isStaticEnvironment(scene, a);
+  const bool bKin = !b.dynamic && !isStaticEnvironment(scene, b);
+  if (!a.awake && !b.awake && !aKin && !bKin) {
+    return true;
+  }
+  if (!a.awake && a.dynamic && isStaticEnvironment(scene, b)) {
+    return true;
+  }
+  if (!b.awake && b.dynamic && isStaticEnvironment(scene, a)) {
+    return true;
+  }
+  return false;
+}
+
+float quatAngle(const glm::quat& a, const glm::quat& b) {
+  float d = std::abs(glm::dot(glm::normalize(a), glm::normalize(b)));
+  d = std::min(d, 1.0f);
+  return 2.0f * std::acos(d);
+}
+
+float sleepVelocity(const RigidBody& b, float h) {
+  const float extent = std::max(b.extent, kSphereRadius);
+  const float maxV = glm::length(b.v) + glm::length(b.w) * extent;
+  const float maxDx = glm::length(b.x - b.xTick0) + quatAngle(b.qTick0, b.q) * extent;
+  const float invH = h > 1e-8f ? 1.0f / h : 0.0f;
+  return std::max(maxV, kSleepPositionFactor * maxDx * invH);
+}
+
+int ufFind(std::vector<int>& parent, int i) {
+  while (parent[static_cast<size_t>(i)] != i) {
+    parent[static_cast<size_t>(i)] = parent[static_cast<size_t>(parent[static_cast<size_t>(i)])];
+    i = parent[static_cast<size_t>(i)];
+  }
+  return i;
+}
+
+void ufUnite(std::vector<int>& parent, int a, int b) {
+  a = ufFind(parent, a);
+  b = ufFind(parent, b);
+  if (a != b) {
+    parent[static_cast<size_t>(b)] = a;
+  }
 }
 
 }  // namespace
@@ -64,6 +125,8 @@ void PhysicsWorld::initBodyFromObject(int objectIndex, RigidBody& body, bool pre
     body.w = glm::vec3(0.0f);
     body.awake = false;
     body.sleepTimer = 0.0f;
+    body.sleepIsland = -1;
+    body.supports.clear();
     body.invM = 0.0f;
     body.Iloc = glm::mat3(1.0f);
     body.IinvW = glm::mat3(0.0f);
@@ -79,6 +142,8 @@ void PhysicsWorld::initBodyFromObject(int objectIndex, RigidBody& body, bool pre
     body.w = glm::vec3(0.0f);
     body.awake = dynamic;
     body.sleepTimer = 0.0f;
+    body.sleepIsland = -1;
+    body.supports.clear();
   }
 }
 
@@ -111,11 +176,15 @@ void PhysicsWorld::rebuildDirty() {
     if (i >= classes_.size() || !classes_[i].dirty) {
       continue;
     }
-    if (!scene_->slotOccupied(static_cast<int>(i))) {
+    const int slot = static_cast<int>(i);
+    if (!scene_->slotOccupied(slot)) {
+      wakeSleepersSupportedBy(slot);
       RigidBody& b = bodies_[i];
-      b.shapeIndex = static_cast<int>(i);
+      b.shapeIndex = slot;
       b.dynamic = false;
       b.awake = false;
+      b.sleepIsland = -1;
+      b.supports.clear();
       b.invM = 0.0f;
       b.IinvW = glm::mat3(0.0f);
       b.v = glm::vec3(0.0f);
@@ -126,10 +195,16 @@ void PhysicsWorld::rebuildDirty() {
       classes_[i].occValid = false;
       continue;
     }
-    rebuildShapeClass(*scene_, static_cast<int>(i), classes_[i]);
-    computeMassProperties(*scene_, static_cast<int>(i), bodies_[i]);
-    snapBodyComFromObject(scene_->cpuObject(static_cast<int>(i)), bodies_[i]);
-    refreshInverseInertiaWorld(bodies_[i]);
+    RigidBody& b = bodies_[i];
+    if (!b.dynamic) {
+      wakeSleepersSupportedBy(slot);
+    } else if (!b.awake) {
+      wakeBodyAndIsland(slot, 0.0f);
+    }
+    rebuildShapeClass(*scene_, slot, classes_[i]);
+    computeMassProperties(*scene_, slot, b);
+    snapBodyComFromObject(scene_->cpuObject(slot), b);
+    refreshInverseInertiaWorld(b);
   }
 }
 
@@ -193,6 +268,14 @@ bool PhysicsWorld::removeBody(VoxelObjectId id) {
   const int i = static_cast<int>(id.slot);
   if (i < 0 || i >= static_cast<int>(bodies_.size())) {
     return false;
+  }
+  wakeSleepersSupportedBy(i);
+  for (const std::pair<int, int>& t : lastTouching_) {
+    if (t.first == i) {
+      wakeBodyAndIsland(t.second, 0.0f);
+    } else if (t.second == i) {
+      wakeBodyAndIsland(t.first, 0.0f);
+    }
   }
   RigidBody& b = bodies_[static_cast<size_t>(i)];
   b = RigidBody{};
@@ -259,8 +342,107 @@ void PhysicsWorld::activateBodiesInBounds(const glm::vec3& worldMin, const glm::
         wmx.z < worldMin.z || wmn.z > worldMax.z) {
       continue;
     }
+    wakeBodyAndIsland(i, 0.0f);
+  }
+}
+
+void PhysicsWorld::snapshotTickPoses() {
+  for (RigidBody& b : bodies_) {
+    if (!b.dynamic) {
+      continue;
+    }
+    b.xTick0 = b.x;
+    b.qTick0 = b.q;
+  }
+}
+
+void PhysicsWorld::wakeBodyAndIsland(int objectIndex, float gravityDt) {
+  if (objectIndex < 0 || objectIndex >= static_cast<int>(bodies_.size())) {
+    return;
+  }
+  const int island = bodies_[static_cast<size_t>(objectIndex)].sleepIsland;
+  auto wakeOne = [&](RigidBody& b) {
+    if (!b.dynamic) {
+      return;
+    }
+    const bool wasSleeping = !b.awake;
     b.awake = true;
     b.sleepTimer = 0.0f;
+    b.sleepIsland = -1;
+    b.supports.clear();
+    if (wasSleeping && gravityDt > 0.0f && b.invM > 0.0f) {
+      b.v += kGravity * gravityDt;
+    }
+  };
+  if (island < 0) {
+    wakeOne(bodies_[static_cast<size_t>(objectIndex)]);
+    return;
+  }
+  for (RigidBody& b : bodies_) {
+    if (b.sleepIsland == island) {
+      wakeOne(b);
+    }
+  }
+}
+
+void PhysicsWorld::wakeSleepersSupportedBy(int staticSlot) {
+  for (size_t i = 0; i < bodies_.size(); ++i) {
+    RigidBody& b = bodies_[i];
+    if (b.awake || !b.dynamic) {
+      continue;
+    }
+    for (const SleepSupport& s : b.supports) {
+      if (s.staticSlot == staticSlot) {
+        wakeBodyAndIsland(static_cast<int>(i), 0.0f);
+        break;
+      }
+    }
+  }
+}
+
+void PhysicsWorld::wakeLostStaticSupport() {
+  if (!scene_) {
+    return;
+  }
+  const int n = static_cast<int>(bodies_.size());
+  for (int i = 0; i < n; ++i) {
+    RigidBody& b = bodies_[static_cast<size_t>(i)];
+    if (b.awake || !b.dynamic || b.supports.empty()) {
+      continue;
+    }
+    bool anyLost = false;
+    for (const SleepSupport& s : b.supports) {
+      if (!worldPointHitsOccupancy(*scene_, s.staticSlot, s.worldP)) {
+        anyLost = true;
+        break;
+      }
+    }
+    if (anyLost) {
+      wakeBodyAndIsland(i, 0.0f);
+    }
+  }
+}
+
+void PhysicsWorld::wakeFromTouchingContacts(const std::vector<Contact>& contacts, float gravityDt) {
+  const int n = static_cast<int>(bodies_.size());
+  for (const Contact& c : contacts) {
+    if (!contactIsTouching(c) || c.a < 0 || c.b < 0 || c.a >= n || c.b >= n) {
+      continue;
+    }
+    RigidBody& A = bodies_[static_cast<size_t>(c.a)];
+    RigidBody& B = bodies_[static_cast<size_t>(c.b)];
+    if (A.dynamic && !A.awake && B.dynamic && B.awake) {
+      wakeBodyAndIsland(c.a, gravityDt);
+    }
+    if (B.dynamic && !B.awake && A.dynamic && A.awake) {
+      wakeBodyAndIsland(c.b, gravityDt);
+    }
+    if (A.dynamic && !A.awake && !isStaticEnvironment(*scene_, B)) {
+      wakeBodyAndIsland(c.a, gravityDt);
+    }
+    if (B.dynamic && !B.awake && !isStaticEnvironment(*scene_, A)) {
+      wakeBodyAndIsland(c.b, gravityDt);
+    }
   }
 }
 
@@ -286,26 +468,14 @@ void PhysicsWorld::substep() {
       }
       RigidBody& A = bodies_[static_cast<size_t>(i)];
       RigidBody& B = bodies_[static_cast<size_t>(j)];
-      if (!A.dynamic && !B.dynamic) {
-        continue;
-      }
-      if (!A.awake && !B.awake) {
+      if (skipCollidePair(*scene_, A, B)) {
         continue;
       }
       collidePair(*scene_, A, B, classes_[static_cast<size_t>(i)], classes_[static_cast<size_t>(j)],
                   contacts);
     }
   }
-  for (const Contact& c : contacts) {
-    if (c.a >= 0 && c.a < n && bodies_[static_cast<size_t>(c.a)].dynamic) {
-      bodies_[static_cast<size_t>(c.a)].awake = true;
-      bodies_[static_cast<size_t>(c.a)].sleepTimer = 0.0f;
-    }
-    if (c.b >= 0 && c.b < n && bodies_[static_cast<size_t>(c.b)].dynamic) {
-      bodies_[static_cast<size_t>(c.b)].awake = true;
-      bodies_[static_cast<size_t>(c.b)].sleepTimer = 0.0f;
-    }
-  }
+  wakeFromTouchingContacts(contacts, kSubDt);
   const auto t1 = std::chrono::steady_clock::now();
   solveContacts(bodies_, contacts, kSubDt, kContactIters);
   recordSubstepImpulses(contacts, substepIndex_);
@@ -336,21 +506,107 @@ void PhysicsWorld::substep() {
 }
 
 void PhysicsWorld::updateSleep(float h) {
-  for (RigidBody& b : bodies_) {
+  const int n = static_cast<int>(bodies_.size());
+  if (n <= 0) {
+    lastTouching_.clear();
+    return;
+  }
+
+  lastTouching_.clear();
+  std::vector<int> parent(static_cast<size_t>(n));
+  for (int i = 0; i < n; ++i) {
+    parent[static_cast<size_t>(i)] = i;
+  }
+  std::vector<char> penetrating(static_cast<size_t>(n), 0);
+
+  for (const Contact& c : debug_.lastContacts) {
+    if (c.a < 0 || c.b < 0 || c.a >= n || c.b >= n || !contactIsTouching(c)) {
+      continue;
+    }
+    lastTouching_.push_back({c.a, c.b});
+    RigidBody& A = bodies_[static_cast<size_t>(c.a)];
+    RigidBody& B = bodies_[static_cast<size_t>(c.b)];
+    if (A.dynamic && B.dynamic && A.awake && B.awake) {
+      ufUnite(parent, c.a, c.b);
+    }
+    if (c.d > kSlop) {
+      if (A.dynamic && A.awake) {
+        penetrating[static_cast<size_t>(c.a)] = 1;
+      }
+      if (B.dynamic && B.awake) {
+        penetrating[static_cast<size_t>(c.b)] = 1;
+      }
+    }
+  }
+
+  struct IslandAcc {
+    float minTimer = 1.0e30f;
+    bool canSleep = true;
+  };
+  std::vector<IslandAcc> acc(static_cast<size_t>(n));
+  std::vector<char> used(static_cast<size_t>(n), 0);
+
+  for (int i = 0; i < n; ++i) {
+    RigidBody& b = bodies_[static_cast<size_t>(i)];
     if (!b.dynamic || b.invM <= 0.0f) {
       b.awake = false;
       continue;
     }
-    if (glm::length(b.v) < kSleepLin && glm::length(b.w) < kSleepAng) {
-      b.sleepTimer += h;
-      if (b.sleepTimer >= kSleepTime) {
-        b.awake = false;
-        b.v = glm::vec3(0.0f);
-        b.w = glm::vec3(0.0f);
-      }
-    } else {
+    if (!b.awake) {
+      continue;
+    }
+    const bool motionSleepy =
+        sleepVelocity(b, h) <= kSleepLin && glm::length(b.w) <= kSleepAng;
+    if (!b.enableSleep || !motionSleepy) {
       b.sleepTimer = 0.0f;
       b.awake = true;
+    } else {
+      b.sleepTimer += h;
+    }
+    const int root = ufFind(parent, i);
+    used[static_cast<size_t>(root)] = 1;
+    IslandAcc& a = acc[static_cast<size_t>(root)];
+    a.minTimer = std::min(a.minTimer, b.sleepTimer);
+    if (!b.enableSleep || !motionSleepy || penetrating[static_cast<size_t>(i)] != 0) {
+      a.canSleep = false;
+    }
+  }
+
+  for (int root = 0; root < n; ++root) {
+    if (used[static_cast<size_t>(root)] == 0) {
+      continue;
+    }
+    const IslandAcc& a = acc[static_cast<size_t>(root)];
+    if (!a.canSleep || a.minTimer < kSleepTime) {
+      continue;
+    }
+    const int islandId = nextSleepIsland_++;
+    for (int i = 0; i < n; ++i) {
+      if (!bodies_[static_cast<size_t>(i)].dynamic || !bodies_[static_cast<size_t>(i)].awake) {
+        continue;
+      }
+      if (ufFind(parent, i) != ufFind(parent, root)) {
+        continue;
+      }
+      RigidBody& b = bodies_[static_cast<size_t>(i)];
+      b.awake = false;
+      b.v = glm::vec3(0.0f);
+      b.w = glm::vec3(0.0f);
+      b.sleepIsland = islandId;
+      b.supports.clear();
+    }
+    for (const Contact& c : debug_.lastContacts) {
+      if (c.a < 0 || c.b < 0 || c.a >= n || c.b >= n || !contactIsTouching(c)) {
+        continue;
+      }
+      RigidBody& A = bodies_[static_cast<size_t>(c.a)];
+      RigidBody& B = bodies_[static_cast<size_t>(c.b)];
+      if (A.sleepIsland == islandId && isStaticEnvironment(*scene_, B)) {
+        A.supports.push_back(SleepSupport{c.b, c.p});
+      }
+      if (B.sleepIsland == islandId && isStaticEnvironment(*scene_, A)) {
+        B.supports.push_back(SleepSupport{c.a, c.p});
+      }
     }
   }
 }
@@ -430,6 +686,8 @@ void PhysicsWorld::step(float frameDt) {
     tickImpulses_.clear();
     substepIndex_ = 0;
     if (scene_) {
+      wakeLostStaticSupport();
+      snapshotTickPoses();
       for (int s = 0; s < kSubsteps; ++s) {
         substep();
       }

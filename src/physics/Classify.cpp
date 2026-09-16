@@ -229,6 +229,7 @@ void computeMassProperties(VoxelScene& scene, int objectIndex, RigidBody& body) 
     body.Iloc = glm::mat3(1.0f);
     body.IinvW = glm::mat3(0.0f);
     body.comLocal = gridCenter;
+    body.extent = 0.0f;
     return;
   }
 
@@ -238,6 +239,7 @@ void computeMassProperties(VoxelScene& scene, int objectIndex, RigidBody& body) 
   glm::dmat3 I(0.0);
   const double a = static_cast<double>(o.voxelSize);
   const double a2 = a * a;
+  double maxR = 0.0;
 
   for (int z = 0; z < o.gridSize; ++z) {
     for (int y = 0; y < o.gridSize; ++y) {
@@ -253,6 +255,7 @@ void computeMassProperties(VoxelScene& scene, int objectIndex, RigidBody& body) 
                              (static_cast<double>(z) + 0.5) * static_cast<double>(o.voxelSize));
           const glm::dvec3 r = p - com;
           const double r2 = glm::dot(r, r);
+          maxR = std::max(maxR, std::sqrt(r2) + 0.5 * a);
           const double ic = mC * a2 / 6.0;
           I[0][0] += ic + mC * (r2 - r.x * r.x);
           I[1][1] += ic + mC * (r2 - r.y * r.y);
@@ -271,6 +274,7 @@ void computeMassProperties(VoxelScene& scene, int objectIndex, RigidBody& body) 
                                (static_cast<double>(fp.z) + 0.5) * static_cast<double>(s));
             const glm::dvec3 r = p - com;
             const double r2 = glm::dot(r, r);
+            maxR = std::max(maxR, std::sqrt(r2) + 0.5 * static_cast<double>(s));
             I[0][0] += miFine * (r2 - r.x * r.x);
             I[1][1] += miFine * (r2 - r.y * r.y);
             I[2][2] += miFine * (r2 - r.z * r.z);
@@ -287,6 +291,7 @@ void computeMassProperties(VoxelScene& scene, int objectIndex, RigidBody& body) 
   }
 
   body.invM = static_cast<float>(1.0 / mass);
+  body.extent = std::max(static_cast<float>(maxR), kSphereRadius);
   for (int i = 0; i < 3; ++i) {
     for (int j = 0; j < 3; ++j) {
       body.Iloc[i][j] = static_cast<float>(I[i][j]);
