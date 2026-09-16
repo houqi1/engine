@@ -5,10 +5,32 @@
 #include "physics/VoxelCollide.h"
 #include "scene/VoxelScene.h"
 
+#include <glm/gtc/quaternion.hpp>
+
 #include <algorithm>
 #include <chrono>
 
 namespace physics {
+namespace {
+
+glm::vec3 gridCenterLocal(const VoxelObject& o) {
+  const float e = 0.5f * static_cast<float>(o.gridSize) * o.voxelSize;
+  return glm::vec3(e, e, e);
+}
+
+void snapBodyComFromObject(const VoxelObject& o, RigidBody& body) {
+  const glm::vec3 gc = gridCenterLocal(o);
+  body.x = o.position + o.rotation * (body.comLocal - gc);
+  body.q = o.rotation;
+}
+
+void writeObjectPoseFromCom(VoxelObject& o, const RigidBody& body) {
+  const glm::vec3 gc = gridCenterLocal(o);
+  o.rotation = body.q;
+  o.position = body.x - body.q * (body.comLocal - gc);
+}
+
+}  // namespace
 
 void PhysicsWorld::attach(VoxelScene& scene) { scene_ = &scene; }
 
@@ -106,6 +128,7 @@ void PhysicsWorld::rebuildDirty() {
     }
     rebuildShapeClass(*scene_, static_cast<int>(i), classes_[i]);
     computeMassProperties(*scene_, static_cast<int>(i), bodies_[i]);
+    snapBodyComFromObject(scene_->cpuObject(static_cast<int>(i)), bodies_[i]);
     refreshInverseInertiaWorld(bodies_[i]);
   }
 }
@@ -130,6 +153,7 @@ bool PhysicsWorld::getBodyState(VoxelObjectId id, BodyState& out) const {
   out.q = b.q;
   out.v = b.v;
   out.w = b.w;
+  out.comLocal = b.comLocal;
   out.awake = b.awake;
   out.sleepTimer = b.sleepTimer;
   return true;
@@ -153,6 +177,11 @@ bool PhysicsWorld::addBody(VoxelObjectId id, const BodyState& state) {
   classes_[static_cast<size_t>(i)].dirty = true;
   rebuildShapeClass(*scene_, i, classes_[static_cast<size_t>(i)]);
   computeMassProperties(*scene_, i, b);
+  snapBodyComFromObject(scene_->cpuObject(i), b);
+  b.v = state.v;
+  b.w = state.w;
+  b.awake = state.awake && b.dynamic;
+  b.sleepTimer = state.sleepTimer;
   refreshInverseInertiaWorld(b);
   return true;
 }
@@ -197,6 +226,13 @@ bool PhysicsWorld::replaceShape(VoxelObjectId id, const BodyState* stateOrNull) 
   classes_[static_cast<size_t>(i)].dirty = true;
   rebuildShapeClass(*scene_, i, classes_[static_cast<size_t>(i)]);
   computeMassProperties(*scene_, i, b);
+  snapBodyComFromObject(scene_->cpuObject(i), b);
+  if (stateOrNull) {
+    b.v = stateOrNull->v;
+    b.w = stateOrNull->w;
+    b.awake = stateOrNull->awake && b.dynamic;
+    b.sleepTimer = stateOrNull->sleepTimer;
+  }
   refreshInverseInertiaWorld(b);
   return true;
 }
@@ -431,15 +467,13 @@ void PhysicsWorld::syncTransformsToScene() {
     VoxelObject& o = scene_->cpuObject(b.shapeIndex);
     // Kinematic objects are authored by the scene (spinner); do not overwrite.
     if (o.motionType == MotionType::Kinematic) {
-      b.x = o.position;
-      b.q = o.rotation;
+      snapBodyComFromObject(o, b);
       continue;
     }
     if (!b.dynamic) {
       continue;
     }
-    o.position = b.x;
-    o.rotation = b.q;
+    writeObjectPoseFromCom(o, b);
   }
 }
 

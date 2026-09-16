@@ -10,6 +10,8 @@ struct RigidBody {
   glm::quat q{1.0f, 0.0f, 0.0f, 0.0f};
   glm::vec3 v{0.0f};
   glm::vec3 w{0.0f};
+  // Occupancy COM in object local meters (grid origin). x is this point in world.
+  glm::vec3 comLocal{0.0f};
   float invM = 0.0f;
   glm::mat3 Iloc{1.0f};
   glm::mat3 IinvW{0.0f};

@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cmath>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <glm/gtc/quaternion.hpp>
 
@@ -448,27 +449,39 @@ void StructureWorld::collectPendingFracture(StructureInstance& inst) {
     inst.debug.candidateMs = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - t0).count();
     return;
   }
-  if (inst.keepBox || inst.cutApplied) {
-    for (const ActorBinding& b : inst.bindings) {
-      if (b.actor != nullptr && !b.anchored && b.graphNodeCount > 1) {
-        inst.debug.candidateMs =
-            std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - t0).count();
-        return;
-      }
-    }
-  }
   const NvBlastSupportGraph graph = NvBlastAssetGetSupportGraph(inst.blast.asset, blastLog);
   fillNodeOwners(inst, graph);
   const uint32_t n = inst.probeCount;
   const uint32_t metaN = static_cast<uint32_t>(inst.bondMeta.size());
   float peakStrip = 0.0f;
   float peakY = 0.0f;
+  std::unordered_set<uint32_t> contactSlots;
+  for (const ActorLoadSnapshot& snap : inst.loadSnapshots) {
+    if (snap.valid && snap.mappedNodes > 0 && snap.objectId.valid()) {
+      contactSlots.insert(snap.objectId.slot);
+    }
+  }
   auto actorAnchored = [&](uint32_t owner) -> bool {
     if (owner == 0 || owner > inst.actorScratch.size()) {
       return false;
     }
     NvBlastActor* a = inst.actorScratch[owner - 1];
     return a != nullptr && NvBlastActorHasExternalBonds(a, blastLog);
+  };
+  auto ownerHadContact = [&](uint32_t owner) -> bool {
+    if (owner == 0 || owner > inst.actorScratch.size()) {
+      return false;
+    }
+    NvBlastActor* a = inst.actorScratch[owner - 1];
+    if (a == nullptr) {
+      return false;
+    }
+    for (const ActorBinding& b : inst.bindings) {
+      if (b.actor == a && b.objectId.valid() && contactSlots.count(b.objectId.slot) != 0) {
+        return true;
+      }
+    }
+    return false;
   };
   for (uint32_t i = 0; i < n; ++i) {
     const auto& p = inst.probes[i];
@@ -499,10 +512,18 @@ void StructureWorld::collectPendingFracture(StructureInstance& inst) {
   for (uint32_t i = 0; i < n; ++i) {
     const auto& p = inst.probes[i];
     const uint32_t owner = owningActorIndex(p, graph, inst.nodeOwner.data());
-    if (!canTakeDamage(p.health) || !actorAnchored(owner)) {
+    if (!canTakeDamage(p.health) || owner == 0) {
+      continue;
+    }
+    const bool anchored = actorAnchored(owner);
+    if (!anchored && !ownerHadContact(owner)) {
       continue;
     }
     const float s = probeMaxStress(p);
+    constexpr float kPlausibleMaxPa = 2.0e7f;
+    if (!anchored && (!(s > inst.strengthPa) || s > kPlausibleMaxPa)) {
+      continue;
+    }
     bool inStrip = false;
     float cy = 0.0f;
     if (p.blastBondIndex < metaN) {
@@ -514,8 +535,8 @@ void StructureWorld::collectPendingFracture(StructureInstance& inst) {
     }
     const bool belowRoof = !inst.keepBox || cy < roofY;
     const bool inHotSlice =
-        sliceHot && inStrip && belowRoof && std::abs(cy - sliceY) <= sliceBand;
-    if (!(s > inst.strengthPa) && !inHotSlice) {
+        anchored && sliceHot && inStrip && belowRoof && std::abs(cy - sliceY) <= sliceBand;
+    if (anchored && !(s > inst.strengthPa) && !inHotSlice) {
       continue;
     }
     FractureCandidate c;

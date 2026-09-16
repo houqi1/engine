@@ -1329,6 +1329,97 @@ void VoxelScene::setSpawnTestBoxOnSimulate(GfxDevice& gfx, bool on) {
   }
 }
 
+bool VoxelScene::getBodyState(VoxelObjectId id, physics::BodyState& out) const {
+  return physics_.getBodyState(id, out);
+}
+
+void VoxelScene::clearFineCollideProbes(GfxDevice& gfx) {
+  gfx.waitIdle();
+  for (int i = static_cast<int>(objects_.size()) - 1; i >= 0; --i) {
+    if (objects_[static_cast<size_t>(i)].slotOccupied &&
+        objects_[static_cast<size_t>(i)].isFineCollideProbe) {
+      freeObjectSlot(static_cast<uint32_t>(i));
+    }
+  }
+  packObjectPool();
+  fillGpuObjectRecords();
+  ensureGpuBuffers(gfx);
+  uploadCoarsePool(gfx);
+  uploadOccMip(gfx);
+  for (uint32_t i = 0; i < GfxDevice::kFramesInFlight; ++i) {
+    uploadObjectTransforms(gfx, i);
+  }
+  physics_.attach(*this);
+  physics_.rebuildFromScene();
+}
+
+void VoxelScene::spawnFineCollideProbes(GfxDevice& gfx) {
+  nestedMicroVoxels_ = true;
+  nestedFineVoxels_ = true;
+  clearFineCollideProbes(gfx);
+
+  constexpr int kN = 1;
+  constexpr int kFine = 4;
+  constexpr uint32_t kMat = 2u;
+  constexpr int kCount = 4;
+  const float vs = voxelSize_;
+  const float extent = static_cast<float>(kN) * vs;
+  const float xs[kCount] = {-6.0f, -2.0f, 2.0f, 6.0f};
+
+  for (int i = 0; i < kCount; ++i) {
+    const uint32_t slot = allocObjectSlot();
+    VoxelObject& o = objects_[slot];
+    o.gridSize = kN;
+    o.voxelSize = vs;
+    o.nestedMicro = true;
+    o.editable = true;
+    o.enabled = true;
+    o.slotOccupied = true;
+    o.isScatter = false;
+    o.isFineCollideProbe = true;
+    o.motionType = MotionType::Dynamic;
+    o.density = 1000.0f;
+    o.topologyRevision = 1;
+    o.useImportPalette = false;
+    o.rotation = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+    o.position = glm::vec3(xs[i], 3.2f + 0.5f * extent + 2.0f, -5.0f);
+    o.cells.assign(static_cast<size_t>(kN * kN * kN), CoarseCell{});
+    ensureCoarseBrick(o, glm::ivec3(0, 0, 0), kMat);
+    for (int z = 0; z < kFine; ++z) {
+      for (int y = 0; y < kFine; ++y) {
+        for (int x = 0; x < kFine; ++x) {
+          glm::ivec3 c, m, f;
+          splitFineIndex(x, y, z, c, m, f);
+          setFineCpu(o, c, m, f, true);
+        }
+      }
+    }
+  }
+
+  packObjectPool();
+  fillGpuObjectRecords();
+  ensureGpuBuffers(gfx);
+  uploadCoarsePool(gfx);
+  uploadOccMip(gfx);
+  for (uint32_t i = 0; i < GfxDevice::kFramesInFlight; ++i) {
+    uploadObjectTransforms(gfx, i);
+  }
+  physics_.attach(*this);
+  physics_.rebuildFromScene();
+}
+
+void VoxelScene::setFineCollideProbes(GfxDevice& gfx, bool on) {
+  if (fineCollideProbes_ == on) {
+    return;
+  }
+  fineCollideProbes_ = on;
+  if (on) {
+    spawnFineCollideProbes(gfx);
+  } else {
+    clearFineCollideProbes(gfx);
+  }
+}
+
 void VoxelScene::clearScatterBoxes(GfxDevice& gfx) {
   gfx.waitIdle();
   for (int i = static_cast<int>(objects_.size()) - 1; i >= 0; --i) {

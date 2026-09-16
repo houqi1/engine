@@ -233,6 +233,8 @@ private:
   bool scatterClearRequested_ = false;
   bool simulateRequested_ = false;
   bool spawnTestBoxRequested_ = false;
+  bool fineProbesRequested_ = false;
+  bool pendingFineProbes_ = false;
   bool spawnCylinderRequested_ = false;
   bool resetCylinderRequested_ = false;
   bool cutCylinderRequested_ = false;

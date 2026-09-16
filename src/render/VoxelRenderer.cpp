@@ -1290,7 +1290,8 @@ bool VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
   }
 
   if (importRequested_ || removeImportRequested_ || rebuildRequested_ || scatterSpawnRequested_ ||
-      scatterClearRequested_ || simulateRequested_ || spawnTestBoxRequested_ || spawnCylinderRequested_ ||
+      scatterClearRequested_ || simulateRequested_ || spawnTestBoxRequested_ || fineProbesRequested_ ||
+      spawnCylinderRequested_ ||
       spawnFrameRequested_ || resetCylinderRequested_ || cutCylinderRequested_ || cutThreeColumnsRequested_ ||
       cylinderDensityRequested_ || cylinderItersRequested_ || cylinderDisplayRequested_) {
     gfx_.waitIdle();
@@ -1318,6 +1319,9 @@ bool VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
     }
     if (spawnTestBoxRequested_) {
       scene.setSpawnTestBoxOnSimulate(gfx_, pendingSpawnTestBox_);
+    }
+    if (fineProbesRequested_) {
+      scene.setFineCollideProbes(gfx_, pendingFineProbes_);
     }
     if (simulateRequested_) {
       scene.setSimulate(gfx_, pendingSimulate_);
@@ -1348,6 +1352,7 @@ bool VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
     }
     importRequested_ = removeImportRequested_ = rebuildRequested_ = false;
     scatterSpawnRequested_ = scatterClearRequested_ = simulateRequested_ = spawnTestBoxRequested_ = false;
+    fineProbesRequested_ = false;
     spawnCylinderRequested_ = resetCylinderRequested_ = cutCylinderRequested_ = false;
     spawnFrameRequested_ = cutThreeColumnsRequested_ = false;
     cylinderDensityRequested_ = cylinderItersRequested_ = cylinderDisplayRequested_ = false;
@@ -1997,6 +2002,31 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
     ImGui::Checkbox("Fracture on dig", &scene.fractureEnabled());
     ImGui::TextDisabled("On = digging a dynamic object can split it into falling pieces.");
     ImGui::TextDisabled("Spawn test box: drop a solid cube onto the 3.2 m ground (off by default).");
+    bool fineProbes = scene.fineCollideProbes();
+    if (ImGui::Checkbox("Fine-grid collide probes", &fineProbes)) {
+      pendingFineProbes_ = fineProbes;
+      fineProbesRequested_ = true;
+    }
+    ImGui::TextDisabled("4 cubes of 4^3 fines (0.4 m, brick occupancy, 1000 kg/m3). Compare rest vs the solid test box.");
+    ImGui::TextDisabled("Gravity/contacts act at occupancy COM; comOff is |COM - object-grid center|.");
+    if (scene.fineCollideProbes()) {
+      int shown = 0;
+      for (int i = 0; i < scene.cpuObjectCount() && shown < 4; ++i) {
+        const VoxelObject& o = scene.cpuObject(i);
+        if (!o.slotOccupied || !o.isFineCollideProbe) {
+          continue;
+        }
+        physics::BodyState st;
+        const bool ok = scene.getBodyState(scene.objectIdAt(i), st);
+        const float gc = 0.5f * static_cast<float>(o.gridSize) * o.voxelSize;
+        const float comOff = ok ? glm::length(st.comLocal - glm::vec3(gc)) : 0.0f;
+        ImGui::Text("Probe %d corners=%u edges=%u |v|=%.3f |w|=%.3f awake=%d comOff=%.3f", shown,
+                    scene.physicsCornerCount(i), scene.physicsEdgeCount(i),
+                    ok ? glm::length(st.v) : 0.0f, ok ? glm::length(st.w) : 0.0f, ok && st.awake ? 1 : 0,
+                    comOff);
+        ++shown;
+      }
+    }
     if (scene.simulate() && scene.spawnTestBoxOnSimulate()) {
       const int testSlot = scene.testObjectId().valid() ? static_cast<int>(scene.testObjectId().slot) : 1;
       ImGui::Text("Test box corners: %u   edges: %u", scene.physicsCornerCount(testSlot),

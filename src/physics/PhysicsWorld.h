@@ -20,6 +20,7 @@ struct BodyState {
   glm::vec3 w{0.0f};
   bool awake = true;
   float sleepTimer = 0.0f;
+  glm::vec3 comLocal{0.0f};
 };
 
 class PhysicsWorld {

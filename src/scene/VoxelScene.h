@@ -78,6 +78,7 @@ struct VoxelObject {
   // Slot is live in the object table (distinct from enabled, which is visibility/sim).
   bool slotOccupied = true;
   bool isScatter = false;
+  bool isFineCollideProbe = false;
   MotionType motionType = MotionType::Dynamic;
   float density = 600.0f;
   // Bumped when occupancy, material connectivity rules, or anchors change.
@@ -226,6 +227,9 @@ public:
   void setSimulate(GfxDevice& gfx, bool on);
   bool spawnTestBoxOnSimulate() const { return spawnTestBoxOnSimulate_; }
   void setSpawnTestBoxOnSimulate(GfxDevice& gfx, bool on);
+  bool fineCollideProbes() const { return fineCollideProbes_; }
+  void setFineCollideProbes(GfxDevice& gfx, bool on);
+  bool getBodyState(VoxelObjectId id, physics::BodyState& out) const;
   int cpuObjectCount() const { return static_cast<int>(objects_.size()); }
   const VoxelObject& cpuObject(int i) const { return objects_.at(static_cast<size_t>(i)); }
   VoxelObject& cpuObject(int i) { return objects_.at(static_cast<size_t>(i)); }
@@ -305,6 +309,8 @@ private:
   void buildSpinnerObject(VoxelObject& o);
   void buildTestBoxObject(VoxelObject& o);
   void fillTestSlot(VoxelObject& o);
+  void clearFineCollideProbes(GfxDevice& gfx);
+  void spawnFineCollideProbes(GfxDevice& gfx);
   void rebuildTestSlot(GfxDevice& gfx);
   void clearObjectPages(VoxelObject& o);
   uint32_t allocObjectSlot();
@@ -466,6 +472,7 @@ private:
   bool spinnerEnabled_ = false;
   bool simulate_ = false;
   bool spawnTestBoxOnSimulate_ = false;
+  bool fineCollideProbes_ = false;
   physics::PhysicsWorld physics_;
   blast::StructureWorld structures_;
   VoxelObjectId stressCylinderId_{};
