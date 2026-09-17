@@ -462,11 +462,65 @@ void testLoadOnlyMatchingActor(blast::BlastRuntime& rt) {
   world.clear();
 }
 
+void testHottestPerSolve() {
+  std::cout << "E3 one solveEpoch does not dump the full over-S set\n";
+  std::vector<blast::FractureCandidate> cs;
+  for (uint32_t i = 0; i < 10; ++i) {
+    blast::FractureCandidate a;
+    a.anchored = true;
+    a.owner = 1;
+    a.stress = 1000.0f * static_cast<float>(i + 1);
+    a.sdkIndex = i;
+    cs.push_back(a);
+  }
+  for (uint32_t i = 0; i < 10; ++i) {
+    blast::FractureCandidate u;
+    u.anchored = false;
+    u.owner = 2;
+    u.stress = 100.0f * static_cast<float>(i + 1);
+    u.sdkIndex = 20 + i;
+    cs.push_back(u);
+  }
+  for (uint32_t i = 0; i < 3; ++i) {
+    blast::FractureCandidate u;
+    u.anchored = false;
+    u.owner = 3;
+    u.stress = 50.0f - static_cast<float>(i);
+    u.sdkIndex = 100 + i;
+    cs.push_back(u);
+  }
+  blast::keepHottestCandidates(cs, 4);
+  uint32_t n1 = 0;
+  uint32_t n2 = 0;
+  uint32_t n3 = 0;
+  float min1 = 1.0e9f;
+  float min2 = 1.0e9f;
+  for (const blast::FractureCandidate& c : cs) {
+    if (c.owner == 1) {
+      ++n1;
+      min1 = std::min(min1, c.stress);
+    }
+    if (c.owner == 2) {
+      ++n2;
+      min2 = std::min(min2, c.stress);
+    }
+    if (c.owner == 3) {
+      ++n3;
+    }
+  }
+  expect(n1 == 4, "anchored actor also capped at this solveEpoch");
+  expect(min1 >= 7000.0f, "owner 1 keeps only the hottest 4");
+  expect(n2 == 4, "unanchored actor capped at this solveEpoch");
+  expect(min2 >= 700.0f, "owner 2 keeps only the hottest 4");
+  expect(n3 == 3, "actor below the cap keeps all");
+}
+
 }  // namespace
 
 int main() {
   std::cout << "blast_e3_tests contact loads + mapping + gate\n";
   testImpulseBooks();
+  testHottestPerSolve();
   testTickFold();
   testEccentricMap();
   blast::TrackingAllocator alloc;

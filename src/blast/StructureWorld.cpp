@@ -1,7 +1,6 @@
 #include "blast/StructureWorld.h"
 
 #include "blast/CylinderVoxels.h"
-#include "blast/FrameVoxels.h"
 #include "blast/HardFracture.h"
 
 #include "NvBlast.h"
@@ -40,6 +39,40 @@ glm::ivec3 unpackFineCoord(uint32_t i, int n) {
 }
 
 }  // namespace
+
+void keepHottestCandidates(std::vector<FractureCandidate>& candidates, uint32_t maxPerActor) {
+  if (candidates.empty()) {
+    return;
+  }
+  if (maxPerActor == 0) {
+    candidates.clear();
+    return;
+  }
+  std::sort(candidates.begin(), candidates.end(), [](const FractureCandidate& a, const FractureCandidate& b) {
+    if (a.owner != b.owner) {
+      return a.owner < b.owner;
+    }
+    if (a.stress != b.stress) {
+      return a.stress > b.stress;
+    }
+    return a.sdkIndex < b.sdkIndex;
+  });
+  std::vector<FractureCandidate> kept;
+  kept.reserve(std::min(candidates.size(), static_cast<size_t>(maxPerActor) * 8u));
+  uint32_t curOwner = 0;
+  uint32_t taken = 0;
+  for (FractureCandidate& c : candidates) {
+    if (c.owner != curOwner) {
+      curOwner = c.owner;
+      taken = 0;
+    }
+    if (taken < maxPerActor) {
+      kept.push_back(std::move(c));
+      ++taken;
+    }
+  }
+  candidates.swap(kept);
+}
 
 bool StructureWorld::init(BlastRuntime& runtime) {
   if (!runtime.initialized()) {
@@ -453,8 +486,6 @@ void StructureWorld::collectPendingFracture(StructureInstance& inst) {
   fillNodeOwners(inst, graph);
   const uint32_t n = inst.probeCount;
   const uint32_t metaN = static_cast<uint32_t>(inst.bondMeta.size());
-  float peakStrip = 0.0f;
-  float peakY = 0.0f;
   std::unordered_set<uint32_t> contactSlots;
   for (const ActorLoadSnapshot& snap : inst.loadSnapshots) {
     if (snap.valid && snap.mappedNodes > 0 && snap.objectId.valid()) {
@@ -483,31 +514,6 @@ void StructureWorld::collectPendingFracture(StructureInstance& inst) {
     }
     return false;
   };
-  for (uint32_t i = 0; i < n; ++i) {
-    const auto& p = inst.probes[i];
-    if (p.blastBondIndex >= metaN || !canTakeDamage(p.health)) {
-      continue;
-    }
-    if (!actorAnchored(owningActorIndex(p, graph, inst.nodeOwner.data()))) {
-      continue;
-    }
-    const BondMeta& m = inst.bondMeta[p.blastBondIndex];
-    if (m.inStrip == 0 || m.graphIndex >= inst.graph.bonds.size()) {
-      continue;
-    }
-    const float s = probeMaxStress(p);
-    if (s > peakStrip) {
-      peakStrip = s;
-      peakY = inst.graph.bonds[m.graphIndex].cy;
-    }
-  }
-  const float sliceBand = 0.25f;
-  const float roofY = static_cast<float>(kFrameColH) * kE1FineMeters;
-  float sliceY = peakY;
-  if (inst.keepBox && sliceY > roofY - sliceBand * 1.5f) {
-    sliceY = roofY - sliceBand * 1.5f;
-  }
-  const bool sliceHot = peakStrip > inst.strengthPa && (inst.keepBox || inst.cutApplied);
   inst.pending.candidates.reserve(n);
   for (uint32_t i = 0; i < n; ++i) {
     const auto& p = inst.probes[i];
@@ -521,30 +527,20 @@ void StructureWorld::collectPendingFracture(StructureInstance& inst) {
     }
     const float s = probeMaxStress(p);
     constexpr float kPlausibleMaxPa = 2.0e7f;
-    if (!anchored && (!(s > inst.strengthPa) || s > kPlausibleMaxPa)) {
+    if (!(s > inst.strengthPa)) {
       continue;
     }
-    bool inStrip = false;
-    float cy = 0.0f;
-    if (p.blastBondIndex < metaN) {
-      const BondMeta& m = inst.bondMeta[p.blastBondIndex];
-      inStrip = m.inStrip != 0;
-      if (m.graphIndex < inst.graph.bonds.size()) {
-        cy = inst.graph.bonds[m.graphIndex].cy;
-      }
-    }
-    const bool belowRoof = !inst.keepBox || cy < roofY;
-    const bool inHotSlice =
-        anchored && sliceHot && inStrip && belowRoof && std::abs(cy - sliceY) <= sliceBand;
-    if (anchored && !(s > inst.strengthPa) && !inHotSlice) {
+    if (!anchored && s > kPlausibleMaxPa) {
       continue;
     }
     FractureCandidate c;
     c.sdkIndex = p.blastBondIndex;
     c.node0 = p.node0;
     c.node1 = p.node1;
+    c.owner = owner;
     c.stress = s;
     c.strength = inst.strengthPa;
+    c.anchored = anchored;
     if (p.blastBondIndex < metaN) {
       const BondMeta& m = inst.bondMeta[p.blastBondIndex];
       c.stableId = m.stableId;
@@ -556,10 +552,14 @@ void StructureWorld::collectPendingFracture(StructureInstance& inst) {
         c.faces = b.faces;
       }
     }
+    inst.pending.candidates.push_back(std::move(c));
+  }
+  keepHottestCandidates(inst.pending.candidates);
+  inst.debug.candidateInStrip = 0;
+  for (const FractureCandidate& c : inst.pending.candidates) {
     if (c.inStrip) {
       ++inst.debug.candidateInStrip;
     }
-    inst.pending.candidates.push_back(std::move(c));
   }
   inst.pending.valid = !inst.pending.candidates.empty();
   inst.pending.objectId = inst.objectId;

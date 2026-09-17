@@ -68,11 +68,22 @@ struct FractureCandidate {
   uint32_t nodeB = 0;
   uint32_t node0 = 0;
   uint32_t node1 = 0;
+  uint32_t owner = 0;
   float stress = 0.0f;
   float strength = 0.0f;
   bool inStrip = false;
+  bool anchored = false;
   std::vector<uint64_t> faces;
 };
+
+// One ExtStress snapshot is only valid until the first bonds break. Applying every
+// over-S bond from that snapshot deletes members that would be under S after
+// unload. Each solveEpoch submits at most this many hottest over-S bonds per actor;
+// the next solve (same gravity, new topology) decides the rest.
+constexpr uint32_t kFractureBondsPerSolve = 1;
+
+void keepHottestCandidates(std::vector<FractureCandidate>& candidates,
+                           uint32_t maxPerActor = kFractureBondsPerSolve);
 
 struct PendingFracture {
   bool valid = false;

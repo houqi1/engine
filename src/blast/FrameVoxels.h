@@ -6,13 +6,15 @@
 
 namespace blast {
 
-// Four corner columns + a roof slab. Fine 0.1 m, same 64^3 object as the cylinder demo.
-constexpr int kFrameGridFines = 64;
+// Four corner columns + a roof slab. Fine 0.1 m. Grid is cubic (VoxelObject.gridSize).
+// 96 fines = 9.6 m; columns 8.8 m so a cut roof falls farther than the old 4.0 m posts.
+constexpr int kFrameGridFines = 96;
 constexpr int kFrameColW = 6;
-constexpr int kFrameColH = 40;
+constexpr int kFrameColH = 88;
 constexpr int kFrameRoofT = 4;
 constexpr int kFrameAnchorFines = 2;
-constexpr int kFrameInset = 8;
+constexpr int kFrameColSpan = 32;
+constexpr int kFrameInset = (kFrameGridFines - kFrameColSpan - kFrameColW) / 2;
 constexpr int kFrameKeepCol = 3;
 constexpr int kFrameAgg = 4;
 constexpr float kFrameStrengthFailPa = 1.0e6f;
@@ -29,11 +31,10 @@ struct FrameRaster {
 };
 
 inline void frameColumnRange(int col, int& x0, int& z0) {
-  const int span = 32;
   const int ix = (col == 2 || col == 3) ? 1 : 0;
   const int iz = (col == 1 || col == 3) ? 1 : 0;
-  x0 = kFrameInset + ix * span;
-  z0 = kFrameInset + iz * span;
+  x0 = kFrameInset + ix * kFrameColSpan;
+  z0 = kFrameInset + iz * kFrameColSpan;
 }
 
 inline bool inFrameColumn(int col, int x, int y, int z) {
@@ -60,9 +61,9 @@ inline bool inFrameRoof(int x, int y, int z) {
     return false;
   }
   const int x0 = kFrameInset;
-  const int x1 = kFrameInset + 32 + kFrameColW;
+  const int x1 = kFrameInset + kFrameColSpan + kFrameColW;
   const int z0 = kFrameInset;
-  const int z1 = kFrameInset + 32 + kFrameColW;
+  const int z1 = kFrameInset + kFrameColSpan + kFrameColW;
   const int t = kFrameColW;
   const bool xBeam = x >= x0 && x < x1 && ((z >= z0 && z < z0 + t) || (z >= z1 - t && z < z1));
   const bool zBeam = z >= z0 && z < z1 && ((x >= x0 && x < x0 + t) || (x >= x1 - t && x < x1));

@@ -165,12 +165,12 @@ void testCutStressAndStrength(blast::BlastRuntime& rt) {
   expect(after > before, "remaining column stress rises");
   {
     blast::StructureInstance* inst = cutHold.instance();
+    const uint32_t n = inst != nullptr ? inst->probeCount : 0;
     const float th[] = {2.5e5f, 5.0e5f, 1.0e6f, 1.5e6f, 2.0e6f, 2.5e6f};
     std::cout << "  bond counts above S (keep-col vs other):\n";
     for (float s0 : th) {
       uint32_t keep = 0;
       uint32_t other = 0;
-      uint32_t n = inst != nullptr ? inst->probeCount : 0;
       for (uint32_t i = 0; i < n; ++i) {
         const auto& p = inst->probes[i];
         if (!canTakeDamage(p.health)) {
@@ -191,6 +191,47 @@ void testCutStressAndStrength(blast::BlastRuntime& rt) {
       }
       std::cout << "    S=" << s0 << " Pa  keep-col=" << keep << " other=" << other << "\n";
     }
+    const float failS = blast::kFrameStrengthFailPa;
+    const float binM = 0.5f;
+    const int nBin = 20;
+    uint32_t yOver[20] = {};
+    uint32_t yAll[20] = {};
+    float yMin = 1.0e9f;
+    float yMax = -1.0e9f;
+    uint32_t keepOver = 0;
+    uint32_t keepTotal = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+      const auto& p = inst->probes[i];
+      if (p.blastBondIndex >= inst->bondMeta.size()) {
+        continue;
+      }
+      const blast::BondMeta& m = inst->bondMeta[p.blastBondIndex];
+      if (m.inStrip == 0 || m.world != 0 || m.graphIndex >= inst->graph.bonds.size()) {
+        continue;
+      }
+      if (!canTakeDamage(p.health)) {
+        continue;
+      }
+      const float cy = inst->graph.bonds[m.graphIndex].cy;
+      yMin = std::min(yMin, cy);
+      yMax = std::max(yMax, cy);
+      const int b = std::max(0, std::min(nBin - 1, static_cast<int>(cy / binM)));
+      ++yAll[b];
+      ++keepTotal;
+      if (blast::probeMaxStress(p) > failS) {
+        ++yOver[b];
+        ++keepOver;
+      }
+    }
+    std::cout << "  keep-col bonds σ>" << failS << " Pa: " << keepOver << "/" << keepTotal
+              << "  y=[" << yMin << "," << yMax << "]\n";
+    for (int b = 0; b < nBin; ++b) {
+      if (yAll[b] == 0) {
+        continue;
+      }
+      std::cout << "    y " << (b * binM) << "-" << ((b + 1) * binM) << " m  over=" << yOver[b]
+                << " / " << yAll[b] << "\n";
+    }
   }
   cutHold.setFractureEnabled(true);
   solveWorld(cutHold, 2);
@@ -205,13 +246,40 @@ void testCutStressAndStrength(blast::BlastRuntime& rt) {
   cutFail.setFractureEnabled(true);
   driveUntilConverged(cutFail, 24);
   expect(cutFail.debug().converged, "cut-fail converged");
-  solveWorld(cutFail, 1);
-  const uint32_t cand = cutFail.debug().candidateCount;
-  const uint32_t nfrac = cutFail.applyPendingCandidates(cutFail.pendingFracture());
-  const uint32_t actors = cutFail.splitAllRequired();
+  uint32_t nfrac = 0;
+  uint32_t actors = 1;
+  uint32_t firstCand = 0;
+  for (int step = 0; step < 64; ++step) {
+    solveWorld(cutFail, 1);
+    if (!cutFail.debug().converged) {
+      continue;
+    }
+    const uint32_t cand = cutFail.debug().candidateCount;
+    if (step == 0) {
+      firstCand = cand;
+    }
+    if (cand == 0) {
+      break;
+    }
+    nfrac += cutFail.applyPendingCandidates(cutFail.pendingFracture());
+    actors = cutFail.splitAllRequired();
+    if (actors > 1) {
+      break;
+    }
+  }
   expect(nfrac > 0, "low strength breaks remaining path");
-  expect(actors > 1, "hot slice splits the remaining column");
-  std::cout << "  fail cand=" << cand << " fractured=" << nfrac << " actors=" << actors << "\n";
+  expect(actors > 1, "over-S path splits after re-solves");
+  expect(firstCand <= blast::kFractureBondsPerSolve, "one solveEpoch does not dump every over-S bond");
+  std::cout << "  fail firstCand=" << firstCand << " fractured=" << nfrac << " actors=" << actors << "\n";
+  driveUntilConverged(cutFail, 24);
+  solveWorld(cutFail, 1);
+  std::cout << "  after-split conv=" << cutFail.debug().converged
+            << " strip=" << cutFail.debug().stripMaxStress
+            << " cand=" << cutFail.debug().candidateCount
+            << " actors=" << cutFail.debug().splitActors << "\n";
+  expect(cutFail.debug().converged, "stump reconverges");
+  expect(cutFail.debug().stripMaxStress < blast::kFrameStrengthFailPa, "unloaded stump below fail S");
+  expect(cutFail.debug().candidateCount == 0, "unloaded stump does not keep fracturing");
   cutFail.clear();
 }
 

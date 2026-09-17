@@ -2025,6 +2025,8 @@ bool VoxelScene::spawnStressFrame(GfxDevice& gfx) {
   o.rotation = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
   const float extent = static_cast<float>(o.gridSize) * o.voxelSize;
   o.position = glm::vec3(0.0f, 3.2f + 0.5f * extent, 0.0f);
+  camera_.setOrbitTarget(glm::vec3(0.0f, 3.2f + 0.5f * static_cast<float>(blast::kFrameColH) * blast::kE1FineMeters, 0.0f));
+  camera_.setOrbitDistance(32.0f);
   o.cells.assign(static_cast<size_t>(o.gridSize * o.gridSize * o.gridSize), CoarseCell{});
   blast::forEachFrameFine(spec, [&](int x, int y, int z) {
     glm::ivec3 c, m, f;
