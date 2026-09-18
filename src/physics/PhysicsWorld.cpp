@@ -477,6 +477,18 @@ void PhysicsWorld::substep() {
   }
   wakeFromTouchingContacts(contacts, kSubDt);
   const auto t1 = std::chrono::steady_clock::now();
+  // Snapshot contact-point velocities before SI (NvBlast ExtImpactDamageManager
+  // uses getVelocityAtPos for force = (n·Δv)*reducedMass). Post-solve Δv is ~0
+  // here because kRestitution=0, so Impact Damage would otherwise always filter.
+  for (Contact& c : contacts) {
+    if (c.a < 0 || c.b < 0 || c.a >= n || c.b >= n) {
+      continue;
+    }
+    const RigidBody& A = bodies_[static_cast<size_t>(c.a)];
+    const RigidBody& B = bodies_[static_cast<size_t>(c.b)];
+    c.preVelA = A.v + glm::cross(A.w, c.rA);
+    c.preVelB = B.v + glm::cross(B.w, c.rB);
+  }
   solveContacts(bodies_, contacts, kSubDt, kContactIters);
   recordSubstepImpulses(contacts, substepIndex_);
   ++substepIndex_;
@@ -622,7 +634,9 @@ void PhysicsWorld::recordSubstepImpulses(const std::vector<Contact>& contacts, i
       continue;
     }
     const glm::vec3 JA = contactImpulseOnA(c);
-    if (glm::dot(JA, JA) <= 1e-20f) {
+    // Narrow phase also emits speculative candidates. Only contacts that are
+    // touching or actually constrain approach correspond to a Viewer contact report.
+    if (!contactIsTouching(c) && glm::dot(JA, JA) <= 1.0e-20f) {
       continue;
     }
     const RigidBody& A = bodies_[static_cast<size_t>(c.a)];
@@ -645,6 +659,27 @@ void PhysicsWorld::recordSubstepImpulses(const std::vector<Contact>& contacts, i
     rec.fineNB = (c.b < static_cast<int>(classes_.size())) ? classes_[static_cast<size_t>(c.b)].fineN : 0;
     rec.tickId = tick;
     rec.substep = substep;
+    rec.n = c.n;
+    rec.massA = A.invM > 0.0f ? 1.0f / A.invM : 0.0f;
+    rec.massB = B.invM > 0.0f ? 1.0f / B.invM : 0.0f;
+    // Viewer Impact Damage Δv (ExtImpactDamageManager), not post-SI residual.
+    rec.velA = c.preVelA;
+    rec.velB = c.preVelB;
+    rec.eventId = blast::contactPairKey(rec.idA, rec.idB);
+    rec.persistent = false;
+    const int lo = c.a < c.b ? c.a : c.b;
+    const int hi = c.a < c.b ? c.b : c.a;
+    for (const std::pair<int, int>& t : lastTouching_) {
+      const int tlo = t.first < t.second ? t.first : t.second;
+      const int thi = t.first < t.second ? t.second : t.first;
+      if (tlo == lo && thi == hi) {
+        rec.persistent = true;
+        break;
+      }
+    }
+    if (!rec.persistent) {
+      rec.eventId ^= tick * 0x9E3779B97F4A7C15ULL;
+    }
     tickImpulses_.push_back(rec);
   }
 }

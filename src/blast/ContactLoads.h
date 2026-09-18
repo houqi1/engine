@@ -51,6 +51,7 @@ public:
   bool consume(uint64_t eventId);
   void invalidateSnapshot(LoadSnapshot& snap);
   bool consumed(uint64_t eventId) const;
+  void reset();
 
 private:
   std::unordered_set<uint64_t> consumed_;
@@ -74,7 +75,33 @@ struct WorldContactImpulse {
   int fineNB = 0;
   uint64_t tickId = 0;
   int substep = 0;
+  uint64_t eventId = 0;
+  bool persistent = false;
+  glm::vec3 n{0.0f, 1.0f, 0.0f};
+  float massA = 0.0f;
+  float massB = 0.0f;
+  // Contact-point velocities for ExtImpactDamageManager force = (n·Δv)*reducedMass.
+  // PhysicsWorld fills these from pre-solve snapshots (see Contact::preVelA/B).
+  glm::vec3 velA{0.0f};
+  glm::vec3 velB{0.0f};
 };
+
+struct BodyKinematics {
+  VoxelObjectId objectId{};
+  glm::quat worldQ{1.0f, 0.0f, 0.0f, 0.0f};
+  glm::vec3 worldW{0.0f};
+};
+
+inline uint64_t contactPairKey(VoxelObjectId a, VoxelObjectId b) {
+  if (a.slot > b.slot || (a.slot == b.slot && a.generation > b.generation)) {
+    const VoxelObjectId t = a;
+    a = b;
+    b = t;
+  }
+  uint64_t h = (static_cast<uint64_t>(a.slot) << 32) ^ a.generation;
+  h ^= (static_cast<uint64_t>(b.slot) << 32) ^ (static_cast<uint64_t>(b.generation) << 1);
+  return h;
+}
 
 struct BodyAssetFrame {
   VoxelObjectId objectId{};

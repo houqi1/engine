@@ -474,7 +474,7 @@ void sceneBlastLog(int type, const char* msg, const char* file, int line) {
 bool VoxelScene::extractIslandFromFines(GfxDevice& /*gfx*/, VoxelObject& parent, int parentIndex,
                                         const std::vector<voxel::FineCoord>& fines, VoxelObjectId parentId,
                                         const physics::BodyState& parentState, glm::dvec3 parentComLocal,
-                                        MotionType motion, uint32_t minFines, VoxelObjectId* outId) {
+                                        MotionType motion, VoxelObjectId* outId) {
   if (outId != nullptr) {
     *outId = {};
   }
@@ -510,9 +510,6 @@ bool VoxelScene::extractIslandFromFines(GfxDevice& /*gfx*/, VoxelObject& parent,
     samples.push_back(sample);
   }
   if (samples.empty()) {
-    return true;
-  }
-  if (samples.size() < minFines) {
     return true;
   }
 
@@ -682,7 +679,7 @@ VoxelObjectId VoxelScene::objectOwningFamilyFine(const glm::ivec3& absFine) cons
 
 bool VoxelScene::commitOccupancySplit(GfxDevice& gfx, VoxelObjectId parentId,
                                       const std::vector<std::vector<voxel::FineCoord>>& islands,
-                                      const std::vector<uint8_t>& anchored, uint32_t minFines,
+                                      const std::vector<uint8_t>& anchored,
                                       const std::vector<NvBlastActor*>& actors) {
   VoxelObject* parent = tryGetObject(parentId);
   if (!parent || islands.empty()) {
@@ -723,7 +720,9 @@ bool VoxelScene::commitOccupancySplit(GfxDevice& gfx, VoxelObjectId parentId,
 
   uint32_t created = 0;
   for (size_t i = 0; i < islands.size(); ++i) {
-    if (i == keep || islands[i].empty() || islands[i].size() < minFines) {
+    // Every nonempty Blast island must become a separate body, including partially
+    // occupied boundary cells. Leaving small islands in the parent glues them back.
+    if (i == keep || islands[i].empty()) {
       continue;
     }
     parent = tryGetObject(parentId);
@@ -733,7 +732,7 @@ bool VoxelScene::commitOccupancySplit(GfxDevice& gfx, VoxelObjectId parentId,
     const MotionType motion = (i < anchored.size() && anchored[i] != 0) ? MotionType::Static : MotionType::Dynamic;
     VoxelObjectId childId{};
     if (!extractIslandFromFines(gfx, *parent, parentIndex, islands[i], parentId, parentState, parentCom, motion,
-                                minFines, &childId)) {
+                                &childId)) {
       std::cerr << "Structure split: island extract failed\n";
       return false;
     }
@@ -810,46 +809,23 @@ void VoxelScene::commitStructureSplits(GfxDevice& gfx) {
   if (inst == nullptr || inst->blast.actor == nullptr) {
     return;
   }
-  if (!structures_.pendingFracture().valid || structures_.pendingFracture().candidates.empty()) {
-    return;
-  }
-  if (!structures_.pendingSnapshotMatches(structures_.pendingFracture())) {
-    structures_.recachePendingFromProbes();
-    if (!structures_.pendingSnapshotMatches(structures_.pendingFracture()) ||
-        !structures_.pendingFracture().valid || structures_.pendingFracture().candidates.empty()) {
-      structures_.clearPendingFracture();
+  const bool dirty = structures_.takeOccupancyDirty();
+  if (!dirty) {
+    if (!structures_.pendingFracture().valid || structures_.pendingFracture().candidates.empty()) {
       return;
     }
-  }
-
-  const blast::PendingFracture& pending = structures_.pendingFracture();
-  for (const blast::FractureCandidate& c : pending.candidates) {
-    for (uint64_t f : c.faces) {
-      inst->grid.brokenFaces.insert(f);
+    if (!structures_.pendingSnapshotMatches(structures_.pendingFracture())) {
+      structures_.recachePendingFromProbes();
+      if (!structures_.pendingSnapshotMatches(structures_.pendingFracture()) ||
+          !structures_.pendingFracture().valid || structures_.pendingFracture().candidates.empty()) {
+        structures_.clearPendingFracture();
+        return;
+      }
     }
-    if (c.stableId != 0) {
-      inst->grid.bondDamage[blast::packBondKey(c.nodeA, c.nodeB)] = 1.0f;
-    }
+    structures_.applyPendingIfAny();
   }
-
-  const uint32_t nfrac = structures_.applyPendingCandidates(pending);
-  inst->debug.fracturedBonds = nfrac;
-  structures_.clearPendingFracture();
-  if (nfrac == 0) {
-    return;
-  }
-
-  const uint32_t actors = structures_.splitAllRequired();
-  inst->debug.splitActors = actors;
-  inst->debug.candidateCount = 0;
-
+  const uint32_t actors = inst->debug.splitActors;
   if (actors <= 1) {
-    std::cout << "Structure fracture: bonds=" << nfrac << " no new actor (graph updated)\n";
-    return;
-  }
-  if (actors > 128) {
-    std::cerr << "Structure fracture: bonds=" << nfrac << " actors=" << actors
-              << " occupancy extract skipped (too many islands)\n";
     return;
   }
 
@@ -865,6 +841,7 @@ void VoxelScene::commitStructureSplits(GfxDevice& gfx) {
   struct Piece {
     NvBlastActor* actor = nullptr;
     std::vector<voxel::FineCoord> fines;
+    voxel::FineCoord firstFine{};
     uint8_t anchored = 0;
     VoxelObjectId owner{};
   };
@@ -914,9 +891,10 @@ void VoxelScene::commitStructureSplits(GfxDevice& gfx) {
        " anchored=" + std::to_string(NvBlastActorHasExternalBonds(a, sceneBlastLog) ? 1 : 0));
     Piece piece;
     piece.actor = a;
+    piece.firstFine = fines.front();
     piece.fines = std::move(fines);
     piece.anchored = NvBlastActorHasExternalBonds(a, sceneBlastLog) ? 1 : 0;
-    piece.owner = objectOwningFamilyFine(glm::ivec3(piece.fines[0].x, piece.fines[0].y, piece.fines[0].z));
+    piece.owner = objectOwningFamilyFine(glm::ivec3(piece.firstFine.x, piece.firstFine.y, piece.firstFine.z));
     if (!piece.owner.valid() ||
         (groundObjectId_.valid() && piece.owner.slot == groundObjectId_.slot) ||
         (testObjectId_.valid() && piece.owner.slot == testObjectId_.slot)) {
@@ -951,9 +929,29 @@ void VoxelScene::commitStructureSplits(GfxDevice& gfx) {
     const uint32_t beforeSolids = countSolidFines(static_cast<int>(owner.slot));
     tr("Structure split: ownerSlot=" + std::to_string(owner.slot) +
        " islands=" + std::to_string(islands.size()) + " solidsBefore=" + std::to_string(beforeSolids));
-    commitOccupancySplit(gfx, owner, islands, anchored, 64u, actors);
+    commitOccupancySplit(gfx, owner, islands, anchored, actors);
     tr("Structure split: solidsAfter=" +
        std::to_string(countSolidFines(static_cast<int>(owner.slot))));
+  }
+  std::vector<blast::ActorObjectLink> relink;
+  relink.reserve(pieces.size());
+  for (const Piece& p : pieces) {
+    blast::ActorObjectLink L;
+    L.actor = p.actor;
+    L.objectId = objectOwningFamilyFine(glm::ivec3(p.firstFine.x, p.firstFine.y, p.firstFine.z));
+    if (!L.objectId.valid() ||
+        (groundObjectId_.valid() && L.objectId.slot == groundObjectId_.slot) ||
+        (testObjectId_.valid() && L.objectId.slot == testObjectId_.slot)) {
+      L.objectId = p.owner.valid() ? p.owner : inst->objectId;
+    }
+    if (const VoxelObject* o = tryGetObject(L.objectId)) {
+      L.fineOrigin = o->structureFineOrigin;
+      L.fineN = o->gridSize * kFinePerCoarse;
+    }
+    relink.push_back(L);
+  }
+  if (!relink.empty()) {
+    structures_.bindVisibleActors(relink);
   }
   if (pieces.size() < 2) {
     tr("Structure split: pieces=" + std::to_string(pieces.size()) + " occupancy skipped");

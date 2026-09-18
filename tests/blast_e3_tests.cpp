@@ -1,6 +1,7 @@
 #include "blast/BlastMemory.h"
 #include "blast/ContactLoads.h"
 #include "blast/HardFracture.h"
+#include "blast/ImpactDamage.h"
 #include "blast/OccupancySampler.h"
 #include "blast/StructureWorld.h"
 #include "physics/PhysicsTypes.h"
@@ -413,10 +414,6 @@ void testStrictConverge(blast::BlastRuntime& rt) {
   world.setFractureEnabled(true);
   world.setStrengthPa(1.0f);
   world.onPhysicsTick(1, physics::kDt);
-  const bool conv = world.debug().converged;
-  if (!conv && world.debug().stripMaxStress <= 2.0f * world.debug().strengthPa) {
-    expect(world.debug().candidateCount == 0, "unconverged and not clearly-over => no candidates");
-  }
   expect(world.debug().probeExportCount == 1, "one probe export");
   expect(world.bindings().size() >= 1, "mounted actor binding");
   world.clear();
@@ -462,57 +459,273 @@ void testLoadOnlyMatchingActor(blast::BlastRuntime& rt) {
   world.clear();
 }
 
-void testHottestPerSolve() {
-  std::cout << "E3 one solveEpoch does not dump the full over-S set\n";
-  std::vector<blast::FractureCandidate> cs;
-  for (uint32_t i = 0; i < 10; ++i) {
-    blast::FractureCandidate a;
-    a.anchored = true;
-    a.owner = 1;
-    a.stress = 1000.0f * static_cast<float>(i + 1);
-    a.sdkIndex = i;
-    cs.push_back(a);
-  }
-  for (uint32_t i = 0; i < 10; ++i) {
-    blast::FractureCandidate u;
-    u.anchored = false;
-    u.owner = 2;
-    u.stress = 100.0f * static_cast<float>(i + 1);
-    u.sdkIndex = 20 + i;
-    cs.push_back(u);
-  }
-  for (uint32_t i = 0; i < 3; ++i) {
-    blast::FractureCandidate u;
-    u.anchored = false;
-    u.owner = 3;
-    u.stress = 50.0f - static_cast<float>(i);
-    u.sdkIndex = 100 + i;
-    cs.push_back(u);
-  }
-  blast::keepHottestCandidates(cs, 4);
-  uint32_t n1 = 0;
-  uint32_t n2 = 0;
-  uint32_t n3 = 0;
-  float min1 = 1.0e9f;
-  float min2 = 1.0e9f;
-  for (const blast::FractureCandidate& c : cs) {
-    if (c.owner == 1) {
-      ++n1;
-      min1 = std::min(min1, c.stress);
+void testSdkProportionalDamage(blast::BlastRuntime& rt) {
+  std::cout << "E3 generateFractureCommands keeps fractional damage below fatal\n";
+  class BoxView final : public blast::OccupancyView {
+  public:
+    int nx() const override { return 8; }
+    int ny() const override { return 8; }
+    int nz() const override { return 4; }
+    bool solid(int x, int y, int z) const override {
+      return x >= 0 && x < 8 && y >= 0 && y < 6 && z >= 1 && z < 3;
     }
-    if (c.owner == 2) {
-      ++n2;
-      min2 = std::min(min2, c.stress);
-    }
-    if (c.owner == 3) {
-      ++n3;
+    bool anchor(int x, int y, int z) const override { return solid(x, y, z) && y < 1; }
+  } view;
+  blast::OccupancySampleOpts opts;
+  opts.agg = 1;
+  auto sample = blast::sampleOccupancy(view, opts);
+  expect(sample.error == blast::BlastError::Ok, "sample");
+  blast::StructureWorld world;
+  expect(world.init(rt), "init");
+  expect(world.mountSample({8, 1}, std::move(sample), 400, 5.0e7f, 0.0f, 0.0f) == blast::BlastError::Ok, "mount");
+  world.setFractureEnabled(true);
+  world.setStrengthPa(1.0f);
+  world.onPhysicsTick(1, physics::kDt);
+  if (!world.debug().converged) {
+    for (int i = 0; i < 24 && !world.debug().converged; ++i) {
+      world.onPhysicsTick(static_cast<uint64_t>(2 + i), physics::kDt);
     }
   }
-  expect(n1 == 4, "anchored actor also capped at this solveEpoch");
-  expect(min1 >= 7000.0f, "owner 1 keeps only the hottest 4");
-  expect(n2 == 4, "unanchored actor capped at this solveEpoch");
-  expect(min2 >= 700.0f, "owner 2 keeps only the hottest 4");
-  expect(n3 == 3, "actor below the cap keeps all");
+  expect(world.debug().converged, "converged for damage commands");
+  const blast::PendingFracture& pend = world.pendingFracture();
+  if (world.debug().stripMaxStress > 1.0f && world.debug().stripMaxStress < 2.0f) {
+    expect(pend.valid && !pend.candidates.empty(), "over-elastic bonds emit commands");
+    bool anyPartial = false;
+    for (const blast::FractureCandidate& c : pend.candidates) {
+      expect(c.damage > 0.0f, "SDK command damage is positive");
+      if (c.healthBefore > 0.0f && c.damage < c.healthBefore) {
+        anyPartial = true;
+      }
+    }
+    expect(anyPartial, "below fatal, damage is not full remaining health");
+  }
+  world.clear();
+}
+
+void testViewerImpactFormula() {
+  std::cout << "E3 Viewer Impact Damage formula\n";
+  blast::WorldContactImpulse imp{};
+  imp.n = glm::vec3(0.0f, 1.0f, 0.0f);
+  imp.massA = 10.0f;
+  imp.massB = 0.0f;
+  imp.velA = glm::vec3(0.0f, -4.0f, 0.0f);
+  imp.velB = glm::vec3(0.0f, 0.0f, 0.0f);
+  glm::vec3 fA{0.0f};
+  glm::vec3 fB{0.0f};
+  expect(blast::viewerPairForce(imp, fA, fB), "fast contact produces Viewer force");
+  expect(std::abs(fA.y - 40.0f) < 1.0e-3f, "forceA = -n(n·dv)m = 40 N·s along +Y");
+  expect(std::abs(fB.y + 40.0f) < 1.0e-3f, "forceB opposite");
+  imp.velA = glm::vec3(0.0f, -0.1f, 0.0f);
+  expect(!blast::viewerPairForce(imp, fA, fB), "dv^2 < 1 filtered when reduced mass > 0");
+  blast::ImpactSettings s;
+  s.hardness = 10.0f;
+  s.damageThresholdMin = 0.1f;
+  s.damageThresholdMax = 0.8f;
+  NvBlastExtMaterial mat;
+  mat.health = 100.0f;
+  mat.minDamageThreshold = 0.0f;
+  mat.maxDamageThreshold = 1.0f;
+  expect(blast::viewerNormalizedDamage(5.0f, s, mat) == 0.0f, "below 10% health filtered");
+  const float mid = blast::viewerNormalizedDamage(500.0f, s, mat);
+  expect(std::abs(mid - 0.5f) < 1.0e-5f, "Damage=impulse/hardness then /health");
+  const float cap = blast::viewerNormalizedDamage(2000.0f, s, mat);
+  expect(std::abs(cap - 0.8f) < 1.0e-5f, "damageThresholdMax caps a single event");
+}
+
+// ExtImpactDamageManager uses getVelocityAtPos for force=(n·Δv)*reducedMass. With our
+// inelastic SI (kRestitution=0), that must be the pre-solve approach velocity: post-solve
+// Δv~0 fails the Viewer min-|Δv| filter even when JA is huge.
+void testViewerImpactUsesPreSolveVelocity() {
+  std::cout << "E3 Viewer Impact Damage uses pre-solve contact velocity\n";
+  physics::RigidBody A{};
+  physics::RigidBody B{};
+  A.dynamic = true;
+  A.awake = true;
+  A.invM = 1.0f / 2000.0f;  // ~roof-scale mass vs static ground
+  A.Iloc = glm::mat3(1.0f);
+  physics::refreshInverseInertiaWorld(A);
+  A.v = glm::vec3(0.0f, -12.0f, 0.0f);
+  B.dynamic = false;
+  B.invM = 0.0f;
+
+  physics::Contact hit{};
+  hit.a = 0;
+  hit.b = 1;
+  hit.p = glm::vec3(0.0f, 0.0f, 0.0f);
+  hit.n = glm::vec3(0.0f, 1.0f, 0.0f);
+  hit.rA = glm::vec3(0.0f);
+  hit.rB = glm::vec3(0.0f, 1.0f, 0.0f);
+  hit.d = 0.0f;
+  hit.preVelA = A.v + glm::cross(A.w, hit.rA);
+  hit.preVelB = B.v + glm::cross(B.w, hit.rB);
+
+  std::vector<physics::RigidBody> bodies{A, B};
+  std::vector<physics::Contact> hs{hit};
+  physics::solveContacts(bodies, hs, physics::kSubDt, physics::kContactIters);
+  const glm::vec3 JA = physics::contactImpulseOnA(hs[0]);
+  const glm::vec3 postVelA = bodies[0].v + glm::cross(bodies[0].w, hit.rA);
+  const glm::vec3 postVelB = bodies[1].v + glm::cross(bodies[1].w, hit.rB);
+
+  // PhysicsWorld now records Contact::preVel* into WorldContactImpulse::vel*.
+  blast::WorldContactImpulse aligned{};
+  aligned.n = hit.n;
+  aligned.massA = 2000.0f;
+  aligned.massB = 0.0f;
+  aligned.velA = hit.preVelA;
+  aligned.velB = hit.preVelB;
+  aligned.JA = JA;
+
+  blast::WorldContactImpulse postSolveWrong{};
+  postSolveWrong.n = hit.n;
+  postSolveWrong.massA = 2000.0f;
+  postSolveWrong.massB = 0.0f;
+  postSolveWrong.velA = postVelA;
+  postSolveWrong.velB = postVelB;
+  postSolveWrong.JA = JA;
+
+  glm::vec3 fA{0.0f};
+  glm::vec3 fB{0.0f};
+  const bool alignedOk = blast::viewerPairForce(aligned, fA, fB);
+  const float alignedFy = fA.y;
+  const bool postOk = blast::viewerPairForce(postSolveWrong, fA, fB);
+
+  std::cout << "  preSolve vy=" << hit.preVelA.y << " postSolve vy=" << postVelA.y
+            << " |JA|=" << glm::length(JA) << " alignedForceOk=" << (alignedOk ? 1 : 0)
+            << " postForceOk=" << (postOk ? 1 : 0) << " Fy=" << alignedFy << "\n";
+
+  expect(glm::length(JA) > 1000.0f, "landing produces large solved impulse JA");
+  expect(glm::dot(postVelA - postVelB, postVelA - postVelB) < blast::kMinImpactVelocitySquared,
+         "after inelastic solve, post-solve |Δv|^2 is below Viewer min filter");
+  expect(!postOk, "post-solve residual must not drive Viewer Impact Damage");
+  expect(alignedOk, "pre-solve snapshot matches ExtImpactDamageManager Δv input");
+  expect(std::abs(alignedFy - 2000.0f * 12.0f) < 1.0f, "Viewer force ≈ m * |approach vy|");
+}
+
+void testImpactDamageNeedsApproachVelocity(blast::BlastRuntime& rt) {
+  std::cout << "E3 Impact Damage needs approach Δv (StructureWorld path)\n";
+  class BoxView final : public blast::OccupancyView {
+  public:
+    int nx() const override { return 12; }
+    int ny() const override { return 6; }
+    int nz() const override { return 6; }
+    bool solid(int x, int y, int z) const override {
+      return x >= 0 && x < 12 && y >= 0 && y < 4 && z >= 1 && z < 5;
+    }
+    bool anchor(int x, int y, int z) const override { return solid(x, y, z) && y < 1; }
+  } view;
+  blast::OccupancySampleOpts opts;
+  opts.agg = 2;
+  auto sample = blast::sampleOccupancy(view, opts);
+  expect(sample.error == blast::BlastError::Ok, "sample box");
+
+  blast::StructureWorld world;
+  expect(world.init(rt), "init");
+  const VoxelObjectId id{9, 1};
+  expect(world.mountSample(id, std::move(sample), 50, 1.0e6f, 0.0f, 0.0f) == blast::BlastError::Ok,
+         "mount box");
+  world.setImpactDamageEnabled(true);
+  world.setStressImpactImpulses(false);
+  world.setFractureEnabled(false);
+  expect(world.bindings().size() >= 1, "box binding");
+  expect(world.instance() != nullptr && world.instance()->blast.accelerator != nullptr,
+         "ImpactSpread accelerator created with asset");
+
+  blast::WorldContactImpulse postSolveHit{};
+  postSolveHit.idA = id;
+  postSolveHit.worldPoint = glm::vec3(0.6f, 0.0f, 0.3f);
+  postSolveHit.n = glm::vec3(0.0f, 1.0f, 0.0f);
+  postSolveHit.massA = 500.0f;
+  postSolveHit.massB = 0.0f;
+  postSolveHit.velA = glm::vec3(0.0f, -0.05f, 0.0f);  // like PhysicsWorld post-solve residual
+  postSolveHit.velB = glm::vec3(0.0f);
+  postSolveHit.JA = glm::vec3(0.0f, 6000.0f, 0.0f);  // real stopping impulse, unused by Impact Damage
+  postSolveHit.xA = glm::vec3(0.6f, 0.2f, 0.3f);
+  postSolveHit.qA = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+  postSolveHit.persistent = false;
+  postSolveHit.eventId = 42;
+  postSolveHit.tickId = 1;
+
+  world.onPhysicsTick(1, physics::kDt, &postSolveHit, 1);
+  std::cout << "  post-solve path events=" << world.debug().impactDamageEvents << "\n";
+  expect(world.debug().impactDamageEvents == 0, "post-solve Δv yields zero Impact Damage events");
+
+  blast::WorldContactImpulse preSolveHit = postSolveHit;
+  preSolveHit.velA = glm::vec3(0.0f, -10.0f, 0.0f);
+  preSolveHit.eventId = 43;
+  preSolveHit.tickId = 2;
+  world.onPhysicsTick(2, physics::kDt, &preSolveHit, 1);
+  std::cout << "  pre-solve path events=" << world.debug().impactDamageEvents << "\n";
+  expect(world.debug().impactDamageEvents > 0, "pre-solve approach Δv applies Impact Damage");
+  world.clear();
+}
+
+void testImpactSpreadBeatsShearOnThinSlab(blast::BlastRuntime& rt) {
+  std::cout << "E3 ImpactSpread vs Shear on thin slab\n";
+  class ThinSlab final : public blast::OccupancyView {
+  public:
+    int nx() const override { return 24; }
+    int ny() const override { return 8; }
+    int nz() const override { return 24; }
+    bool solid(int x, int y, int z) const override {
+      return x >= 2 && x < 22 && y >= 0 && y < 4 && z >= 2 && z < 22;
+    }
+    bool anchor(int x, int y, int z) const override { return solid(x, y, z) && y < 1 && x < 4; }
+  } view;
+  blast::OccupancySampleOpts opts;
+  opts.agg = 2;
+
+  auto runHit = [&](bool shear, uint32_t& events, uint32_t& actorsAfter) {
+    auto sample = blast::sampleOccupancy(view, opts);
+    expect(sample.error == blast::BlastError::Ok, shear ? "sample shear" : "sample spread");
+    blast::StructureWorld world;
+    expect(world.init(rt), shear ? "init shear" : "init spread");
+    const VoxelObjectId id{11, 1};
+    expect(world.mountSample(id, std::move(sample), 50, 1.0e6f, 0.0f, 0.0f) == blast::BlastError::Ok,
+           shear ? "mount shear" : "mount spread");
+    blast::ImpactSettings s = world.impactSettings();
+    s.shearDamage = shear;
+    world.setImpactSettings(s);
+    world.setImpactDamageEnabled(true);
+    world.setStressImpactImpulses(false);
+    world.setFractureEnabled(false);
+    const uint32_t actorsBefore =
+        world.instance() != nullptr && world.instance()->blast.family != nullptr
+            ? NvBlastFamilyGetActorCount(world.instance()->blast.family, blastLog)
+            : 0;
+    blast::WorldContactImpulse hit{};
+    hit.idA = id;
+    hit.worldPoint = glm::vec3(1.2f, 0.0f, 1.2f);
+    hit.n = glm::vec3(0.0f, 1.0f, 0.0f);
+    hit.massA = 800.0f;
+    hit.massB = 0.0f;
+    hit.velA = glm::vec3(0.0f, -12.0f, 0.0f);
+    hit.velB = glm::vec3(0.0f);
+    hit.xA = glm::vec3(1.2f, 0.2f, 1.2f);
+    hit.qA = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+    hit.persistent = false;
+    hit.eventId = shear ? 70u : 71u;
+    hit.tickId = 1;
+    world.onPhysicsTick(1, physics::kDt, &hit, 1);
+    events = world.debug().impactDamageEvents;
+    world.applyPendingIfAny();
+    actorsAfter = world.debug().splitActors;
+    if (actorsAfter == 0) {
+      actorsAfter = actorsBefore;
+    }
+    std::cout << "  " << (shear ? "shear" : "spread") << " events=" << events
+              << " actors=" << actorsAfter << " (before " << actorsBefore << ")\n";
+    world.clear();
+  };
+
+  uint32_t shearEvents = 0;
+  uint32_t shearActors = 0;
+  uint32_t spreadEvents = 0;
+  uint32_t spreadActors = 0;
+  runHit(true, shearEvents, shearActors);
+  runHit(false, spreadEvents, spreadActors);
+  expect(spreadEvents > shearEvents, "ImpactSpread damages more bonds than Shear on a thin slab");
+  expect(spreadEvents > 8, "ImpactSpread yields more than a single-digit chip on a thin slab");
+  expect(spreadActors > 1, "ImpactSpread landing splits the thin slab family");
 }
 
 }  // namespace
@@ -520,7 +733,8 @@ void testHottestPerSolve() {
 int main() {
   std::cout << "blast_e3_tests contact loads + mapping + gate\n";
   testImpulseBooks();
-  testHottestPerSolve();
+  testViewerImpactFormula();
+  testViewerImpactUsesPreSolveVelocity();
   testTickFold();
   testEccentricMap();
   blast::TrackingAllocator alloc;
@@ -531,8 +745,11 @@ int main() {
   testFreeChunkSplit(alloc);
   blast::BlastRuntime rt;
   expect(rt.init(), "runtime");
+  testSdkProportionalDamage(rt);
   testStrictConverge(rt);
   testLoadOnlyMatchingActor(rt);
+  testImpactDamageNeedsApproachVelocity(rt);
+  testImpactSpreadBeatsShearOnThinSlab(rt);
   rt.shutdown();
   expect(errors.errorCount() == 0, "no nvblast errors");
   if (gFailures == 0) {

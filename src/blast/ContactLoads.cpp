@@ -74,6 +74,8 @@ void ImpulseEvents::invalidateSnapshot(LoadSnapshot& snap) { snap.valid = false;
 
 bool ImpulseEvents::consumed(uint64_t eventId) const { return consumed_.count(eventId) != 0; }
 
+void ImpulseEvents::reset() { consumed_.clear(); }
+
 glm::vec3 worldToAsset(const glm::vec3& pWorld, const BodyAssetFrame& frame) {
   const glm::vec3 r = glm::inverse(frame.worldQ) * (pWorld - frame.worldCom);
   return frame.assetCom + r;

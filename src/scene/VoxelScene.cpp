@@ -192,17 +192,44 @@ void VoxelScene::freeObjectSlot(uint32_t slot) {
 
 VoxelScene::~VoxelScene() { stopStructureTicks(); }
 
-void VoxelScene::bindStructureTicks() {
+void VoxelScene::bindStructureTicks(GfxDevice& gfx) {
+  structureGfx_ = &gfx;
   physics_.setFixedTickCallback(
       [](void* user, uint64_t tickId, float dt) {
         auto* scene = static_cast<VoxelScene*>(user);
         const auto& imps = scene->physics_.tickImpulses();
-        scene->structures_.onPhysicsTick(tickId, dt, imps.data(), static_cast<uint32_t>(imps.size()));
+        std::vector<blast::BodyKinematics> kin;
+        const std::vector<blast::ActorBinding>& binds = scene->structures_.bindings();
+        kin.reserve(binds.size());
+        for (const blast::ActorBinding& b : binds) {
+          if (!b.objectId.valid()) {
+            continue;
+          }
+          physics::BodyState st;
+          if (!scene->physics_.getBodyState(b.objectId, st)) {
+            continue;
+          }
+          blast::BodyKinematics k;
+          k.objectId = b.objectId;
+          k.worldQ = st.q;
+          k.worldW = st.w;
+          kin.push_back(k);
+        }
+        scene->structures_.onPhysicsTick(tickId, dt, imps.data(), static_cast<uint32_t>(imps.size()), kin.data(),
+                                         static_cast<uint32_t>(kin.size()));
+        scene->structures_.applyPendingIfAny();
+        // Materialize and rebind split actors before the next fixed physics tick,
+        // including when a render frame runs multiple ticks.
+        scene->physics_.syncTransformsToScene();
+        scene->commitStructureSplits(*scene->structureGfx_);
       },
       this);
 }
 
-void VoxelScene::stopStructureTicks() { physics_.setFixedTickCallback(nullptr, nullptr); }
+void VoxelScene::stopStructureTicks() {
+  physics_.setFixedTickCallback(nullptr, nullptr);
+  structureGfx_ = nullptr;
+}
 
 void VoxelScene::resetStructureSession() {
   structures_.clear();
@@ -211,6 +238,7 @@ void VoxelScene::resetStructureSession() {
   stressCylinderCut_ = false;
   stressCylinderDoubleDensity_ = false;
   stressCylinderDisplay_ = false;
+  frameSpawnPosValid_ = false;
 }
 
 void VoxelScene::init(GfxDevice& gfx, blast::BlastRuntime& runtime) {
@@ -233,7 +261,7 @@ void VoxelScene::init(GfxDevice& gfx, blast::BlastRuntime& runtime) {
   if (!structures_.init(runtime)) {
     throw std::runtime_error("StructureWorld init failed: Blast runtime is not initialized");
   }
-  bindStructureTicks();
+  bindStructureTicks(gfx);
 
   const std::string pirateObj =
       std::string(VE_ASSETS_DIR) + "/meshes/pirate-building/Piratebuilding.obj";
@@ -1679,6 +1707,8 @@ void VoxelScene::destroyStressCylinderObject() {
   structures_.unmount(stressCylinderId_);
   const uint32_t slot = stressCylinderId_.slot;
   stressCylinderId_ = {};
+  frameSpawnPosValid_ = false;
+  frameExtentY_ = 0.0f;
   freeObjectSlot(slot);
 }
 
@@ -1844,12 +1874,95 @@ void VoxelScene::paintCylinderStress(GfxDevice& gfx) {
   lastStressPaintSolveEpoch_ = inst->solveEpoch;
 }
 
-void VoxelScene::refreshStressColors(GfxDevice& gfx) {
-  if (!stressCylinderDisplay_ || !stressCylinderId_.valid()) {
+void VoxelScene::paintBondDamage(GfxDevice& gfx) {
+  const blast::StructureInstance* inst = structures_.instance();
+  if (inst == nullptr) {
     return;
   }
+  std::unordered_map<uint32_t, float> nodeDamage;
+  for (const blast::GraphBond& b : inst->graph.bonds) {
+    if (b.world) {
+      continue;
+    }
+    const auto it = inst->grid.bondDamage.find(blast::packBondKey(b.nodeA, b.nodeB));
+    if (it == inst->grid.bondDamage.end() || !(it->second > 0.0f)) {
+      continue;
+    }
+    const float d = std::clamp(it->second, 0.0f, 1.0f);
+    nodeDamage[b.nodeA] = std::max(nodeDamage[b.nodeA], d);
+    nodeDamage[b.nodeB] = std::max(nodeDamage[b.nodeB], d);
+  }
+  auto rgbFor = [](float d) {
+    // Blue (intact) → yellow → red (fully damaged).
+    const float t = std::clamp(d, 0.0f, 1.0f);
+    const uint32_t r = static_cast<uint32_t>(t * 255.0f);
+    const uint32_t g = static_cast<uint32_t>((t < 0.5f ? t * 2.0f : 1.0f) * 200.0f);
+    const uint32_t bl = static_cast<uint32_t>((1.0f - t) * 255.0f);
+    return (r << 16) | (g << 8) | bl;
+  };
+  auto paintObject = [&](VoxelObjectId id) {
+    VoxelObject* o = tryGetObject(id);
+    if (o == nullptr || !o->enabled || !o->slotOccupied) {
+      return;
+    }
+    o->useImportPalette = true;
+    const int slot = static_cast<int>(id.slot);
+    const glm::ivec3 origin = o->structureFineOrigin;
+    for (const blast::GraphNode& n : inst->graph.nodes) {
+      const float d = nodeDamage.count(n.stableId) ? nodeDamage[n.stableId] : 0.0f;
+      const uint32_t rgb = rgbFor(d);
+      const uint32_t packed = packRgb888a(rgb);
+      for (const blast::VoxelCoord& p : n.voxels) {
+        const glm::ivec3 local(p.x - origin.x, p.y - origin.y, p.z - origin.z);
+        glm::ivec3 c, m, f;
+        splitFineIndex(local.x, local.y, local.z, c, m, f);
+        if (!inBounds(*o, c) || !occupancyFine(slot, c, m, f)) {
+          continue;
+        }
+        const uint32_t page = cellAt(*o, indexOf(*o, c)).brickPage;
+        if (page == kInvalidBrickPage) {
+          continue;
+        }
+        const uint32_t ci = fineColorIndex(m, f);
+        if (readFineRgb(page, ci) == packed) {
+          continue;
+        }
+        writeFineRgb(page, ci, rgb);
+        dirtyPages_.insert(page);
+      }
+    }
+  };
+  paintObject(stressCylinderId_);
+  for (const blast::ActorBinding& b : inst->bindings) {
+    if (b.objectId.valid() && b.objectId != stressCylinderId_) {
+      paintObject(b.objectId);
+    }
+  }
+  flushDirtyPages(gfx);
+  lastBondDamagePaintEvents_ = inst->debug.impactDamageEvents;
+  lastStressPaintSolveEpoch_ = inst->solveEpoch;
+}
+
+void VoxelScene::setBondDamageDisplay(GfxDevice& gfx, bool on) {
+  bondDamageDisplay_ = on;
+  if (on) {
+    paintBondDamage(gfx);
+  }
+}
+
+void VoxelScene::refreshStressColors(GfxDevice& gfx) {
   const blast::StructureInstance* inst = structures_.instance();
-  if (inst == nullptr || inst->probeCount == 0) {
+  if (inst == nullptr || !stressCylinderId_.valid()) {
+    return;
+  }
+  if (bondDamageDisplay_) {
+    if (inst->debug.impactDamageEvents != lastBondDamagePaintEvents_ ||
+        inst->solveEpoch != lastStressPaintSolveEpoch_) {
+      paintBondDamage(gfx);
+    }
+    return;
+  }
+  if (!stressCylinderDisplay_ || inst->probeCount == 0) {
     return;
   }
   if (inst->solveEpoch == lastStressPaintSolveEpoch_) {
@@ -1997,7 +2110,7 @@ bool VoxelScene::mountFrameFromOccupancy(GfxDevice& gfx) {
   return true;
 }
 
-bool VoxelScene::spawnStressFrame(GfxDevice& gfx) {
+bool VoxelScene::spawnStressFrame(GfxDevice& gfx, float columnHeightMeters) {
   nestedMicroVoxels_ = true;
   nestedFineVoxels_ = true;
   if (!simulate_) {
@@ -2008,7 +2121,10 @@ bool VoxelScene::spawnStressFrame(GfxDevice& gfx) {
     physics_.removeBody(testObjectId_);
   }
   destroyStressCylinderObject();
-  const blast::FrameRaster spec{};
+  blast::FrameRaster spec{};
+  frameColumnHeightFines_ = std::clamp(static_cast<int>(std::lround(columnHeightMeters / blast::kE1FineMeters)),
+                                     10, blast::kFrameGridFines - blast::kFrameRoofT);
+  spec.columnHeight = frameColumnHeightFines_;
   const uint32_t slot = allocObjectSlot();
   VoxelObject& o = objects_[slot];
   o.gridSize = spec.nx / kFinePerCoarse;
@@ -2025,7 +2141,10 @@ bool VoxelScene::spawnStressFrame(GfxDevice& gfx) {
   o.rotation = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
   const float extent = static_cast<float>(o.gridSize) * o.voxelSize;
   o.position = glm::vec3(0.0f, 3.2f + 0.5f * extent, 0.0f);
-  camera_.setOrbitTarget(glm::vec3(0.0f, 3.2f + 0.5f * static_cast<float>(blast::kFrameColH) * blast::kE1FineMeters, 0.0f));
+  frameSpawnPos_ = o.position;
+  frameExtentY_ = (spec.columnHeight + blast::kFrameRoofT) * blast::kE1FineMeters;
+  frameSpawnPosValid_ = true;
+  camera_.setOrbitTarget(glm::vec3(0.0f, 3.2f + 0.5f * frameExtentY_, 0.0f));
   camera_.setOrbitDistance(32.0f);
   o.cells.assign(static_cast<size_t>(o.gridSize * o.gridSize * o.gridSize), CoarseCell{});
   blast::forEachFrameFine(spec, [&](int x, int y, int z) {
@@ -2055,8 +2174,10 @@ bool VoxelScene::cutThreeColumns(GfxDevice& gfx) {
     return false;
   }
   std::vector<glm::ivec3> removed;
-  blast::forEachFrameFine(blast::FrameRaster{}, [&](int x, int y, int z) {
-    if (!blast::inThreeColumnCut(x, y, z)) {
+  blast::FrameRaster spec{};
+  spec.columnHeight = frameColumnHeightFines_;
+  blast::forEachFrameFine(spec, [&](int x, int y, int z) {
+    if (!blast::inThreeColumnCut(x, y, z, spec.columnHeight)) {
       return;
     }
     glm::ivec3 c, m, f;
@@ -2084,6 +2205,83 @@ bool VoxelScene::cutThreeColumns(GfxDevice& gfx) {
     mountFrameFromOccupancy(gfx);
     return false;
   }
+  return true;
+}
+
+bool VoxelScene::liftStructureForRedrop() {
+  if (!frameSpawnPosValid_ || !structures_.instance()) {
+    return false;
+  }
+  std::vector<VoxelObjectId> ids;
+  ids.reserve(structures_.bindings().size());
+  for (const blast::ActorBinding& b : structures_.bindings()) {
+    if (!b.objectId.valid() || !b.actor) {
+      continue;
+    }
+    if (groundObjectId_.valid() && b.objectId.slot == groundObjectId_.slot) {
+      continue;
+    }
+    if (testObjectId_.valid() && b.objectId.slot == testObjectId_.slot) {
+      continue;
+    }
+    const VoxelObject* o = tryGetObject(b.objectId);
+    if (o == nullptr || !o->enabled || o->motionType != MotionType::Dynamic) {
+      continue;
+    }
+    bool seen = false;
+    for (const VoxelObjectId& id : ids) {
+      if (id.slot == b.objectId.slot && id.generation == b.objectId.generation) {
+        seen = true;
+        break;
+      }
+    }
+    if (!seen) {
+      ids.push_back(b.objectId);
+    }
+  }
+  if (ids.empty()) {
+    return false;
+  }
+  float minY = std::numeric_limits<float>::max();
+  std::vector<physics::BodyState> states(ids.size());
+  for (size_t i = 0; i < ids.size(); ++i) {
+    if (!physics_.getBodyState(ids[i], states[i])) {
+      return false;
+    }
+    minY = std::min(minY, states[i].x.y);
+  }
+  if (!(minY < std::numeric_limits<float>::max() / 2.0f)) {
+    return false;
+  }
+  // Drop from above the original roof (AABB top + margin), not just the object center.
+  const float targetY = 3.2f + frameExtentY_ + 2.0f;
+  const float dy = targetY - minY;
+  if (std::abs(dy) < 1.0e-3f) {
+    // Already at target height; still zero velocity so a nudge can re-drop.
+  }
+  for (size_t i = 0; i < ids.size(); ++i) {
+    VoxelObject* o = tryGetObject(ids[i]);
+    if (o == nullptr) {
+      return false;
+    }
+    physics::BodyState st = states[i];
+    st.x.y += dy;
+    st.v = glm::vec3(0.0f);
+    st.w = glm::vec3(0.0f);
+    st.awake = true;
+    st.sleepTimer = 0.0f;
+    // replaceShape snaps body COM from object pose — update the object first.
+    const float e = 0.5f * static_cast<float>(o->gridSize) * o->voxelSize;
+    const glm::vec3 gc(e, e, e);
+    o->rotation = st.q;
+    o->position = st.x - st.q * (st.comLocal - gc);
+    if (!physics_.replaceShape(ids[i], &st)) {
+      return false;
+    }
+  }
+  physics_.syncTransformsToScene();
+  std::cout << "Lift structure for redrop: pieces=" << ids.size() << " dy=" << dy << " targetY=" << targetY
+            << "\n";
   return true;
 }
 

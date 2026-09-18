@@ -257,13 +257,18 @@ public:
   bool spawnStressCylinder(GfxDevice& gfx);
   bool resetStressCylinder(GfxDevice& gfx);
   bool cutStressCylinder270(GfxDevice& gfx);
-  bool spawnStressFrame(GfxDevice& gfx);
+  bool spawnStressFrame(GfxDevice& gfx, float columnHeightMeters = 4.0f);
+  float frameColumnHeightMeters() const { return frameColumnHeightFines_ * 0.1f; }
   bool cutThreeColumns(GfxDevice& gfx);
+  // Raise all dynamic structure pieces so the lowest returns near the original roof
+  // height, zero velocities, and wake them to fall again (for accumulating Impact Damage).
+  bool liftStructureForRedrop();
   bool setStressCylinderDoubleDensity(bool on);
   void setStressCylinderSolverIters(uint32_t iters);
   void setStressCylinderDisplay(GfxDevice& gfx, bool on);
-  // After beginFrame: upload stress colors without waitIdle. No-op if display is off
-  // or the solver has not produced a new probe snapshot since the last paint.
+  void setBondDamageDisplay(GfxDevice& gfx, bool on);
+  bool bondDamageDisplay() const { return bondDamageDisplay_; }
+  // After beginFrame: upload stress or bond-damage colors without waitIdle.
   void refreshStressColors(GfxDevice& gfx);
   void commitStructureSplits(GfxDevice& gfx);
   bool stressCylinderCut() const { return stressCylinderCut_; }
@@ -340,12 +345,14 @@ private:
   void destroyGridImages(GfxDevice& gfx);
   void flushObject(GfxDevice& gfx, int objectIndex);
   void flushDirtyPages(GfxDevice& gfx);
-  void bindStructureTicks();
+  void bindStructureTicks(GfxDevice& gfx);
+  GfxDevice* structureGfx_ = nullptr;
   void stopStructureTicks();
   void resetStructureSession();
   bool mountCylinderFromOccupancy(GfxDevice& gfx);
   bool mountFrameFromOccupancy(GfxDevice& gfx);
   void paintCylinderStress(GfxDevice& gfx);
+  void paintBondDamage(GfxDevice& gfx);
   void destroyStressCylinderObject();
 
   int applyCoarseSphereBrush(VoxelObject& o, const glm::ivec3& center, float radius,
@@ -386,10 +393,10 @@ private:
   bool extractIslandFromFines(GfxDevice& gfx, VoxelObject& parent, int parentIndex,
                               const std::vector<voxel::FineCoord>& fines, VoxelObjectId parentId,
                               const physics::BodyState& parentState, glm::dvec3 parentComLocal,
-                              MotionType motion, uint32_t minFines, VoxelObjectId* outId = nullptr);
+                              MotionType motion, VoxelObjectId* outId = nullptr);
   bool commitOccupancySplit(GfxDevice& gfx, VoxelObjectId parentId,
                             const std::vector<std::vector<voxel::FineCoord>>& islands,
-                            const std::vector<uint8_t>& anchored, uint32_t minFines,
+                            const std::vector<uint8_t>& anchored,
                             const std::vector<NvBlastActor*>& actors = {});
   VoxelObjectId objectOwningFamilyFine(const glm::ivec3& absFine) const;
   bool familyFinesOnObject(VoxelObjectId id, const std::vector<voxel::FineCoord>& fines) const;
@@ -476,6 +483,12 @@ private:
   physics::PhysicsWorld physics_;
   blast::StructureWorld structures_;
   VoxelObjectId stressCylinderId_{};
+  glm::vec3 frameSpawnPos_{0.0f};
+  int frameColumnHeightFines_ = 40;
+  float frameExtentY_ = 0.0f;
+  bool frameSpawnPosValid_ = false;
+  bool bondDamageDisplay_ = false;
+  uint64_t lastBondDamagePaintEvents_ = 0;
   bool stressCylinderCut_ = false;
   bool stressCylinderDoubleDensity_ = false;
   bool stressCylinderDisplay_ = false;

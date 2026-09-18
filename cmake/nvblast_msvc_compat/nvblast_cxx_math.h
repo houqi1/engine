@@ -3,5 +3,6 @@
 #if defined(_MSC_VER)
 namespace std {
 using ::copysignf;
+using ::pow;
 }
 #endif

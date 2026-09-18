@@ -550,6 +550,10 @@ float bondAgeo(const GraphBond& b, float voxelSize) { return static_cast<float>(
 float bondAeff(const GraphBond& b, float voxelSize) { return bondAgeo(b, voxelSize) * (1.0f - b.d); }
 
 void destroyVoxelBlast(VoxelBlast& b) {
+  if (b.accelerator) {
+    b.accelerator->release();
+    b.accelerator = nullptr;
+  }
   if (b.solver) {
     b.solver->release();
     b.solver = nullptr;
@@ -576,6 +580,7 @@ VoxelBlast& VoxelBlast::operator=(VoxelBlast&& o) noexcept {
     family = o.family;
     actor = o.actor;
     solver = o.solver;
+    accelerator = o.accelerator;
     chunkFromStable = std::move(o.chunkFromStable);
     sdkBondFromStable = std::move(o.sdkBondFromStable);
     graphFromStable = std::move(o.graphFromStable);
@@ -584,6 +589,7 @@ VoxelBlast& VoxelBlast::operator=(VoxelBlast&& o) noexcept {
     o.family = nullptr;
     o.actor = nullptr;
     o.solver = nullptr;
+    o.accelerator = nullptr;
     o.graphWorld = kInvalidIndex;
   }
   return *this;
@@ -693,10 +699,10 @@ BlastError createVoxelBlast(TrackingAllocator& alloc, const VoxelStructureGraph&
   st.graphReductionLevel = 0;
   st.compressionElasticLimit = strengthPa;
   st.compressionFatalLimit = 2.0f * strengthPa;
-  st.tensionElasticLimit = strengthPa;
-  st.tensionFatalLimit = 2.0f * strengthPa;
-  st.shearElasticLimit = strengthPa;
-  st.shearFatalLimit = 2.0f * strengthPa;
+  st.tensionElasticLimit = -1.0f;
+  st.tensionFatalLimit = -1.0f;
+  st.shearElasticLimit = -1.0f;
+  st.shearFatalLimit = -1.0f;
   out.solver = Nv::Blast::ExtStressSolver::create(*out.family, st);
   if (!out.solver) {
     destroyVoxelBlast(out);
@@ -714,6 +720,8 @@ BlastError createVoxelBlast(TrackingAllocator& alloc, const VoxelStructureGraph&
     }
   }
   out.solver->notifyActorCreated(*out.actor);
+  // type 0 = nullptr; any other value builds the AABB tree used by ImpactSpread.
+  out.accelerator = NvBlastExtDamageAcceleratorCreate(out.asset, 1);
   return BlastError::Ok;
 }
 

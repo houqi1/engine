@@ -80,6 +80,11 @@ struct Contact {
   float lambdaNVel = 0.0f;
   // Accumulated world-space friction impulse on A (sum of dLamT * t each iteration).
   glm::vec3 JtWorld{0.0f};
+  // Contact-point velocities before solveContacts. ExtImpactDamageManager builds
+  // Viewer force from getVelocityAtPos; with kRestitution=0, post-solve Δv~0, so
+  // Impact Damage must see this pre-solve approach velocity.
+  glm::vec3 preVelA{0.0f};
+  glm::vec3 preVelB{0.0f};
 };
 
 inline bool contactIsTouching(const Contact& c) { return c.d >= -kSlop; }

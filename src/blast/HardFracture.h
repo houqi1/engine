@@ -14,6 +14,19 @@ inline float probeMaxStress(const Nv::Blast::ExtStressSolver::BondProbe& p) {
   return std::max(p.compression, std::max(p.tension, p.shear));
 }
 
+// NVIDIA default: tension/shear inherit from compression when negative (see inheritSettingsLimits).
+inline void applyExtStressStrength(Nv::Blast::ExtStressSolver& solver, float strengthPa) {
+  auto st = solver.getSettings();
+  st.graphReductionLevel = 0;
+  st.compressionElasticLimit = strengthPa;
+  st.compressionFatalLimit = 2.0f * strengthPa;
+  st.tensionElasticLimit = -1.0f;
+  st.tensionFatalLimit = -1.0f;
+  st.shearElasticLimit = -1.0f;
+  st.shearFatalLimit = -1.0f;
+  solver.setSettings(st);
+}
+
 struct OverstressHit {
   uint32_t blastBondIndex = 0;
   uint32_t node0 = 0;
@@ -273,7 +286,7 @@ inline uint32_t splitAllRequired(NvBlastFamily* family, Nv::Blast::ExtStressSolv
     std::vector<char> scratch(NvBlastActorGetRequiredScratchForSplit(actor, logFn));
     const uint32_t nNew = NvBlastActorSplit(&ev, actor, maxNew, scratch.data(), logFn, nullptr);
     for (uint32_t k = 0; k < nNew && k < maxNew; ++k) {
-      if (created[k] != nullptr && created[k] != ev.deletedActor) {
+      if (created[k] != nullptr) {
         solver.notifyActorCreated(*created[k]);
       }
     }

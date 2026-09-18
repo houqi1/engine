@@ -2,6 +2,7 @@
 
 #include "blast/BlastMemory.h"
 #include "blast/ContactLoads.h"
+#include "blast/ImpactDamage.h"
 #include "blast/OccupancySampler.h"
 #include "blast/VoxelGraph.h"
 
@@ -59,6 +60,14 @@ struct StructureDebugSnapshot {
   uint32_t invalidSnapshots = 0;
   uint32_t bindingCount = 0;
   float contactLoadMs = 0.0f;
+  bool stressImpactImpulses = false;
+  float stressImpactScale = 0.01f;
+  uint32_t gravityActors = 0;
+  uint32_t centrifugalActors = 0;
+  bool impactDamageEnabled = true;
+  uint32_t impactDamageEvents = 0;
+  float maxBondDamage = 0.0f;
+  uint32_t damagedBondCount = 0;
 };
 
 struct FractureCandidate {
@@ -71,19 +80,15 @@ struct FractureCandidate {
   uint32_t owner = 0;
   float stress = 0.0f;
   float strength = 0.0f;
+  float damage = 0.0f;
+  float healthBefore = 0.0f;
+  float cy = 0.0f;
   bool inStrip = false;
   bool anchored = false;
   std::vector<uint64_t> faces;
 };
 
-// One ExtStress snapshot is only valid until the first bonds break. Applying every
-// over-S bond from that snapshot deletes members that would be under S after
-// unload. Each solveEpoch submits at most this many hottest over-S bonds per actor;
-// the next solve (same gravity, new topology) decides the rest.
-constexpr uint32_t kFractureBondsPerSolve = 1;
-
-void keepHottestCandidates(std::vector<FractureCandidate>& candidates,
-                           uint32_t maxPerActor = kFractureBondsPerSolve);
+constexpr float kExtStressImpactImpulseFactor = 0.01f;
 
 struct PendingFracture {
   bool valid = false;
@@ -152,6 +157,7 @@ struct StructureInstance {
   std::vector<uint32_t> nodeOwner;
   std::vector<uint32_t> nodeIndexScratch;
   std::vector<NvBlastBondFractureData> cmdScratch;
+  std::vector<NvBlastChunkFractureData> chunkScratch;
   StructureDebugSnapshot debug{};
   float axisX = 0.0f;
   float axisZ = 0.0f;
@@ -172,6 +178,8 @@ struct StructureInstance {
   uint64_t loadEpoch = 0;
   uint64_t lastLoadTick = 0;
   uint32_t lastBoundTopologyEpoch = 0xFFFFFFFFu;
+  ImpulseEvents impactEvents{};
+  bool impactAppliedThisTick = false;
 };
 
 class StructureWorld {
@@ -190,6 +198,8 @@ public:
 
   void onPhysicsTick(uint64_t tickId, float dt);
   void onPhysicsTick(uint64_t tickId, float dt, const WorldContactImpulse* impulses, uint32_t nImpulses);
+  void onPhysicsTick(uint64_t tickId, float dt, const WorldContactImpulse* impulses, uint32_t nImpulses,
+                     const BodyKinematics* kinematics, uint32_t nKinematics);
   void bindVisibleActors(const std::vector<ActorObjectLink>& links);
   const std::vector<ActorBinding>& bindings() const {
     static const std::vector<ActorBinding> kEmpty;
@@ -206,12 +216,26 @@ public:
   uint32_t warmupGravity(uint32_t maxPasses);
   void setFractureEnabled(bool on);
   void setStrengthPa(float strengthPa);
+  // SampleAssetViewer: pass impact to stress instead of the damage shader.
+  // addForce(contact, ViewerForce * 0.01). Default off.
+  void setStressImpactImpulses(bool on);
+  void setStressImpactScale(float scale);
+  bool stressImpactImpulses() const { return stressImpactImpulses_; }
+  float stressImpactScale() const { return stressImpactScale_; }
+  void setImpactDamageEnabled(bool on);
+  bool impactDamageEnabled() const { return impactDamageEnabled_; }
+  void setImpactSettings(const ImpactSettings& settings);
+  const ImpactSettings& impactSettings() const { return impactSettings_; }
+  void setImpactMaterial(const NvBlastExtMaterial& material) { impactMaterial_ = material; }
+  const NvBlastExtMaterial& impactMaterial() const { return impactMaterial_; }
   PendingFracture takePendingFracture();
   const PendingFracture& pendingFracture() const { return instances_.empty() ? idlePending_ : instances_.front().pending; }
   void clearPendingFracture();
   bool pendingSnapshotMatches(const PendingFracture& pending) const;
   uint32_t applyPendingCandidates(const PendingFracture& pending);
+  uint32_t applyPendingIfAny();
   uint32_t splitAllRequired();
+  bool takeOccupancyDirty();
   void recacheOccupied();
   void recachePendingFromProbes();
 
@@ -229,7 +253,9 @@ public:
   const char* lastError() const { return lastError_; }
 
 private:
-  void solveInstance(StructureInstance& inst, const WorldContactImpulse* impulses, uint32_t nImpulses);
+  void solveInstance(StructureInstance& inst, const WorldContactImpulse* impulses, uint32_t nImpulses,
+                     const BodyKinematics* kinematics, uint32_t nKinematics);
+  const BodyKinematics* findKinematics(VoxelObjectId id, const BodyKinematics* kinematics, uint32_t nKinematics) const;
   void refreshDebug(StructureInstance& inst, float solveMs);
   void collectPendingFracture(StructureInstance& inst);
   void rebuildBondMeta(StructureInstance& inst);
@@ -241,6 +267,11 @@ private:
                        bool sideA, NodeRef& out) const;
   void buildLoadSnapshots(StructureInstance& inst, const WorldContactImpulse* impulses, uint32_t nImpulses,
                           uint64_t tickId, float dt);
+  void applyViewerImpact(StructureInstance& inst, const WorldContactImpulse* impulses, uint32_t nImpulses);
+  uint32_t applyImpactShaderToActor(StructureInstance& inst, NvBlastActor* actor, const glm::vec3& localPos,
+                                    const glm::vec3& localForce);
+  void syncBondDamageFromHealth(StructureInstance& inst);
+  ActorBinding* bindingForObject(StructureInstance& inst, VoxelObjectId id);
 
   BlastRuntime* runtime_ = nullptr;
   bool initialized_ = false;
@@ -251,6 +282,12 @@ private:
   StructureDebugSnapshot idle_{};
   PendingFracture idlePending_{};
   const char* lastError_ = "ok";
+  bool occupancyDirty_ = false;
+  bool stressImpactImpulses_ = false;
+  float stressImpactScale_ = 0.01f;
+  bool impactDamageEnabled_ = true;
+  ImpactSettings impactSettings_{};
+  NvBlastExtMaterial impactMaterial_{};
 };
 
 }  // namespace blast

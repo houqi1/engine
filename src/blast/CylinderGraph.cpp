@@ -256,10 +256,10 @@ bool buildCylinderScene(TrackingAllocator& alloc, CylinderScene& scene, const Cy
   settings.graphReductionLevel = 0;
   settings.compressionElasticLimit = opts.strengthPa;
   settings.compressionFatalLimit = 2.0f * opts.strengthPa;
-  settings.tensionElasticLimit = opts.strengthPa;
-  settings.tensionFatalLimit = 2.0f * opts.strengthPa;
-  settings.shearElasticLimit = opts.strengthPa;
-  settings.shearFatalLimit = 2.0f * opts.strengthPa;
+  settings.tensionElasticLimit = -1.0f;
+  settings.tensionFatalLimit = -1.0f;
+  settings.shearElasticLimit = -1.0f;
+  settings.shearFatalLimit = -1.0f;
 
   scene.solver = Nv::Blast::ExtStressSolver::create(*scene.family, settings);
   if (!scene.solver) {

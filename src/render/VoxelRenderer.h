@@ -239,7 +239,9 @@ private:
   bool resetCylinderRequested_ = false;
   bool cutCylinderRequested_ = false;
   bool spawnFrameRequested_ = false;
+  float pendingFrameHeightMeters_ = 4.0f;
   bool cutThreeColumnsRequested_ = false;
+  bool liftStructureRedropRequested_ = false;
   bool cylinderDensityRequested_ = false;
   bool cylinderItersRequested_ = false;
   bool cylinderDisplayRequested_ = false;
@@ -247,11 +249,17 @@ private:
   bool cylinderStrengthRequested_ = false;
   bool pendingCylinderFracture_ = false;
   bool pendingCylinderFailStrength_ = true;
+  bool pendingStressImpactImpulses_ = false;
+  bool pendingImpactDamage_ = true;
+  blast::ImpactSettings pendingImpactSettings_{};
+  NvBlastExtMaterial pendingImpactMaterial_{};
+  float pendingStressImpactScale_ = blast::kExtStressImpactImpulseFactor;
   uint32_t scatterSpawnCount_ = 0;
   bool pendingSimulate_ = false;
   bool pendingSpawnTestBox_ = false;
   bool pendingCylinderDoubleDensity_ = false;
   bool pendingCylinderDisplay_ = false;
+  bool pendingBondDamageDisplay_ = false;
   int pendingCylinderIters_ = 200;
   float displayFps_ = 0.0f;
   int traceStage_ = 0;

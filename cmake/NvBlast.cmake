@@ -177,10 +177,17 @@ set(VE_NVBLAST_STRESS_SOURCES
   "${VE_BLAST_ROOT}/source/shared/stress_solver/stress.cpp"
 )
 
+set(VE_NVBLAST_SHADER_SOURCES
+  "${VE_BLAST_ROOT}/source/sdk/extensions/shaders/NvBlastExtDamageShaders.cpp"
+  "${VE_BLAST_ROOT}/source/sdk/extensions/shaders/NvBlastExtDamageAccelerators.cpp"
+  "${VE_BLAST_ROOT}/source/sdk/extensions/shaders/NvBlastExtDamageAcceleratorAABBTree.cpp"
+)
+
 add_library(nvblast STATIC
   ${VE_NVBLAST_LL_SOURCES}
   ${VE_NVBLAST_GLOBALS_SOURCES}
   ${VE_NVBLAST_STRESS_SOURCES}
+  ${VE_NVBLAST_SHADER_SOURCES}
 )
 add_library(engine::nvblast ALIAS nvblast)
 
@@ -188,6 +195,7 @@ target_include_directories(nvblast
   PUBLIC
     "${VE_BLAST_ROOT}/include/lowlevel"
     "${VE_BLAST_ROOT}/include/extensions/stress"
+    "${VE_BLAST_ROOT}/include/extensions/shaders"
     "${VE_BLAST_ROOT}/include/globals"
     "${VE_BLAST_ROOT}/include/shared/NvFoundation"
   PRIVATE
@@ -197,6 +205,7 @@ target_include_directories(nvblast
     "${VE_BLAST_ROOT}/source/sdk/lowlevel"
     "${VE_BLAST_ROOT}/source/sdk/globals"
     "${VE_BLAST_ROOT}/source/sdk/extensions/stress"
+    "${VE_BLAST_ROOT}/source/sdk/extensions/shaders"
     "${VE_BLAST_ROOT}/source/shared/NsFoundation/include"
     "${VE_BLAST_ROOT}/source/shared/stress_solver"
 )
@@ -230,6 +239,10 @@ if(MSVC)
   set_source_files_properties(
     "${VE_BLAST_ROOT}/source/sdk/extensions/stress/NvBlastExtStressSolver.cpp"
     PROPERTIES COMPILE_OPTIONS "/arch:AVX2;/FInvblast_cxx_math.h"
+  )
+  set_source_files_properties(
+    "${VE_BLAST_ROOT}/source/sdk/extensions/shaders/NvBlastExtDamageAcceleratorAABBTree.cpp"
+    PROPERTIES COMPILE_OPTIONS "/FInvblast_cxx_math.h"
   )
   set_source_files_properties(
     "${VE_BLAST_ROOT}/source/shared/stress_solver/stress.cpp"

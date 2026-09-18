@@ -1357,22 +1357,14 @@ void VoxelRenderer::buildVisibleInstances(VoxelScene& scene, uint32_t frameIndex
 bool VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
   displayFps_ = displayFps;
 
-  // UI requests must not destroy resources referenced by an unsubmitted command buffer.
-  // Fracture/strength only flip CPU flags; do not stall the GPU or repaint the cylinder.
-  if (cylinderFractureRequested_) {
-    scene.structures().setFractureEnabled(pendingCylinderFracture_);
-    cylinderFractureRequested_ = false;
-  }
-  if (cylinderStrengthRequested_) {
-    scene.structures().setStrengthPa(pendingCylinderFailStrength_ ? blast::kFrameStrengthFailPa
-                                                                  : blast::kFrameStrengthHoldPa);
-    cylinderStrengthRequested_ = false;
-  }
+  cylinderFractureRequested_ = false;
+  cylinderStrengthRequested_ = false;
 
   if (importRequested_ || removeImportRequested_ || rebuildRequested_ || scatterSpawnRequested_ ||
       scatterClearRequested_ || simulateRequested_ || spawnTestBoxRequested_ || fineProbesRequested_ ||
       spawnCylinderRequested_ ||
       spawnFrameRequested_ || resetCylinderRequested_ || cutCylinderRequested_ || cutThreeColumnsRequested_ ||
+      liftStructureRedropRequested_ ||
       cylinderDensityRequested_ || cylinderItersRequested_ || cylinderDisplayRequested_) {
     gfx_.waitIdle();
     if (importRequested_) {
@@ -1416,10 +1408,15 @@ bool VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
       scene.cutStressCylinder270(gfx_);
     }
     if (spawnFrameRequested_) {
-      scene.spawnStressFrame(gfx_);
+      scene.spawnStressFrame(gfx_, pendingFrameHeightMeters_);
     }
     if (cutThreeColumnsRequested_) {
       scene.cutThreeColumns(gfx_);
+    }
+    if (liftStructureRedropRequested_) {
+      if (!scene.liftStructureForRedrop()) {
+        std::cerr << "Lift structure for redrop: no dynamic pieces (spawn frame + Fail first)\n";
+      }
     }
     if (cylinderDensityRequested_) {
       scene.setStressCylinderDoubleDensity(pendingCylinderDoubleDensity_);
@@ -1434,10 +1431,23 @@ bool VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
     scatterSpawnRequested_ = scatterClearRequested_ = simulateRequested_ = spawnTestBoxRequested_ = false;
     fineProbesRequested_ = false;
     spawnCylinderRequested_ = resetCylinderRequested_ = cutCylinderRequested_ = false;
-    spawnFrameRequested_ = cutThreeColumnsRequested_ = false;
+    spawnFrameRequested_ = cutThreeColumnsRequested_ = liftStructureRedropRequested_ = false;
     cylinderDensityRequested_ = cylinderItersRequested_ = cylinderDisplayRequested_ = false;
     boundCoarsePoolBuffer_ = VK_NULL_HANDLE;
   }
+
+  // Remount (Spawn/Cut) copies fracture/strength onto the new family, but UI is the source of
+  // truth: reapply every frame so Fail / Stress fracture / Impact stay live after remount.
+  // Do NOT call setDensityScale / setSolverIters here — setNodeInfo dirties ExtStress and
+  // forces a cold start every frame (strip stuck ~0.27 MPa, stress colors all blue).
+  scene.structures().setFractureEnabled(pendingCylinderFracture_);
+  scene.structures().setStrengthPa(pendingCylinderFailStrength_ ? blast::kFrameStrengthFailPa
+                                                                : blast::kFrameStrengthHoldPa);
+  scene.structures().setImpactDamageEnabled(pendingImpactDamage_);
+  scene.structures().setStressImpactImpulses(pendingStressImpactImpulses_);
+  scene.structures().setStressImpactScale(pendingStressImpactScale_);
+  scene.structures().setImpactSettings(pendingImpactSettings_);
+  scene.structures().setImpactMaterial(pendingImpactMaterial_);
 
   if (gfx_.swapchainWasRecreated()) {
     resize();
@@ -2126,6 +2136,8 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
     const blast::StructureDebugSnapshot& st = sw.debug();
     ImGui::Separator();
     ImGui::TextUnformatted("Structure (four-column roof)");
+    ImGui::SliderFloat("Column height", &pendingFrameHeightMeters_, 1.0f, 9.2f, "%.1f m");
+    ImGui::TextUnformatted("Height applies on Spawn / reset four columns.");
     ImGui::Text("State: %s", sw.initialized() ? "initialized" : "not initialized");
     if (ImGui::Button("Spawn / reset four columns")) {
       spawnFrameRequested_ = true;
@@ -2133,6 +2145,13 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
     ImGui::SameLine();
     if (ImGui::Button("Cut 3 columns")) {
       cutThreeColumnsRequested_ = true;
+    }
+    if (ImGui::Button("Lift & drop again")) {
+      liftStructureRedropRequested_ = true;
+    }
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip(
+          "Raise fallen dynamic pieces to the frame spawn height, zero velocity, and let them fall again.");
     }
     if (ImGui::Button("Spawn cylinder (legacy)")) {
       spawnCylinderRequested_ = true;
@@ -2155,15 +2174,55 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
       pendingCylinderDisplay_ = disp;
       cylinderDisplayRequested_ = true;
     }
-    bool frac = st.fractureEnabled;
+    bool dmgDisp = pendingBondDamageDisplay_;
+    if (ImGui::Checkbox("Bond damage colors (Impact)", &dmgDisp)) {
+      pendingBondDamageDisplay_ = dmgDisp;
+      scene.setBondDamageDisplay(gfx_, dmgDisp);
+    }
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip("Blue=intact, yellow/red=Impact bond damage fraction (accumulates across drops).");
+    }
+    bool frac = pendingCylinderFracture_;
     if (ImGui::Checkbox("Stress fracture", &frac)) {
       pendingCylinderFracture_ = frac;
-      cylinderFractureRequested_ = true;
     }
-    bool failS = st.strengthPa < 1.0e7f;
+    bool failS = pendingCylinderFailStrength_;
     if (ImGui::Checkbox("Fail strength (1.0 MPa); off = 50 MPa hold", &failS)) {
       pendingCylinderFailStrength_ = failS;
-      cylinderStrengthRequested_ = true;
+    }
+    bool impactDmg = pendingImpactDamage_;
+    if (ImGui::Checkbox("Impact Damage (Viewer default)", &impactDmg)) {
+      pendingImpactDamage_ = impactDmg;
+    }
+    ImGui::BeginDisabled(pendingStressImpactImpulses_);
+    ImGui::Checkbox("Shear impact (Viewer default)", &pendingImpactSettings_.shearDamage);
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip(
+          "On = Viewer Shear. Off = Viewer ImpactSpread. Stress routing replaces either shader.");
+    }
+    ImGui::EndDisabled();
+    bool impact = pendingStressImpactImpulses_;
+    if (ImGui::Checkbox("Pass impact to stress (replaces shader)", &impact)) {
+      pendingStressImpactImpulses_ = impact;
+    }
+    if (pendingStressImpactImpulses_) {
+      ImGui::DragFloat("Impact to stress factor", &pendingStressImpactScale_, 0.001f, 0.0f, 1000.0f, "%.4f");
+    }
+    if (ImGui::TreeNode("Viewer impact parameters")) {
+      ImGui::Checkbox("Family self-collision damage", &pendingImpactSettings_.selfCollisionEnabled);
+      ImGui::DragFloat("Material health", &pendingImpactMaterial_.health, 1.0f, 0.0f, 100000.0f);
+      ImGui::SliderFloat("Material threshold min", &pendingImpactMaterial_.minDamageThreshold, 0.0f,
+                         pendingImpactMaterial_.maxDamageThreshold);
+      ImGui::SliderFloat("Material threshold max", &pendingImpactMaterial_.maxDamageThreshold,
+                         pendingImpactMaterial_.minDamageThreshold, 1.0f);
+      ImGui::DragFloat("Impact hardness", &pendingImpactSettings_.hardness, 0.1f, 0.0f, 100000.0f);
+      ImGui::DragFloat("Damage radius max", &pendingImpactSettings_.damageRadiusMax, 0.05f, 0.0f, 100.0f);
+      ImGui::SliderFloat("Impact threshold min", &pendingImpactSettings_.damageThresholdMin, 0.0f,
+                         pendingImpactSettings_.damageThresholdMax);
+      ImGui::SliderFloat("Impact threshold max", &pendingImpactSettings_.damageThresholdMax,
+                         pendingImpactSettings_.damageThresholdMin, 1.0f);
+      ImGui::SliderFloat("Falloff radius factor", &pendingImpactSettings_.damageFalloffRadiusFactor, 1.0f, 32.0f);
+      ImGui::TreePop();
     }
     ImGui::Text("Instances: %u   cylinder: %s   cut: %s", sw.instanceCount(),
                 scene.stressCylinderId().valid() ? "yes" : "no", scene.stressCylinderCut() ? "yes" : "no");
@@ -2174,6 +2233,10 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
                 st.strengthPa);
     ImGui::Text("Candidates: %u (strip %u)  fractured bonds: %u  actors: %u  bindings: %u",
                 st.candidateCount, st.candidateInStrip, st.fracturedBonds, st.splitActors, st.bindingCount);
+    ImGui::Text("ExtPx loads: gravity %u  centrifugal %u  ImpactDmg %s events %u  stress-imp %s x%.3g",
+                st.gravityActors, st.centrifugalActors, st.impactDamageEnabled ? "on" : "off",
+                st.impactDamageEvents, st.stressImpactImpulses ? "on" : "off", st.stressImpactScale);
+    ImGui::Text("Bond damage: max=%.3f  bonds=%u  (1=fully broken)", st.maxBondDamage, st.damagedBondCount);
     ImGui::Text("max T/C/S: %.3g / %.3g / %.3g Pa", st.maxTension, st.maxCompression, st.maxShear);
     ImGui::Text("extract %.2f ms  asset %.2f ms  solve %.2f ms  iters %u", st.extractMs, st.assetMs, st.solveMs,
                 st.solverIters);

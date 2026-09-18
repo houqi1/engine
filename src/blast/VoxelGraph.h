@@ -4,6 +4,7 @@
 #include "blast/BlastMemory.h"
 
 #include "NvBlast.h"
+#include "NvBlastExtDamageShaders.h"
 #include "NvBlastExtStressSolver.h"
 
 #include <cstdint>
@@ -171,6 +172,8 @@ struct VoxelBlast {
   NvBlastFamily* family = nullptr;
   NvBlastActor* actor = nullptr;
   Nv::Blast::ExtStressSolver* solver = nullptr;
+  // ExtImpactDamageManager ImpactSpread path needs this (type!=0 AABB tree).
+  NvBlastExtDamageAccelerator* accelerator = nullptr;
   std::unordered_map<uint32_t, uint32_t> chunkFromStable;
   std::unordered_map<uint32_t, uint32_t> sdkBondFromStable;
   std::unordered_map<uint32_t, uint32_t> graphFromStable;

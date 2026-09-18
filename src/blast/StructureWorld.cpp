@@ -2,14 +2,19 @@
 
 #include "blast/CylinderVoxels.h"
 #include "blast/HardFracture.h"
+#include "blast/ImpactDamage.h"
 
 #include "NvBlast.h"
+#include "NvBlastExtDamageShaders.h"
 #include "NvBlastTypes.h"
 #include "NvCTypes.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <iostream>
+#include <map>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -38,41 +43,22 @@ glm::ivec3 unpackFineCoord(uint32_t i, int n) {
   return glm::ivec3(x, y, z);
 }
 
-}  // namespace
-
-void keepHottestCandidates(std::vector<FractureCandidate>& candidates, uint32_t maxPerActor) {
-  if (candidates.empty()) {
-    return;
+uint32_t sdkBondFromNodes(const NvBlastSupportGraph& graph, uint32_t n0, uint32_t n1) {
+  if (n0 > n1) {
+    std::swap(n0, n1);
   }
-  if (maxPerActor == 0) {
-    candidates.clear();
-    return;
+  if (n0 >= graph.nodeCount) {
+    return UINT32_MAX;
   }
-  std::sort(candidates.begin(), candidates.end(), [](const FractureCandidate& a, const FractureCandidate& b) {
-    if (a.owner != b.owner) {
-      return a.owner < b.owner;
-    }
-    if (a.stress != b.stress) {
-      return a.stress > b.stress;
-    }
-    return a.sdkIndex < b.sdkIndex;
-  });
-  std::vector<FractureCandidate> kept;
-  kept.reserve(std::min(candidates.size(), static_cast<size_t>(maxPerActor) * 8u));
-  uint32_t curOwner = 0;
-  uint32_t taken = 0;
-  for (FractureCandidate& c : candidates) {
-    if (c.owner != curOwner) {
-      curOwner = c.owner;
-      taken = 0;
-    }
-    if (taken < maxPerActor) {
-      kept.push_back(std::move(c));
-      ++taken;
+  for (uint32_t adj = graph.adjacencyPartition[n0]; adj < graph.adjacencyPartition[n0 + 1]; ++adj) {
+    if (graph.adjacentNodeIndices[adj] == n1) {
+      return graph.adjacentBondIndices[adj];
     }
   }
-  candidates.swap(kept);
+  return UINT32_MAX;
 }
+
+}  // namespace
 
 bool StructureWorld::init(BlastRuntime& runtime) {
   if (!runtime.initialized()) {
@@ -102,6 +88,9 @@ void StructureWorld::resetTickSession() {
   ticksReceived_ = 0;
   lastTickId_ = 0;
   lastDt_ = 0.0f;
+  for (StructureInstance& inst : instances_) {
+    inst.impactEvents.reset();
+  }
 }
 
 void StructureWorld::unmount(VoxelObjectId objectId) {
@@ -178,9 +167,17 @@ BlastError StructureWorld::mountSample(VoxelObjectId objectId, OccupancySample s
   inst.keepAz1 = kE1KeepAz1;
   inst.solverIters = solverIters == 0 ? 200u : solverIters;
   inst.debug.extractMs = 0.0f;
+  bool keepFrac = false;
+  float keepS = strengthPa;
+  uint64_t keepStrengthEpoch = 1;
+  if (StructureInstance* old = instance()) {
+    keepFrac = old->fractureEnabled;
+    keepS = old->strengthPa;
+    keepStrengthEpoch = old->strengthEpoch == 0 ? 1 : old->strengthEpoch;
+  }
   const auto t0 = std::chrono::steady_clock::now();
   const BlastError ce =
-      createVoxelBlast(runtime_->allocator(), inst.graph, inst.grid, inst.blast, strengthPa, inst.solverIters);
+      createVoxelBlast(runtime_->allocator(), inst.graph, inst.grid, inst.blast, keepS, inst.solverIters);
   const auto t1 = std::chrono::steady_clock::now();
   inst.debug.assetMs = std::chrono::duration<float, std::milli>(t1 - t0).count();
   if (ce != BlastError::Ok) {
@@ -206,19 +203,14 @@ BlastError StructureWorld::mountSample(VoxelObjectId objectId, OccupancySample s
   inst.debug.solverIters = inst.solverIters;
   inst.debug.assetMs = inst.debug.assetMs;
   inst.debug.probeExportCount = 0;
-  bool keepFrac = false;
-  float keepS = kE2StrengthHoldPa;
-  uint64_t keepStrengthEpoch = 1;
-  if (StructureInstance* old = instance()) {
-    keepFrac = old->fractureEnabled;
-    keepS = old->strengthPa;
-    keepStrengthEpoch = old->strengthEpoch == 0 ? 1 : old->strengthEpoch;
-  }
   inst.fractureEnabled = keepFrac;
   inst.strengthPa = keepS;
   inst.strengthEpoch = keepStrengthEpoch;
   inst.debug.fractureEnabled = keepFrac;
   inst.debug.strengthPa = keepS;
+  if (inst.blast.solver != nullptr) {
+    applyExtStressStrength(*inst.blast.solver, keepS);
+  }
   rebuildBindingsFromFamily(inst);
   if (!inst.bindings.empty()) {
     inst.bindings.front().objectId = objectId;
@@ -379,6 +371,9 @@ void StructureWorld::setFractureEnabled(bool on) {
   if (inst == nullptr) {
     return;
   }
+  if (inst->fractureEnabled == on) {
+    return;
+  }
   inst->fractureEnabled = on;
   inst->debug.fractureEnabled = on;
   if (!on) {
@@ -387,14 +382,30 @@ void StructureWorld::setFractureEnabled(bool on) {
   }
 }
 
+void StructureWorld::setStressImpactImpulses(bool on) { stressImpactImpulses_ = on; }
+
+void StructureWorld::setStressImpactScale(float scale) {
+  stressImpactScale_ = std::max(0.0f, scale);
+}
+
+void StructureWorld::setImpactDamageEnabled(bool on) { impactDamageEnabled_ = on; }
+
+void StructureWorld::setImpactSettings(const ImpactSettings& settings) { impactSettings_ = settings; }
+
 void StructureWorld::setStrengthPa(float strengthPa) {
   StructureInstance* inst = instance();
   if (inst == nullptr) {
     return;
   }
+  const bool changed = inst->strengthPa != strengthPa || inst->debug.strengthPa != strengthPa;
   inst->strengthPa = strengthPa;
   inst->debug.strengthPa = strengthPa;
-  ++inst->strengthEpoch;
+  if (changed) {
+    ++inst->strengthEpoch;
+  }
+  if (inst->blast.solver != nullptr) {
+    applyExtStressStrength(*inst->blast.solver, strengthPa);
+  }
 }
 
 PendingFracture StructureWorld::takePendingFracture() {
@@ -478,83 +489,71 @@ void StructureWorld::collectPendingFracture(StructureInstance& inst) {
     inst.debug.candidateMs = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - t0).count();
     return;
   }
-  if (!inst.debug.converged) {
+  if (inst.blast.solver->getOverstressedBondCount() == 0) {
     inst.debug.candidateMs = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - t0).count();
     return;
   }
   const NvBlastSupportGraph graph = NvBlastAssetGetSupportGraph(inst.blast.asset, blastLog);
   fillNodeOwners(inst, graph);
-  const uint32_t n = inst.probeCount;
+  const uint32_t nA = NvBlastFamilyGetActorCount(inst.blast.family, blastLog);
+  if (nA == 0) {
+    inst.debug.candidateMs = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    return;
+  }
   const uint32_t metaN = static_cast<uint32_t>(inst.bondMeta.size());
-  std::unordered_set<uint32_t> contactSlots;
-  for (const ActorLoadSnapshot& snap : inst.loadSnapshots) {
-    if (snap.valid && snap.mappedNodes > 0 && snap.objectId.valid()) {
-      contactSlots.insert(snap.objectId.slot);
+  inst.pending.candidates.reserve(inst.probeCount);
+  for (uint32_t ai = 0; ai < nA; ++ai) {
+    NvBlastActor* actor = ai < inst.actorScratch.size() ? inst.actorScratch[ai] : nullptr;
+    if (actor == nullptr) {
+      continue;
+    }
+    NvBlastFractureBuffers cmds{};
+    inst.blast.solver->generateFractureCommands(*actor, cmds);
+    if (cmds.bondFractureCount == 0 || cmds.bondFractures == nullptr) {
+      continue;
+    }
+    const uint32_t owner = ai + 1;
+    const bool anchored = NvBlastActorHasExternalBonds(actor, blastLog);
+    for (uint32_t b = 0; b < cmds.bondFractureCount; ++b) {
+      const NvBlastBondFractureData& d = cmds.bondFractures[b];
+      if (!(d.health > 0.0f)) {
+        continue;
+      }
+      FractureCandidate c;
+      c.node0 = d.nodeIndex0;
+      c.node1 = d.nodeIndex1;
+      c.damage = d.health;
+      c.owner = owner;
+      c.anchored = anchored;
+      c.strength = inst.strengthPa;
+      c.sdkIndex = sdkBondFromNodes(graph, d.nodeIndex0, d.nodeIndex1);
+      if (c.owner == 0) {
+        if (d.nodeIndex0 < inst.nodeOwner.size() && inst.nodeOwner[d.nodeIndex0] != 0) {
+          c.owner = inst.nodeOwner[d.nodeIndex0];
+        } else if (d.nodeIndex1 < inst.nodeOwner.size()) {
+          c.owner = inst.nodeOwner[d.nodeIndex1];
+        }
+      }
+      if (c.sdkIndex < inst.probeCount && inst.probes[c.sdkIndex].blastBondIndex == c.sdkIndex) {
+        const auto& p = inst.probes[c.sdkIndex];
+        c.stress = probeMaxStress(p);
+        c.healthBefore = p.health;
+      }
+      if (c.sdkIndex < metaN) {
+        const BondMeta& m = inst.bondMeta[c.sdkIndex];
+        c.stableId = m.stableId;
+        c.inStrip = m.inStrip != 0;
+        if (m.graphIndex < inst.graph.bonds.size()) {
+          const GraphBond& gb = inst.graph.bonds[m.graphIndex];
+          c.nodeA = gb.nodeA;
+          c.nodeB = gb.nodeB;
+          c.cy = gb.cy;
+          c.faces = gb.faces;
+        }
+      }
+      inst.pending.candidates.push_back(std::move(c));
     }
   }
-  auto actorAnchored = [&](uint32_t owner) -> bool {
-    if (owner == 0 || owner > inst.actorScratch.size()) {
-      return false;
-    }
-    NvBlastActor* a = inst.actorScratch[owner - 1];
-    return a != nullptr && NvBlastActorHasExternalBonds(a, blastLog);
-  };
-  auto ownerHadContact = [&](uint32_t owner) -> bool {
-    if (owner == 0 || owner > inst.actorScratch.size()) {
-      return false;
-    }
-    NvBlastActor* a = inst.actorScratch[owner - 1];
-    if (a == nullptr) {
-      return false;
-    }
-    for (const ActorBinding& b : inst.bindings) {
-      if (b.actor == a && b.objectId.valid() && contactSlots.count(b.objectId.slot) != 0) {
-        return true;
-      }
-    }
-    return false;
-  };
-  inst.pending.candidates.reserve(n);
-  for (uint32_t i = 0; i < n; ++i) {
-    const auto& p = inst.probes[i];
-    const uint32_t owner = owningActorIndex(p, graph, inst.nodeOwner.data());
-    if (!canTakeDamage(p.health) || owner == 0) {
-      continue;
-    }
-    const bool anchored = actorAnchored(owner);
-    if (!anchored && !ownerHadContact(owner)) {
-      continue;
-    }
-    const float s = probeMaxStress(p);
-    constexpr float kPlausibleMaxPa = 2.0e7f;
-    if (!(s > inst.strengthPa)) {
-      continue;
-    }
-    if (!anchored && s > kPlausibleMaxPa) {
-      continue;
-    }
-    FractureCandidate c;
-    c.sdkIndex = p.blastBondIndex;
-    c.node0 = p.node0;
-    c.node1 = p.node1;
-    c.owner = owner;
-    c.stress = s;
-    c.strength = inst.strengthPa;
-    c.anchored = anchored;
-    if (p.blastBondIndex < metaN) {
-      const BondMeta& m = inst.bondMeta[p.blastBondIndex];
-      c.stableId = m.stableId;
-      c.inStrip = m.inStrip != 0;
-      if (m.graphIndex < inst.graph.bonds.size()) {
-        const GraphBond& b = inst.graph.bonds[m.graphIndex];
-        c.nodeA = b.nodeA;
-        c.nodeB = b.nodeB;
-        c.faces = b.faces;
-      }
-    }
-    inst.pending.candidates.push_back(std::move(c));
-  }
-  keepHottestCandidates(inst.pending.candidates);
   inst.debug.candidateInStrip = 0;
   for (const FractureCandidate& c : inst.pending.candidates) {
     if (c.inStrip) {
@@ -581,7 +580,6 @@ uint32_t StructureWorld::applyPendingCandidates(const PendingFracture& pending) 
   const NvBlastSupportGraph graph = NvBlastAssetGetSupportGraph(inst->blast.asset, blastLog);
   fillNodeOwners(*inst, graph);
   const uint32_t nA = NvBlastFamilyGetActorCount(inst->blast.family, blastLog);
-  const float* healths = inst->blast.actor != nullptr ? NvBlastActorGetBondHealths(inst->blast.actor, blastLog) : nullptr;
   uint32_t nfrac = 0;
   for (uint32_t ai = 0; ai < nA; ++ai) {
     NvBlastActor* actor = ai < inst->actorScratch.size() ? inst->actorScratch[ai] : nullptr;
@@ -590,25 +588,17 @@ uint32_t StructureWorld::applyPendingCandidates(const PendingFracture& pending) 
     }
     inst->cmdScratch.clear();
     for (const FractureCandidate& c : pending.candidates) {
-      if (c.sdkIndex >= inst->probeCount) {
+      if (c.owner != ai + 1) {
         continue;
       }
-      const auto& p = inst->probes[c.sdkIndex];
-      if (p.blastBondIndex != c.sdkIndex) {
-        continue;
-      }
-      const float health = healths != nullptr ? healths[c.sdkIndex] : p.health;
-      if (!canTakeDamage(health)) {
-        continue;
-      }
-      if (owningActorIndex(p, graph, inst->nodeOwner.data()) != ai + 1) {
+      if (!(c.damage > 0.0f)) {
         continue;
       }
       NvBlastBondFractureData d{};
       d.userdata = 0;
-      d.nodeIndex0 = p.node0;
-      d.nodeIndex1 = p.node1;
-      d.health = health;
+      d.nodeIndex0 = c.node0;
+      d.nodeIndex1 = c.node1;
+      d.health = c.damage;
       inst->cmdScratch.push_back(d);
     }
     if (inst->cmdScratch.empty()) {
@@ -623,9 +613,89 @@ uint32_t StructureWorld::applyPendingCandidates(const PendingFracture& pending) 
     nfrac += static_cast<uint32_t>(inst->cmdScratch.size());
   }
   if (nfrac > 0) {
-    inst->blast.solver->syncBrokenBonds();
+    bool anyBroken = false;
+    for (const FractureCandidate& c : pending.candidates) {
+      if (c.healthBefore > 0.0f && c.damage >= c.healthBefore) {
+        anyBroken = true;
+        break;
+      }
+    }
+    if (anyBroken) {
+      inst->blast.solver->syncBrokenBonds();
+    }
   }
   return nfrac;
+}
+
+uint32_t StructureWorld::applyPendingIfAny() {
+  StructureInstance* inst = instance();
+  if (inst == nullptr) {
+    return 0;
+  }
+  const bool impactOnly = inst->impactAppliedThisTick &&
+                          (!inst->pending.valid || inst->pending.candidates.empty());
+  if (impactOnly) {
+    const uint32_t before =
+        inst->blast.family != nullptr ? NvBlastFamilyGetActorCount(inst->blast.family, blastLog) : 0;
+    const uint32_t actors = splitAllRequired();
+    inst->debug.splitActors = actors;
+    if (actors > before) {
+      occupancyDirty_ = true;
+    }
+    inst->impactAppliedThisTick = false;
+    return inst->debug.impactDamageEvents;
+  }
+  if (!inst->pending.valid || inst->pending.candidates.empty()) {
+    return 0;
+  }
+  if (!pendingSnapshotMatches(inst->pending)) {
+    recachePendingFromProbes();
+    if (!pendingSnapshotMatches(inst->pending) || !inst->pending.valid || inst->pending.candidates.empty()) {
+      clearPendingFracture();
+      // Stale stress work must not cancel damage already applied by Impact.
+      return inst->impactAppliedThisTick ? applyPendingIfAny() : 0;
+    }
+  }
+  for (const FractureCandidate& c : inst->pending.candidates) {
+    if (!(c.damage > 0.0f) || !(c.healthBefore > 0.0f)) {
+      continue;
+    }
+    const float frac = std::min(1.0f, c.damage / c.healthBefore);
+    if (c.stableId != 0) {
+      const uint64_t key = packBondKey(c.nodeA, c.nodeB);
+      const auto it = inst->grid.bondDamage.find(key);
+      const float prev = it != inst->grid.bondDamage.end() ? it->second : 0.0f;
+      inst->grid.bondDamage[key] = std::max(prev, frac);
+    }
+    if (c.damage >= c.healthBefore) {
+      for (uint64_t f : c.faces) {
+        inst->grid.brokenFaces.insert(f);
+      }
+    }
+  }
+  const uint32_t nfrac = applyPendingCandidates(inst->pending);
+  inst->debug.fracturedBonds = nfrac;
+  const uint32_t candKeep = inst->debug.candidateCount;
+  clearPendingFracture();
+  inst->debug.candidateCount = candKeep;
+  if (nfrac == 0 && !inst->impactAppliedThisTick) {
+    return 0;
+  }
+  const uint32_t before =
+      inst->blast.family != nullptr ? NvBlastFamilyGetActorCount(inst->blast.family, blastLog) : 0;
+  const uint32_t actors = splitAllRequired();
+  inst->debug.splitActors = actors;
+  if (actors > before) {
+    occupancyDirty_ = true;
+  }
+  inst->impactAppliedThisTick = false;
+  return nfrac;
+}
+
+bool StructureWorld::takeOccupancyDirty() {
+  const bool dirty = occupancyDirty_;
+  occupancyDirty_ = false;
+  return dirty;
 }
 
 uint32_t StructureWorld::splitAllRequired() {
@@ -633,7 +703,6 @@ uint32_t StructureWorld::splitAllRequired() {
   if (inst == nullptr || inst->blast.family == nullptr || inst->blast.solver == nullptr) {
     return 0;
   }
-  inst->bindings.clear();
   inst->loadSnapshots.clear();
   inst->blast.actor = nullptr;
   const uint32_t actors = blast::splitAllRequired(inst->blast.family, *inst->blast.solver, blastLog);
@@ -653,12 +722,300 @@ uint32_t StructureWorld::splitAllRequired() {
   return actors;
 }
 
+ActorBinding* StructureWorld::bindingForObject(StructureInstance& inst, VoxelObjectId id) {
+  if (!id.valid()) {
+    return nullptr;
+  }
+  for (ActorBinding& b : inst.bindings) {
+    if (b.objectId == id && b.actor != nullptr) {
+      return &b;
+    }
+  }
+  return nullptr;
+}
+
+uint32_t StructureWorld::applyImpactShaderToActor(StructureInstance& inst, NvBlastActor* actor,
+                                                  const glm::vec3& localPos, const glm::vec3& localForce) {
+  if (actor == nullptr || inst.blast.asset == nullptr) {
+    return 0;
+  }
+  const float mag = glm::length(localForce);
+  const float normalized = viewerNormalizedDamage(mag, impactSettings_, impactMaterial_);
+  if (normalized <= 0.0f) {
+    return 0;
+  }
+  const float falloff = std::min(32.0f, std::max(1.0f, impactSettings_.damageFalloffRadiusFactor));
+  const float minDistance = impactSettings_.damageRadiusMax * normalized;
+  const float maxDistance = minDistance * falloff;
+  const uint32_t bondCount = familyAssetBondCount(actor, blastLog);
+  const uint32_t chunkCount = NvBlastAssetGetChunkCount(inst.blast.asset, blastLog);
+  if (bondCount == 0 && chunkCount == 0) {
+    return 0;
+  }
+  inst.cmdScratch.assign(bondCount, NvBlastBondFractureData{});
+  inst.chunkScratch.assign(chunkCount, NvBlastChunkFractureData{});
+  NvBlastFractureBuffers buf{};
+  buf.bondFractureCount = bondCount;
+  buf.chunkFractureCount = chunkCount;
+  buf.bondFractures = inst.cmdScratch.empty() ? nullptr : inst.cmdScratch.data();
+  buf.chunkFractures = inst.chunkScratch.empty() ? nullptr : inst.chunkScratch.data();
+  NvBlastExtProgramParams programParams(nullptr, &impactMaterial_, inst.blast.accelerator);
+  NvBlastDamageProgram program{};
+  glm::vec3 n = localForce;
+  const float n2 = glm::dot(n, n);
+  if (n2 > 1.0e-12f) {
+    n /= std::sqrt(n2);
+  } else {
+    n = glm::vec3(0.0f, 1.0f, 0.0f);
+  }
+  if (impactSettings_.shearDamage) {
+    // ExtImpactDamageManager shearDamage=true branch.
+    NvBlastExtShearDamageDesc desc{};
+    desc.damage = normalized;
+    desc.normal[0] = n.x;
+    desc.normal[1] = n.y;
+    desc.normal[2] = n.z;
+    desc.position[0] = localPos.x;
+    desc.position[1] = localPos.y;
+    desc.position[2] = localPos.z;
+    desc.minRadius = minDistance;
+    desc.maxRadius = maxDistance;
+    programParams.damageDesc = &desc;
+    program.graphShaderFunction = NvBlastExtShearGraphShader;
+    program.subgraphShaderFunction = NvBlastExtShearSubgraphShader;
+    NvBlastActorGenerateFracture(&buf, actor, program, &programParams, blastLog, nullptr);
+  } else if (inst.blast.accelerator != nullptr) {
+    // ExtImpactDamageManager shearDamage=false branch (ImpactSpread + accelerator).
+    NvBlastExtImpactSpreadDamageDesc desc{};
+    desc.damage = normalized;
+    desc.position[0] = localPos.x;
+    desc.position[1] = localPos.y;
+    desc.position[2] = localPos.z;
+    desc.minRadius = minDistance;
+    desc.maxRadius = maxDistance;
+    programParams.damageDesc = &desc;
+    program.graphShaderFunction = NvBlastExtImpactSpreadGraphShader;
+    program.subgraphShaderFunction = NvBlastExtImpactSpreadSubgraphShader;
+    NvBlastActorGenerateFracture(&buf, actor, program, &programParams, blastLog, nullptr);
+  } else {
+    // Viewer ImpactSpread requires its accelerator; do not silently change shader.
+    return 0;
+  }
+  if (buf.bondFractureCount == 0 && buf.chunkFractureCount == 0) {
+    return 0;
+  }
+  viewerDamageToBondArea(buf, inst.blast.asset);
+  NvBlastActorApplyFracture(nullptr, actor, &buf, blastLog, nullptr);
+  inst.blast.solver->syncBrokenBonds();
+  syncBondDamageFromHealth(inst);
+  return buf.bondFractureCount + buf.chunkFractureCount;
+}
+
+void StructureWorld::syncBondDamageFromHealth(StructureInstance& inst) {
+  if (inst.blast.asset == nullptr || inst.blast.family == nullptr || inst.bindings.empty()) {
+    return;
+  }
+  NvBlastActor* any = nullptr;
+  for (const ActorBinding& b : inst.bindings) {
+    if (b.actor != nullptr) {
+      any = b.actor;
+      break;
+    }
+  }
+  if (any == nullptr) {
+    return;
+  }
+  const float* healths = NvBlastActorGetBondHealths(any, blastLog);
+  if (healths == nullptr) {
+    return;
+  }
+  const NvBlastBond* assetBonds = NvBlastAssetGetBonds(inst.blast.asset, blastLog);
+  const uint32_t nb = NvBlastAssetGetBondCount(inst.blast.asset, blastLog);
+  float maxDmg = 0.0f;
+  uint32_t damaged = 0;
+  const uint32_t metaN = static_cast<uint32_t>(inst.bondMeta.size());
+  for (uint32_t sdk = 0; sdk < nb && sdk < metaN; ++sdk) {
+    const BondMeta& m = inst.bondMeta[sdk];
+    if (m.world != 0 || m.stableId == 0 || m.graphIndex >= inst.graph.bonds.size()) {
+      continue;
+    }
+    const float initial = assetBonds != nullptr ? assetBonds[sdk].area : 0.0f;
+    if (!(initial > 1.0e-8f) || !canTakeDamage(initial)) {
+      continue;
+    }
+    const float h = healths[sdk];
+    float frac = 1.0f - std::clamp(h / initial, 0.0f, 1.0f);
+    if (h <= 0.0f) {
+      frac = 1.0f;
+    }
+    const GraphBond& gb = inst.graph.bonds[m.graphIndex];
+    const uint64_t key = packBondKey(gb.nodeA, gb.nodeB);
+    if (frac > 0.0f) {
+      const auto it = inst.grid.bondDamage.find(key);
+      const float prev = it != inst.grid.bondDamage.end() ? it->second : 0.0f;
+      inst.grid.bondDamage[key] = std::max(prev, frac);
+    }
+  }
+  maxDmg = 0.0f;
+  damaged = 0;
+  for (const auto& kv : inst.grid.bondDamage) {
+    if (kv.second > 0.0f) {
+      maxDmg = std::max(maxDmg, kv.second);
+      ++damaged;
+    }
+  }
+  inst.debug.maxBondDamage = maxDmg;
+  inst.debug.damagedBondCount = damaged;
+}
+
+void StructureWorld::applyViewerImpact(StructureInstance& inst, const WorldContactImpulse* impulses,
+                                       uint32_t nImpulses) {
+  if (!impactDamageEnabled_ || impulses == nullptr || nImpulses == 0) {
+    return;
+  }
+  struct PairAccum {
+    VoxelObjectId idA{};
+    VoxelObjectId idB{};
+    glm::vec3 forceA{0.0f};
+    glm::vec3 forceB{0.0f};
+    glm::vec3 pos{0.0f};
+    glm::quat qA{1.0f, 0.0f, 0.0f, 0.0f};
+    glm::quat qB{1.0f, 0.0f, 0.0f, 0.0f};
+    glm::vec3 xA{0.0f};
+    glm::vec3 xB{0.0f};
+    uint32_t n = 0;
+  };
+  // Viewer averages within one PxShape pair, not across all shapes of an actor
+  // or across simulation steps. A voxel support node is our collision subshape.
+  using PairKey = std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, int, uint32_t, uint32_t>;
+  std::map<PairKey, PairAccum> pairs;
+  for (uint32_t i = 0; i < nImpulses; ++i) {
+    WorldContactImpulse imp = impulses[i];
+    if (std::tie(imp.idB.slot, imp.idB.generation) < std::tie(imp.idA.slot, imp.idA.generation)) {
+      std::swap(imp.idA, imp.idB);
+      std::swap(imp.massA, imp.massB);
+      std::swap(imp.velA, imp.velB);
+      std::swap(imp.xA, imp.xB);
+      std::swap(imp.qA, imp.qB);
+      std::swap(imp.fineA, imp.fineB);
+      std::swap(imp.fineNA, imp.fineNB);
+      imp.n = -imp.n;
+      imp.JA = -imp.JA;
+    }
+    ActorBinding* bA = bindingForObject(inst, imp.idA);
+    ActorBinding* bB = bindingForObject(inst, imp.idB);
+    // ExtPxActor marks terminal actors LEAF_CHUNK, and FilterShader suppresses
+    // their contact notifications on either side (physics collision still runs).
+    auto leaf = [](const ActorBinding* b) {
+      return b && b->actor && !NvBlastActorCanFracture(b->actor, blastLog);
+    };
+    if (leaf(bA) || leaf(bB)) continue;
+    glm::vec3 fA{0.0f};
+    glm::vec3 fB{0.0f};
+    if (!viewerPairForce(imp, fA, fB)) {
+      continue;
+    }
+    auto shape = [&](ActorBinding* b, bool sideA) {
+      NodeRef node;
+      return b && pickContactNode(inst, *b, imp, sideA, node) ? node.graphNode : UINT32_MAX;
+    };
+    const PairKey key{imp.idA.slot, imp.idA.generation, imp.idB.slot, imp.idB.generation,
+                      imp.substep, shape(bA, true), shape(bB, false)};
+    PairAccum& acc = pairs[key];
+    if (acc.n == 0) {
+      acc.idA = imp.idA;
+      acc.idB = imp.idB;
+      acc.qA = imp.qA;
+      acc.qB = imp.qB;
+      acc.xA = imp.xA;
+      acc.xB = imp.xB;
+    }
+    acc.forceA += fA;
+    acc.forceB += fB;
+    acc.pos += imp.worldPoint;
+    ++acc.n;
+  }
+  auto applySide = [&](ActorBinding* b, const glm::vec3& worldPos, const glm::vec3& worldForce, const glm::quat& q,
+                       const glm::vec3& x) {
+    if (b == nullptr || b->actor == nullptr || glm::dot(worldForce, worldForce) <= 0.0f) {
+      return;
+    }
+    BodyAssetFrame frame;
+    frame.objectId = b->objectId;
+    frame.assetCom = b->comAsset;
+    frame.worldCom = x;
+    frame.worldQ = q;
+    const glm::vec3 localPos = worldToAsset(worldPos, frame);
+    const glm::vec3 localForce = worldVecToAsset(worldForce, frame);
+    if (stressImpactImpulses_ && b->stressSolve) {
+      const glm::vec3 f = localForce * stressImpactScale_;
+      inst.blast.solver->addForce(*b->actor, NvcVec3{localPos.x, localPos.y, localPos.z},
+                                  NvcVec3{f.x, f.y, f.z}, Nv::Blast::ExtForceMode::FORCE);
+      ++inst.debug.impactDamageEvents;
+      return;
+    }
+    const uint32_t n = applyImpactShaderToActor(inst, b->actor, localPos, localForce);
+    if (n > 0) {
+      inst.impactAppliedThisTick = true;
+      inst.debug.impactDamageEvents += n;
+    }
+  };
+  uint32_t noBind = 0;
+  uint32_t selfSkip = 0;
+  for (auto& kv : pairs) {
+    PairAccum& acc = kv.second;
+    if (acc.n == 0) {
+      continue;
+    }
+    const float invN = 1.0f / static_cast<float>(acc.n);
+    acc.forceA *= invN;
+    acc.forceB *= invN;
+    acc.pos *= invN;
+    ActorBinding* bA = bindingForObject(inst, acc.idA);
+    ActorBinding* bB = bindingForObject(inst, acc.idB);
+    if (bA != nullptr && bB != nullptr && !impactSettings_.selfCollisionEnabled) {
+      ++selfSkip;
+      continue;
+    }
+    if (bA == nullptr && bB == nullptr) {
+      ++noBind;
+    }
+    applySide(bA, acc.pos, acc.forceA, acc.qA, acc.xA);
+    applySide(bB, acc.pos, acc.forceB, acc.qB, acc.xB);
+  }
+  if (nImpulses > 0) {
+    std::cout << "ImpactDamage impulses=" << nImpulses << " pairs=" << pairs.size()
+              << " events=" << inst.debug.impactDamageEvents << " noBind=" << noBind
+              << " selfSkip=" << selfSkip << " bindings=" << inst.bindings.size() << "\n";
+  }
+}
+
+const BodyKinematics* StructureWorld::findKinematics(VoxelObjectId id, const BodyKinematics* kinematics,
+                                                     uint32_t nKinematics) const {
+  if (kinematics == nullptr || !id.valid()) {
+    return nullptr;
+  }
+  for (uint32_t i = 0; i < nKinematics; ++i) {
+    if (kinematics[i].objectId == id) {
+      return &kinematics[i];
+    }
+  }
+  return nullptr;
+}
+
 void StructureWorld::solveInstance(StructureInstance& inst, const WorldContactImpulse* impulses,
-                                   uint32_t nImpulses) {
+                                   uint32_t nImpulses, const BodyKinematics* kinematics, uint32_t nKinematics) {
   if (inst.blast.solver == nullptr || inst.blast.family == nullptr) {
     return;
   }
   inst.debug.probeExportCount = 0;
+  inst.debug.gravityActors = 0;
+  inst.debug.centrifugalActors = 0;
+  inst.debug.impactDamageEvents = 0;
+  inst.debug.impactDamageEnabled = impactDamageEnabled_;
+  inst.debug.stressImpactImpulses = stressImpactImpulses_;
+  inst.debug.stressImpactScale = stressImpactScale_;
+  inst.impactAppliedThisTick = false;
   const auto tLoad0 = std::chrono::steady_clock::now();
   const uint32_t topo = inst.blast.solver->topologyEpoch();
   if (inst.bindings.empty() || inst.lastBoundTopologyEpoch != topo) {
@@ -666,30 +1023,31 @@ void StructureWorld::solveInstance(StructureInstance& inst, const WorldContactIm
     inst.lastBoundTopologyEpoch = topo;
   }
   buildLoadSnapshots(inst, impulses, nImpulses, lastTickId_, lastDt_ > 0.0f ? lastDt_ : (1.0f / 60.0f));
+  for (ActorLoadSnapshot& snap : inst.loadSnapshots) {
+    snap.evaluated = true;
+  }
+  const glm::vec3 worldG(0.0f, kE1GravityY, 0.0f);
   for (ActorBinding& b : inst.bindings) {
     if (b.actor == nullptr || !b.stressSolve) {
       continue;
     }
+    const BodyKinematics* kin = findKinematics(b.objectId, kinematics, nKinematics);
+    const glm::quat q = kin != nullptr ? kin->worldQ : glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
     if (b.anchored) {
-      inst.blast.solver->addGravity(*b.actor, NvcVec3{0.0f, kE1GravityY, 0.0f});
+      const glm::vec3 localG = glm::inverse(q) * worldG;
+      inst.blast.solver->addGravity(*b.actor, NvcVec3{localG.x, localG.y, localG.z});
+      ++inst.debug.gravityActors;
+    } else {
+      const glm::vec3 localW = kin != nullptr ? (glm::inverse(q) * kin->worldW) : glm::vec3(0.0f);
+      inst.blast.solver->addCentrifugalAcceleration(
+          *b.actor, NvcVec3{b.comAsset.x, b.comAsset.y, b.comAsset.z},
+          NvcVec3{localW.x, localW.y, localW.z});
+      ++inst.debug.centrifugalActors;
     }
   }
-  for (ActorLoadSnapshot& snap : inst.loadSnapshots) {
-    if (!snap.valid || snap.evaluated) {
-      continue;
-    }
-    if (snap.topologyEpoch != inst.blast.solver->topologyEpoch()) {
-      snap.valid = false;
-      snap.invalidReason = "stale topology";
-      ++inst.debug.invalidSnapshots;
-      continue;
-    }
-    for (const MappedLoad& L : snap.loads) {
-      inst.blast.solver->addLoad(L.graphNode, NvcVec3{L.F.x, L.F.y, L.F.z}, NvcVec3{L.tau.x, L.tau.y, L.tau.z},
-                                 Nv::Blast::ExtForceMode::FORCE);
-    }
-    snap.evaluated = true;
-  }
+  applyViewerImpact(inst, impulses, nImpulses);
+  // Keep bond-damage paint/HUD in sync even on ticks with no new Impact events.
+  syncBondDamageFromHealth(inst);
   inst.debug.contactLoadMs =
       std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - tLoad0).count();
   const auto t0 = std::chrono::steady_clock::now();
@@ -698,13 +1056,21 @@ void StructureWorld::solveInstance(StructureInstance& inst, const WorldContactIm
   const auto t1 = std::chrono::steady_clock::now();
   refreshDebug(inst, std::chrono::duration<float, std::milli>(t1 - t0).count());
   inst.debug.bindingCount = static_cast<uint32_t>(inst.bindings.size());
+  inst.debug.impactDamageEnabled = impactDamageEnabled_;
+  inst.debug.stressImpactImpulses = stressImpactImpulses_;
+  inst.debug.stressImpactScale = stressImpactScale_;
   collectPendingFracture(inst);
 }
 
-void StructureWorld::onPhysicsTick(uint64_t tickId, float dt) { onPhysicsTick(tickId, dt, nullptr, 0); }
+void StructureWorld::onPhysicsTick(uint64_t tickId, float dt) { onPhysicsTick(tickId, dt, nullptr, 0, nullptr, 0); }
 
 void StructureWorld::onPhysicsTick(uint64_t tickId, float dt, const WorldContactImpulse* impulses,
                                    uint32_t nImpulses) {
+  onPhysicsTick(tickId, dt, impulses, nImpulses, nullptr, 0);
+}
+
+void StructureWorld::onPhysicsTick(uint64_t tickId, float dt, const WorldContactImpulse* impulses,
+                                   uint32_t nImpulses, const BodyKinematics* kinematics, uint32_t nKinematics) {
   if (!initialized_) {
     return;
   }
@@ -715,7 +1081,7 @@ void StructureWorld::onPhysicsTick(uint64_t tickId, float dt, const WorldContact
     return;
   }
   for (StructureInstance& inst : instances_) {
-    solveInstance(inst, impulses, nImpulses);
+    solveInstance(inst, impulses, nImpulses, kinematics, nKinematics);
   }
 }
 
@@ -810,6 +1176,13 @@ std::vector<NodeRef> StructureWorld::actorNodeRefs(const StructureInstance& inst
 }
 
 void StructureWorld::rebuildBindingsFromFamily(StructureInstance& inst) {
+  std::unordered_map<NvBlastActor*, ActorBinding> prev;
+  prev.reserve(inst.bindings.size());
+  for (ActorBinding& b : inst.bindings) {
+    if (b.actor != nullptr) {
+      prev[b.actor] = b;
+    }
+  }
   inst.bindings.clear();
   if (inst.blast.family == nullptr) {
     return;
@@ -831,6 +1204,12 @@ void StructureWorld::rebuildBindingsFromFamily(StructureInstance& inst) {
     ActorBinding b;
     b.actor = a;
     b.objectId = inst.objectId;
+    const auto it = prev.find(a);
+    if (it != prev.end()) {
+      b.objectId = it->second.objectId;
+      b.fineOrigin = it->second.fineOrigin;
+      b.fineN = it->second.fineN;
+    }
     fillBindingKinematics(inst, b);
     inst.bindings.push_back(b);
   }
@@ -917,12 +1296,32 @@ void StructureWorld::buildLoadSnapshots(StructureInstance& inst, const WorldCont
     }
     std::vector<PickedImpulse> picked;
     picked.reserve(nImpulses);
+    std::unordered_set<uint64_t> impactAccepted;
+    std::unordered_set<uint64_t> impactRejected;
     for (uint32_t i = 0; i < nImpulses; ++i) {
       const WorldContactImpulse& imp = impulses[i];
       const bool sideA = imp.idA == b.objectId;
       const bool sideB = imp.idB == b.objectId;
       if (!sideA && !sideB) {
         continue;
+      }
+      const bool takeContact = !b.anchored || stressImpactImpulses_;
+      if (!takeContact) {
+        continue;
+      }
+      if (!imp.persistent) {
+        const uint64_t eid =
+            imp.eventId != 0 ? imp.eventId : (contactPairKey(imp.idA, imp.idB) ^ tickId);
+        if (impactRejected.count(eid) != 0) {
+          continue;
+        }
+        if (impactAccepted.count(eid) == 0) {
+          if (!inst.impactEvents.consume(eid)) {
+            impactRejected.insert(eid);
+            continue;
+          }
+          impactAccepted.insert(eid);
+        }
       }
       BodyAssetFrame frame;
       frame.objectId = b.objectId;

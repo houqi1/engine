@@ -149,6 +149,7 @@ add_library(ve_structure_core STATIC
   src/blast/BlastMemory.cpp
   src/blast/VoxelGraph.cpp
   src/blast/ContactLoads.cpp
+  src/blast/ImpactDamage.cpp
   src/blast/OccupancySampler.cpp
   src/blast/StructureWorld.cpp
 )
@@ -189,6 +190,7 @@ ve_blast_test(blast_graph_regression_tests tests/blast_graph_regression_tests.cp
 ve_blast_test(blast_e0_tests tests/blast_e0_tests.cpp)
 ve_blast_test(blast_e1_tests tests/blast_e1_tests.cpp)
 ve_blast_test(blast_frame_tests tests/blast_frame_tests.cpp)
+ve_blast_test(blast_viewer_alignment_tests tests/blast_viewer_alignment_tests.cpp)
 ve_blast_test(blast_e2_tests tests/blast_e2_tests.cpp)
 ve_blast_test(blast_e2_perf tests/blast_e2_perf.cpp)
 ve_blast_test(blast_probe_export_tests tests/blast_probe_export_tests.cpp)

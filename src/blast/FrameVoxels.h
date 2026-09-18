@@ -7,10 +7,10 @@
 namespace blast {
 
 // Four corner columns + a roof slab. Fine 0.1 m. Grid is cubic (VoxelObject.gridSize).
-// 96 fines = 9.6 m; columns 8.8 m so a cut roof falls farther than the old 4.0 m posts.
+// 96 fines = 9.6 m; reserve room for the roof above adjustable columns.
 constexpr int kFrameGridFines = 96;
 constexpr int kFrameColW = 6;
-constexpr int kFrameColH = 88;
+constexpr int kFrameColH = 40;
 constexpr int kFrameRoofT = 4;
 constexpr int kFrameAnchorFines = 2;
 constexpr int kFrameColSpan = 32;
@@ -21,6 +21,7 @@ constexpr float kFrameStrengthFailPa = 1.0e6f;
 constexpr float kFrameStrengthHoldPa = 5.0e7f;
 
 struct FrameRaster {
+  int columnHeight = kFrameColH;
   int nx = kFrameGridFines;
   int ny = kFrameGridFines;
   int nz = kFrameGridFines;
@@ -37,8 +38,8 @@ inline void frameColumnRange(int col, int& x0, int& z0) {
   z0 = kFrameInset + iz * kFrameColSpan;
 }
 
-inline bool inFrameColumn(int col, int x, int y, int z) {
-  if (y < 0 || y >= kFrameColH) {
+inline bool inFrameColumn(int col, int x, int y, int z, int columnHeight = kFrameColH) {
+  if (y < 0 || y >= columnHeight) {
     return false;
   }
   int x0 = 0;
@@ -47,17 +48,17 @@ inline bool inFrameColumn(int col, int x, int y, int z) {
   return x >= x0 && x < x0 + kFrameColW && z >= z0 && z < z0 + kFrameColW;
 }
 
-inline bool inAnyFrameColumn(int x, int y, int z) {
+inline bool inAnyFrameColumn(int x, int y, int z, int columnHeight = kFrameColH) {
   for (int c = 0; c < 4; ++c) {
-    if (inFrameColumn(c, x, y, z)) {
+    if (inFrameColumn(c, x, y, z, columnHeight)) {
       return true;
     }
   }
   return false;
 }
 
-inline bool inFrameRoof(int x, int y, int z) {
-  if (y < kFrameColH || y >= kFrameColH + kFrameRoofT) {
+inline bool inFrameRoof(int x, int y, int z, int columnHeight = kFrameColH) {
+  if (y < columnHeight || y >= columnHeight + kFrameRoofT) {
     return false;
   }
   const int x0 = kFrameInset;
@@ -70,13 +71,15 @@ inline bool inFrameRoof(int x, int y, int z) {
   return xBeam || zBeam;
 }
 
-inline bool inFrameSolid(int x, int y, int z) { return inAnyFrameColumn(x, y, z) || inFrameRoof(x, y, z); }
+inline bool inFrameSolid(int x, int y, int z, int columnHeight = kFrameColH) {
+  return inAnyFrameColumn(x, y, z, columnHeight) || inFrameRoof(x, y, z, columnHeight);
+}
 
 inline bool isFrameAnchorFine(int x, int y, int z) {
   return y >= 0 && y < kFrameAnchorFines && inAnyFrameColumn(x, y, z);
 }
 
-inline bool inThreeColumnCut(int x, int y, int z) {
+inline bool inThreeColumnCut(int x, int y, int z, int columnHeight = kFrameColH) {
   if (y < kFrameAnchorFines) {
     return false;
   }
@@ -84,7 +87,7 @@ inline bool inThreeColumnCut(int x, int y, int z) {
     if (c == kFrameKeepCol) {
       continue;
     }
-    if (inFrameColumn(c, x, y, z)) {
+    if (inFrameColumn(c, x, y, z, columnHeight)) {
       return true;
     }
   }
@@ -106,7 +109,7 @@ void forEachFrameFine(const FrameRaster& r, Fn&& fn) {
   for (int z = 0; z < r.nz; ++z) {
     for (int y = 0; y < r.ny; ++y) {
       for (int x = 0; x < r.nx; ++x) {
-        if (inFrameSolid(x, y, z)) {
+        if (inFrameSolid(x, y, z, r.columnHeight)) {
           fn(x, y, z);
         }
       }

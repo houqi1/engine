@@ -50,6 +50,9 @@ struct Options {
   bool benchmark = false;
   bool e2Perf = false;
   bool frameFail = false;
+  float frameHeightMeters = 4.0f;
+  std::string frameImpactMode = "shear";
+  int frameRenderHz = 60;
   bool help = false;
   uint32_t frames = 300;
   uint32_t warmup = 60;
@@ -91,6 +94,20 @@ Options parseOptions(int argc, char** argv) {
       options.e2Perf = true;
     } else if (arg == "--frame-fail") {
       options.frameFail = true;
+    } else if (arg == "--frame-height") {
+      const std::string text = value();
+      size_t parsed = 0;
+      options.frameHeightMeters = std::stof(text, &parsed);
+      if (parsed != text.size() || !std::isfinite(options.frameHeightMeters) ||
+          options.frameHeightMeters < 1.0f || options.frameHeightMeters > 9.2f) {
+        throw std::runtime_error("--frame-height must be between 1.0 and 9.2 meters");
+      }
+    } else if (arg == "--frame-impact") {
+      options.frameImpactMode = value();
+      if (options.frameImpactMode != "shear" && options.frameImpactMode != "spread" && options.frameImpactMode != "stress")
+        throw std::runtime_error("--frame-impact must be shear, spread or stress");
+    } else if (arg == "--frame-render-hz") {
+      options.frameRenderHz = integer(30, 240);
     } else if (arg == "--help" || arg == "-h") {
       options.help = true;
     } else if (arg == "--frames") {
@@ -785,7 +802,7 @@ void showFatal(const char* message, bool dialogs) {
 
 }  // namespace
 
-void runFrameFail(GfxDevice& gfx, VoxelScene& scene, PerfLog& out) {
+void runFrameFail(GfxDevice& gfx, VoxelScene& scene, PerfLog& out, const Options& options) {
   auto dump = [&](const char* tag) {
     const blast::StructureDebugSnapshot& st = scene.structures().debug();
     int enabled = 0;
@@ -811,10 +828,16 @@ void runFrameFail(GfxDevice& gfx, VoxelScene& scene, PerfLog& out) {
     }
   };
 
-  if (!scene.spawnStressFrame(gfx)) {
+  auto impact = scene.structures().impactSettings();
+  impact.shearDamage = options.frameImpactMode != "spread";
+  scene.structures().setImpactSettings(impact);
+  scene.structures().setStressImpactImpulses(options.frameImpactMode == "stress");
+  if (!scene.spawnStressFrame(gfx, options.frameHeightMeters)) {
     throw std::runtime_error("spawnStressFrame failed");
   }
   ticks(24);
+  out.line("columnHeightMeters=" + std::to_string(scene.frameColumnHeightMeters()));
+  out.line("impactMode=" + options.frameImpactMode + " renderHz=" + std::to_string(options.frameRenderHz));
   dump("after-spawn");
 
   if (!scene.cutThreeColumns(gfx)) {
@@ -825,12 +848,50 @@ void runFrameFail(GfxDevice& gfx, VoxelScene& scene, PerfLog& out) {
 
   scene.structures().setFractureEnabled(true);
   scene.structures().setStrengthPa(blast::kFrameStrengthFailPa);
-  for (int i = 0; i < 8; ++i) {
-    scene.update(physics::kDt);
+  uint32_t firstSplitActors = 0;
+  bool landingSplit = false;
+  // Run through the actual fall and landing, not just the initial column failure.
+  for (int i = 0; i < options.frameRenderHz * 4; ++i) {
+    scene.update(1.0f / static_cast<float>(options.frameRenderHz));
     scene.commitStructureSplits(gfx);
+    const auto& st = scene.structures().debug();
+    if (firstSplitActors == 0 && st.splitActors > 1) {
+      firstSplitActors = st.splitActors;
+    } else if (firstSplitActors > 0 && st.splitActors > firstSplitActors && st.impactDamageEvents > 0) {
+      landingSplit = true;
+    }
+    // Blast actor counts alone miss fragments silently left inside their parent.
+    std::vector<uint32_t> boundSlots;
+    for (const auto& binding : scene.structures().bindings()) {
+      const VoxelObject* object = scene.tryGetObject(binding.objectId);
+      if (object == nullptr || !object->enabled) {
+        throw std::runtime_error("Frame fracture actor has no visible object");
+      }
+      if (std::find(boundSlots.begin(), boundSlots.end(), binding.objectId.slot) != boundSlots.end()) {
+        throw std::runtime_error("Frame fracture actors still share one physical object");
+      }
+      boundSlots.push_back(binding.objectId.slot);
+    }
     dump((std::string("fail-tick-") + std::to_string(i)).c_str());
   }
-  out.line("OK frame-fail");
+  uint32_t singleNodePieces = 0;
+  uint32_t multiNodePieces = 0;
+  uint32_t largestDynamicNodes = 0;
+  for (const auto& binding : scene.structures().bindings()) {
+    if (binding.anchored) continue;
+    if (binding.graphNodeCount == 1) ++singleNodePieces;
+    else ++multiNodePieces;
+    largestDynamicNodes = std::max(largestDynamicNodes, binding.graphNodeCount);
+  }
+  out.line("dynamic single-node=" + std::to_string(singleNodePieces) +
+           " multi-node=" + std::to_string(multiNodePieces) +
+           " largestNodes=" + std::to_string(largestDynamicNodes));
+  // Stress routing uses the Viewer's configurable 0.01 factor; that mode is not
+  // guaranteed to break this particular asset on contact at its current strength.
+  if (!landingSplit && options.frameImpactMode != "stress") {
+    throw std::runtime_error("Frame landing did not produce a secondary fracture");
+  }
+  out.line("OK frame-fail: landingSplit=" + std::to_string(landingSplit) + " and distinct fragment objects");
 }
 
 int main(int argc, char** argv) {
@@ -840,7 +901,11 @@ int main(int argc, char** argv) {
   try {
     const Options options = parseOptions(argc, argv);
     if (options.help) {
-      std::cout << "Usage: vulkan_engine_voxel [--benchmark options | --e2-perf]\n"
+      std::cout << "Usage: vulkan_engine_voxel [--benchmark options | --e2-perf | --frame-fail]\n"
+                   "  --frame-fail     Test four-column failure through landing\n"
+                   "  --frame-height M Column height for --frame-fail (1.0-9.2 m, default 4.0)\n"
+                   "  --frame-impact MODE  shear (Viewer default), spread, or stress\n"
+                   "  --frame-render-hz N  Frame test cadence (30-240, default 60)\n"
                    "  --e2-perf        Headless-ish E2 layer D: spawn cylinder, time scene+collision, exit\n"
                    "  --frames N       Measured submitted frames (default 300, >0)\n"
                    "  --warmup N       Excluded submitted frames (default 60, >=0)\n"
@@ -898,7 +963,7 @@ int main(int argc, char** argv) {
         throw std::runtime_error("Cannot open " + reportPath.string());
       }
       try {
-        runFrameFail(gfx, scene, log);
+        runFrameFail(gfx, scene, log, options);
       } catch (const std::exception& ex) {
         log.line(std::string("ERROR: ") + ex.what());
         gfx.waitIdle();
