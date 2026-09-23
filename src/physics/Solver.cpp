@@ -46,6 +46,16 @@ void refreshInverseInertiaWorld(RigidBody& b) {
 
 void solveContacts(std::vector<RigidBody>& bodies, std::vector<Contact>& contacts, float hSub,
                    int iterations) {
+  // Velocities are sampled by PhysicsWorld before this warm start. The seed is
+  // applied once in this substep; subsequent iterations apply only its delta.
+  for (Contact& c : contacts) {
+    if (c.a < 0 || c.b < 0 || c.a >= static_cast<int>(bodies.size()) ||
+        c.b >= static_cast<int>(bodies.size())) continue;
+    c.lambdaN = std::max(0.0f, c.lambdaN);
+    c.lambdaNVel = c.lambdaN;
+    if (c.d < 0.0f) c.JtWorld = glm::vec3(0.0f);
+    applyImpulse(bodies[c.a], bodies[c.b], c.rA, c.rB, c.lambdaN * c.n + c.JtWorld);
+  }
   const int iters = std::max(1, iterations);
   for (int it = 0; it < iters; ++it) {
   for (Contact& c : contacts) {
@@ -89,31 +99,26 @@ void solveContacts(std::vector<RigidBody>& bodies, std::vector<Contact>& contact
     const float lambdaNVel = std::max(0.0f, c.lambdaNVel + dLamVel);
     c.lambdaNVel = lambdaNVel;
 
-    // No friction while still separated — otherwise speculative contacts brake in air.
-    if (c.d < 0.0f || c.lambdaN <= 0.0f) {
-      continue;
-    }
-
     const glm::vec3 vA2 = A.v + glm::cross(A.w, c.rA);
     const glm::vec3 vB2 = B.v + glm::cross(B.w, c.rB);
     const glm::vec3 vRel2 = vA2 - vB2;
     glm::vec3 vt = vRel2 - glm::dot(vRel2, c.n) * c.n;
     const float vtLen = glm::length(vt);
-    if (vtLen <= 1e-6f) {
-      continue;
+    // Accumulate a world-space tangent vector. A scalar accumulated against a
+    // changing slip direction cannot be safely warm-started (direction reversal
+    // would otherwise reuse friction with the wrong sign).
+    glm::vec3 friction = c.JtWorld;
+    if (vtLen > 1e-6f) {
+      const glm::vec3 t = vt / vtLen;
+      const float kt = effectiveMass(A, B, c.rA, c.rB, t);
+      if (kt > 1e-8f) friction -= (vtLen / kt) * t;
     }
-    const glm::vec3 t = vt / vtLen;
-    const float kt = effectiveMass(A, B, c.rA, c.rB, t);
-    if (kt <= 1e-8f) {
-      continue;
-    }
-    float dLamT = -glm::dot(vt, t) / kt;
-    const float maxF = kFriction * c.lambdaN;
-    const float lambdaT = std::clamp(c.lambdaT + dLamT, -maxF, maxF);
-    dLamT = lambdaT - c.lambdaT;
-    c.lambdaT = lambdaT;
-    applyImpulse(A, B, c.rA, c.rB, dLamT * t);
-    c.JtWorld += dLamT * t;
+    const float maxF = c.d >= 0.0f ? kFriction * c.lambdaN : 0.0f;
+    const float length = glm::length(friction);
+    if (length > maxF && length > 0.0f) friction *= maxF / length;
+    applyImpulse(A, B, c.rA, c.rB, friction - c.JtWorld);
+    c.JtWorld = friction;
+    c.lambdaT = glm::length(friction);
   }
   }
 }

@@ -1,5 +1,7 @@
 #include "blast/BlastMemory.h"
 #include "blast/HardFracture.h"
+#include "blast/OccupancySampler.h"
+#include "blast/StructureWorld.h"
 #include "blast/VoxelGraph.h"
 
 #include "NvBlast.h"
@@ -172,8 +174,166 @@ void testT17(blast::TrackingAllocator& alloc) {
   }
   expect(sawEdited && sawKept, "T17 both edited and preserved actors");
   for (auto& cf : families) {
+    for (int pass = 0; pass < 3; ++pass) {
+      uint32_t covered = 0;
+      for (const auto& node : cf.graph.nodes) covered += static_cast<uint32_t>(node.voxels.size());
+      expect(blast::countSolidVoxels(cf.grid) == covered, "T17 family occupancy excludes siblings");
+      const auto voxel = cf.graph.nodes.front().voxels.front();
+      expect(blast::markRemovedVoxel(cf.grid, voxel.x, voxel.y, voxel.z), "T17 repeated edit");
+      std::vector<blast::CompactFamily> next;
+      const auto result = blast::compactReplace(alloc, cf.grid, cf.graph, cf.blast, next, 1.0e7f);
+      expect(static_cast<bool>(result), "T17 repeated compact succeeds");
+      if (!result || next.size() != 1) break;
+      cf = std::move(next.front());
+    }
+  }
+  for (auto& cf : families) {
     blast::destroyVoxelBlast(cf.blast);
   }
+}
+
+void testRebuildKeepsAnchorAndCut(blast::TrackingAllocator& alloc) {
+  std::cout << "E4 rebuild keeps anchor and cut\n";
+  blast::VoxelGrid grid;
+  blast::initGrid(grid, 1, 4, 1, 1, 0.1f);
+  fillBox(grid, 0, 0, 0, 1, 4, 1);
+  grid.setAnchor(0, 0, 0, true);
+  blast::VoxelStructureGraph graph;
+  expect(blast::extractGraph(grid, graph, blast::kOwnerAll) == blast::BlastError::Ok, "E4 extract");
+  expect(blast::attachWorldBonds(grid, graph) == blast::BlastError::Ok, "E4 anchor");
+  blast::VoxelBlast vb;
+  expect(blast::createVoxelBlast(alloc, graph, grid, vb, 1.0e7f) == blast::BlastError::Ok, "E4 create");
+  const uint64_t saw = blast::packFaceKey(0, 1, 0, 1);
+  grid.brokenFaces.insert(saw);
+  expect(blast::markRemovedVoxel(grid, 0, 3, 0), "E4 remove top");
+  std::vector<blast::CompactFamily> families;
+  expect(static_cast<bool>(blast::compactReplace(alloc, grid, graph, vb, families, 1.0e7f)), "E4 replace");
+  expect(families.size() == 1, "E4 one family");
+  if (!families.empty()) {
+    bool world = false;
+    bool sawFace = false;
+    for (const blast::GraphBond& b : families[0].graph.bonds) {
+      if (b.world) {
+        world = true;
+      }
+      for (uint64_t f : b.faces) {
+        if (f == saw) {
+          sawFace = true;
+        }
+      }
+    }
+    expect(world, "E4 world bond restored");
+    expect(!sawFace, "E4 cut face stays open");
+    expect(!families[0].grid.isSolid(0, 3, 0), "E4 top stays empty");
+    blast::destroyVoxelBlast(families[0].blast);
+  }
+}
+
+blast::OccupancySample columnSample() {
+  blast::OccupancySample sample;
+  blast::initGrid(sample.grid, 1, 7, 1, 1, 0.1f);
+  fillBox(sample.grid, 0, 0, 0, 1, 7, 1);
+  sample.grid.setAnchor(0, 0, 0, true);
+  sample.error = blast::extractGraph(sample.grid, sample.graph, blast::kOwnerAll);
+  expect(sample.error == blast::BlastError::Ok, "E4 column graph");
+  expect(blast::attachWorldBonds(sample.grid, sample.graph) == blast::BlastError::Ok, "E4 column anchor");
+  sample.occupied = 7;
+  for (const auto& node : sample.graph.nodes) sample.mass += node.mass;
+  sample.worldBonds = 1;
+  return sample;
+}
+
+void testWorldRemovalAndSecondInstance(blast::BlastRuntime& runtime) {
+  std::cout << "E4 bridge removal retains detached stress actors and repeated edits\n";
+  const auto baseline = runtime.liveBytes();
+  {
+    blast::StructureWorld world;
+    expect(world.init(runtime), "E4 world init");
+    const VoxelObjectId parent{10, 1}, child{11, 1};
+    expect(world.mountSample(parent, columnSample(), 50, 1.0e7f, 0, 0) == blast::BlastError::Ok,
+           "E4 mount column");
+    const glm::ivec3 bridge(0, 3, 0);
+    expect(world.applyOccupancyRemoval(parent, &bridge, 1) == blast::BlastError::Ok, "E4 remove bridge");
+    auto* inst = world.instance();
+    expect(inst->bindings.size() == 2, "E4 cut immediately creates two actors without stress threshold");
+    expect(world.takeOccupancyDirty(inst), "E4 removal requests scene split");
+    std::vector<blast::ActorObjectLink> links;
+    for (const auto& binding : inst->bindings) {
+      blast::ActorObjectLink link;
+      link.actor = binding.actor;
+      link.objectId = binding.anchored ? parent : child;
+      link.fineOrigin = binding.anchored ? glm::ivec3(0) : glm::ivec3(0, 4, 0);
+      link.fineN = 8;
+      links.push_back(link);
+      expect(binding.stressSolve, "E4 both pieces remain stress-capable");
+    }
+    world.bindVisibleActors(links, inst);
+    expect(world.ownsObject(child), "E4 child is still mounted");
+    const glm::ivec3 tip(0, 2, 0);
+    expect(world.applyOccupancyRemoval(child, &tip, 1) == blast::BlastError::Ok, "E4 edit rebased child");
+    expect(world.instanceCount() == 2, "E4 compact separates owners into instances");
+    blast::StructureInstance* detached = nullptr;
+    blast::StructureInstance* anchored = nullptr;
+    for (uint32_t i = 0; i < world.instanceCount(); ++i) {
+      auto* part = world.instanceAt(i);
+      if (part->objectId == child) detached = part;
+      if (part->objectId == parent) anchored = part;
+      for (const auto& binding : part->bindings) {
+        expect(binding.fineN == 8, "E4 rebuild retains fine dimensions");
+      }
+    }
+    expect(detached && anchored, "E4 both owner identities preserved");
+    if (detached && anchored) {
+      expect(blast::countSolidVoxels(detached->grid) == 2, "E4 child has only surviving child fines");
+      expect(blast::countSolidVoxels(anchored->grid) == 3, "E4 unedited parent keeps mass");
+      expect(!world.takeOccupancyDirty(anchored), "E4 unedited owner needs no body replacement or wake");
+      expect(detached->bindings.front().fineOrigin == glm::ivec3(0, 4, 0), "E4 child origin preserved");
+      const glm::ivec3 another(0, 1, 0);
+      expect(world.applyOccupancyRemoval(child, &another, 1) == blast::BlastError::Ok, "E4 second compact edit succeeds");
+    }
+    world.clear();
+
+    std::cout << "E4 explicit second-instance fracture submission\n";
+    expect(world.mountSample(parent, columnSample(), 50, 1.0e7f, 0, 0) == blast::BlastError::Ok, "E4 first mount");
+    expect(world.mountSample(child, columnSample(), 50, 1.0e7f, 0, 0) == blast::BlastError::Ok, "E4 second mount");
+    auto* first = world.instanceAt(0);
+    auto* second = world.instanceAt(1);
+    const auto& bond = second->graph.bonds.front();
+    blast::FractureCandidate candidate;
+    candidate.stableId = bond.stableId;
+    candidate.nodeA = bond.nodeA;
+    candidate.nodeB = bond.nodeB;
+    candidate.node0 = second->blast.graphFromStable.at(bond.nodeA);
+    candidate.node1 = second->blast.graphFromStable.at(bond.nodeB);
+    candidate.owner = 1;
+    candidate.healthBefore = blast::bondAeff(bond, second->grid.voxelSize);
+    candidate.damage = candidate.healthBefore;
+    candidate.faces = bond.faces;
+    auto& pending = second->pending;
+    pending.valid = true;
+    pending.objectId = child;
+    pending.topologyRevision = second->topologyRevision;
+    pending.solverTopologyEpoch = second->blast.solver->topologyEpoch();
+    pending.solveEpoch = second->solveEpoch;
+    pending.strengthEpoch = second->strengthEpoch;
+    pending.strengthPa = second->strengthPa;
+    pending.candidates.push_back(candidate);
+    expect(world.pendingSnapshotMatches(pending, second), "E4 second pending snapshot matches");
+    expect(!world.pendingSnapshotMatches(pending, first), "E4 first rejects second snapshot");
+    expect(world.applyPendingIfAny(second) == 1, "E4 second commits its fracture");
+    expect(NvBlastFamilyGetActorCount(second->blast.family, blastLog) == 2, "E4 second family split");
+    expect(NvBlastFamilyGetActorCount(first->blast.family, blastLog) == 1, "E4 first family untouched");
+    expect(!world.takeOccupancyDirty(first), "E4 first dirty flag untouched");
+    expect(world.takeOccupancyDirty(second), "E4 second dirty flag delivered");
+    std::vector<blast::ActorObjectLink> secondLinks;
+    for (const auto& b : second->bindings) secondLinks.push_back({b.actor, child, glm::ivec3(0), 8});
+    world.bindVisibleActors(secondLinks, second);
+    expect(first->bindings.front().objectId == parent, "E4 second rebind leaves first alone");
+    world.onPhysicsTick(1, 1.0f / 60.0f);
+    expect(first->solveEpoch == 1 && second->solveEpoch == 1, "E4 both instances still solve");
+  }
+  expect(runtime.liveBytes() == baseline, "E4 world teardown releases rebuilt families");
+  expect(runtime.errorCount() == 0, "E4 world no SDK errors");
 }
 
 }  // namespace
@@ -189,10 +349,18 @@ int main() {
   testT15(alloc);
   testT16(alloc);
   testT17(alloc);
+  testRebuildKeepsAnchorAndCut(alloc);
 
   expect(errors.errorCount() == 0, "no NvBlast error-callback errors");
+  {
+    blast::BlastRuntime runtime;
+    expect(runtime.init(), "E4 runtime init");
+    testWorldRemovalAndSecondInstance(runtime);
+  }
+  NvBlastGlobalSetAllocatorCallback(&alloc);
+  NvBlastGlobalSetErrorCallback(&errors);
   if (gFailures == 0) {
-    std::cout << "OK P4 T14 T15 T16 T17\n";
+    std::cout << "OK P4 T14 T15 T16 T17 E4\n";
     return 0;
   }
   std::cerr << gFailures << " failure(s)\n";

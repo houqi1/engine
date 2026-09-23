@@ -10,6 +10,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -93,7 +95,7 @@ void ufUnite(std::vector<int>& parent, int a, int b) {
 
 }  // namespace
 
-void PhysicsWorld::attach(VoxelScene& scene) { scene_ = &scene; }
+void PhysicsWorld::attach(VoxelScene& scene) { scene_ = &scene; contactCache_.clear(); }
 
 void PhysicsWorld::ensureBodyCapacity(int n) {
   if (n < 0) {
@@ -153,6 +155,9 @@ void PhysicsWorld::rebuildFromScene() {
   }
   const int n = scene_->cpuObjectCount();
   bodies_.assign(static_cast<size_t>(n), RigidBody{});
+  broadPhase_.clear();
+  contactCache_.clear();
+  broadProxies_.clear();
   classes_.assign(static_cast<size_t>(n), ShapeClass{});
   for (int i = 0; i < n; ++i) {
     initBodyFromObject(i, bodies_[static_cast<size_t>(i)], false);
@@ -163,6 +168,7 @@ void PhysicsWorld::rebuildFromScene() {
 }
 
 void PhysicsWorld::markDirty(int objectIndex) {
+  contactCache_.invalidate(objectIndex);
   if (objectIndex >= 0 && objectIndex < static_cast<int>(classes_.size())) {
     classes_[static_cast<size_t>(objectIndex)].dirty = true;
   }
@@ -177,6 +183,7 @@ void PhysicsWorld::rebuildDirty() {
       continue;
     }
     const int slot = static_cast<int>(i);
+    contactCache_.invalidate(slot);
     if (!scene_->slotOccupied(slot)) {
       wakeSleepersSupportedBy(slot);
       RigidBody& b = bodies_[i];
@@ -239,6 +246,7 @@ bool PhysicsWorld::addBody(VoxelObjectId id, const BodyState& state) {
     return false;
   }
   const int i = static_cast<int>(id.slot);
+  contactCache_.invalidate(i);
   ensureBodyCapacity(i + 1);
   RigidBody& b = bodies_[static_cast<size_t>(i)];
   initBodyFromObject(i, b, false);
@@ -266,6 +274,7 @@ bool PhysicsWorld::removeBody(VoxelObjectId id) {
     return false;
   }
   const int i = static_cast<int>(id.slot);
+  contactCache_.invalidate(i);
   if (i < 0 || i >= static_cast<int>(bodies_.size())) {
     return false;
   }
@@ -294,6 +303,7 @@ bool PhysicsWorld::replaceShape(VoxelObjectId id, const BodyState* stateOrNull) 
     return false;
   }
   const int i = static_cast<int>(id.slot);
+  contactCache_.invalidate(i);
   ensureBodyCapacity(i + 1);
   RigidBody& b = bodies_[static_cast<size_t>(i)];
   const bool preserve = stateOrNull == nullptr;
@@ -458,25 +468,100 @@ void PhysicsWorld::substep() {
   }
   std::vector<Contact> contacts;
   const int n = static_cast<int>(bodies_.size());
+  // Synchronize all proxies before querying: sleepers remain discoverable by
+  // active/kinematic bodies, and edits, rotation, teleports and reused slots all
+  // receive fresh occupancy bounds. No cached pair lifetime is required because
+  // every active body is queried each substep, even within its fat AABB.
+  for (size_t i = static_cast<size_t>(n); i < broadProxies_.size(); ++i) {
+    if (broadProxies_[i] != -1) broadPhase_.remove(broadProxies_[i]);
+  }
+  broadProxies_.resize(static_cast<size_t>(n), -1);
+  broadBounds_.resize(static_cast<size_t>(n));
+  collisionPoses_.resize(static_cast<size_t>(n));
   for (int i = 0; i < n; ++i) {
-    if (!scene_->slotOccupied(i) || !scene_->cpuObject(i).enabled) {
+    int& proxy = broadProxies_[static_cast<size_t>(i)];
+    glm::vec3 mn, mx;
+    if (!scene_->slotOccupied(i) || !scene_->cpuObject(i).enabled ||
+        !worldAabb(*scene_, i, classes_[static_cast<size_t>(i)], mn, mx)) {
+      if (proxy != -1) broadPhase_.remove(proxy);
+      proxy = -1;
       continue;
     }
-    for (int j = i + 1; j < n; ++j) {
-      if (!scene_->slotOccupied(j) || !scene_->cpuObject(j).enabled) {
-        continue;
+    const float fine = scene_->cpuObject(i).voxelSize / VoxelScene::kFinePerCoarse;
+    auto& pose = collisionPoses_[static_cast<size_t>(i)];
+    pose.min = mn; pose.max = mx; pose.fineSize = fine;
+    pose.toWorld = scene_->cpuObject(i).objectToWorld();
+    pose.toLocal = glm::inverse(pose.toWorld);
+    // Existing pair rejection expands BOTH bounds by max(fineA, fineB).
+    // 2*fine per body is conservative even when voxel scales differ:
+    // 2*(fineA+fineB) >= 2*max(fineA,fineB).
+    const PhysicsAabb bounds = PhysicsAabb{mn, mx}.expanded(2.0f * fine);
+    broadBounds_[static_cast<size_t>(i)] = bounds;
+    if (proxy == -1) proxy = broadPhase_.insert(i, bounds.expanded(fine));
+    else broadPhase_.update(proxy, bounds, fine);
+  }
+  broadPairs_.clear();
+  for (int i = 0; i < n; ++i) {
+    const RigidBody& a = bodies_[static_cast<size_t>(i)];
+    if (broadProxies_[static_cast<size_t>(i)] == -1 ||
+        !(a.awake || (!a.dynamic && !isStaticEnvironment(*scene_, a)))) continue;
+    broadPhase_.query(broadBounds_[static_cast<size_t>(i)], [&](int j) {
+      if (i == j || skipCollidePair(*scene_, a, bodies_[static_cast<size_t>(j)])) return;
+      // Fat tree proxies are conservative; reject their false positives before
+      // allocating/updating a persistent contact pair. Same gate as collidePair.
+      const auto& pa = collisionPoses_[static_cast<size_t>(i)];
+      const auto& pb = collisionPoses_[static_cast<size_t>(j)];
+      const float pad = std::max(pa.fineSize, pb.fineSize);
+      if (!PhysicsAabb{pa.min, pa.max}.expanded(pad).overlaps(PhysicsAabb{pb.min, pb.max}.expanded(pad))) return;
+      broadPairs_.emplace_back(std::min(i, j), std::max(i, j));
+    });
+  }
+  // Preserve the old pair/solver order, independent of insertion/tree rotations.
+  std::sort(broadPairs_.begin(), broadPairs_.end());
+  broadPairs_.erase(std::unique(broadPairs_.begin(), broadPairs_.end()), broadPairs_.end());
+  // Opt-in integration oracle for fracture/landing runs. Never enabled in normal
+  // play; checks the exact old AABB gate including mixed-resolution objects.
+  static const bool validateBroadPhase = std::getenv("VE_VALIDATE_BROADPHASE") != nullptr;
+  if (validateBroadPhase) {
+    for (int i = 0; i < n; ++i) {
+      if (broadProxies_[static_cast<size_t>(i)] == -1) continue;
+      for (int j = i + 1; j < n; ++j) {
+        if (broadProxies_[static_cast<size_t>(j)] == -1 ||
+            skipCollidePair(*scene_, bodies_[i], bodies_[j])) continue;
+        glm::vec3 amn, amx, bmn, bmx;
+        worldAabb(*scene_, i, classes_[i], amn, amx);
+        worldAabb(*scene_, j, classes_[j], bmn, bmx);
+        const float pad = std::max(scene_->cpuObject(i).voxelSize, scene_->cpuObject(j).voxelSize) /
+                          VoxelScene::kFinePerCoarse;
+        if (PhysicsAabb{amn, amx}.expanded(pad).overlaps(PhysicsAabb{bmn, bmx}.expanded(pad)) &&
+            !std::binary_search(broadPairs_.begin(), broadPairs_.end(), std::pair<int, int>{i, j}))
+          throw std::runtime_error("Dynamic broad phase missed a collision pair");
       }
-      RigidBody& A = bodies_[static_cast<size_t>(i)];
-      RigidBody& B = bodies_[static_cast<size_t>(j)];
-      if (skipCollidePair(*scene_, A, B)) {
-        continue;
-      }
-      collidePair(*scene_, A, B, classes_[static_cast<size_t>(i)], classes_[static_cast<size_t>(j)],
-                  contacts);
     }
   }
+  static const bool disableContactCache = std::getenv("VE_DISABLE_CONTACT_CACHE") != nullptr;
+  const auto tBroad = std::chrono::steady_clock::now();
+  contactCache_.beginSubstep();
+  for (const auto& [i, j] : broadPairs_) {
+    auto stamp = [&](int slot) {
+      const auto& o = scene_->cpuObject(slot);
+      return ContactBodyStamp{scene_->objectIdAt(slot).generation, o.topologyRevision,
+                              o.voxelSize / VoxelScene::kFinePerCoarse};
+    };
+    const auto stats = contactCache_.collect(bodies_[i], bodies_[j], stamp(i), stamp(j), substepIndex_, contacts,
+      [&](std::vector<Contact>& out) {
+        collidePair(*scene_, bodies_[i], bodies_[j], classes_[i], classes_[j], out,
+                    &collisionPoses_[i], &collisionPoses_[j]);
+      }, !disableContactCache);
+    debug_.narrowPhasePairs += stats.generated;
+    debug_.reusedContactPairs += stats.reused;
+    debug_.warmStartedPoints += stats.warmPoints;
+  }
+  contactCache_.endSubstep();
   wakeFromTouchingContacts(contacts, kSubDt);
   const auto t1 = std::chrono::steady_clock::now();
+  debug_.broadPhaseMs += std::chrono::duration<float, std::milli>(tBroad - t0).count();
+  debug_.narrowPhaseMs += std::chrono::duration<float, std::milli>(t1 - tBroad).count();
   // Snapshot contact-point velocities before SI (NvBlast ExtImpactDamageManager
   // uses getVelocityAtPos for force = (n·Δv)*reducedMass). Post-solve Δv is ~0
   // here because kRestitution=0, so Impact Damage would otherwise always filter.
@@ -490,9 +575,13 @@ void PhysicsWorld::substep() {
     c.preVelB = B.v + glm::cross(B.w, c.rB);
   }
   solveContacts(bodies_, contacts, kSubDt, kContactIters);
+  contactCache_.store(contacts);
+  const auto tSolver = std::chrono::steady_clock::now();
   recordSubstepImpulses(contacts, substepIndex_);
   ++substepIndex_;
   const auto t2 = std::chrono::steady_clock::now();
+  debug_.solverOnlyMs += std::chrono::duration<float, std::milli>(tSolver - t1).count();
+  debug_.contactRecordMs += std::chrono::duration<float, std::milli>(t2 - tSolver).count();
   integrateBodies(bodies_, kSubDt);
   syncTransformsToScene();
   const auto t3 = std::chrono::steady_clock::now();
@@ -689,7 +778,7 @@ void PhysicsWorld::setFixedTickCallback(FixedPhysicsTickFn fn, void* user) {
   tickUser_ = user;
 }
 
-void PhysicsWorld::resetTickSession() { clock_.resetSession(); }
+void PhysicsWorld::resetTickSession() { clock_.resetSession(); contactCache_.clear(); }
 
 void PhysicsWorld::step(float frameDt) {
   const auto tRebuild0 = std::chrono::steady_clock::now();
@@ -713,11 +802,15 @@ void PhysicsWorld::step(float frameDt) {
   debug_.physicsTicksThisFrame = 0;
   clock_.advance(frameDt, [this](uint64_t id, float dt) {
     debug_.collideMs = 0.0f;
+    debug_.broadPhaseMs = debug_.narrowPhaseMs = debug_.solverOnlyMs = debug_.contactRecordMs = 0.0f;
     debug_.contactSolveMs = 0.0f;
     debug_.integrateMs = 0.0f;
     debug_.structureCallbackMs = 0.0f;
     debug_.awakeBodies = 0;
     debug_.occupiedBodies = 0;
+    debug_.narrowPhasePairs = 0;
+    debug_.reusedContactPairs = 0;
+    debug_.warmStartedPoints = 0;
     tickImpulses_.clear();
     substepIndex_ = 0;
     if (scene_) {

@@ -1,0 +1,41 @@
+report=C:/Users/win11/engine\docs\blast-e2-perf-engine.txt
+blast e2-perf D: same cylinder in VoxelScene + PhysicsWorld (no DDA draw)
+spawn...
+spawn ok
+warmup intact...
+## D intact standing, fracture off  n=12  occupiedBodies=3 awake=1 contacts=44 cand=0 actors=1 exports=1
+median update=20.813  commit=0.000  A solve=16.036  B probe=0.094  C stats=0.019 cand=0.000
+median collide=3.760  contactSolve=0.214  integrate=0.005  rebuild=0.000  struct-cb=16.971
+median engine-without-structure (D)=3.994 ms / tick
+cut 270...
+cut ok
+## D cut, fracture off  n=8  occupiedBodies=3 awake=1 contacts=44 cand=0 actors=1 exports=1
+median update=19.367  commit=0.000  A solve=13.389  B probe=0.091  C stats=0.017 cand=0.000
+median collide=4.361  contactSolve=0.236  integrate=0.007  rebuild=0.000  struct-cb=14.438
+median engine-without-structure (D)=4.618 ms / tick
+fracture on, wait split...
+## D cut + fail-S until first split  n=1  occupiedBodies=3 awake=1 contacts=44 cand=0 actors=118 exports=1
+median update=22.041  commit=56.927  A solve=16.373  B probe=0.093  C stats=0.019 cand=0.103
+median collide=4.262  contactSolve=0.228  integrate=0.008  rebuild=0.001  struct-cb=17.530
+median engine-without-structure (D)=61.438 ms / tick
+split=yes
+## D fragments after split  n=12  occupiedBodies=4 awake=2 contacts=42 cand=0 actors=2617 exports=1
+median update=10.482  commit=0.000  A solve=7.237  B probe=0.067  C stats=0.014 cand=0.030
+median collide=3.344  contactSolve=0.180  integrate=0.002  rebuild=0.001  struct-cb=7.830
+median engine-without-structure (D)=3.561 ms / tick
+OK e2-perf D
+live FPS: 1280x720 DDA + ImGui, wall-clock dt (same loop as the demo)
+present=MAILBOX (uncapped)
+## FPS intact, fracture off  n=30  median=44.65 fps  p95=25.86 fps  frame=22.39 ms (p95 38.67 max 43.17)
+  update=21.39  commit=0.00  draw=0.97  solve=17.86  probe=0.10  collide=0.04  struct-cb=18.03
+  last cand=0 actors=1 fractured=0 exports=1 awake=2 contacts=0
+## FPS intact, fracture + fail, before cut  n=30  median=432.24 fps  p95=31.72 fps  frame=2.31 ms (p95 31.53 max 36.93)
+  update=0.01  commit=0.00  draw=1.85  solve=0.47  probe=0.09  collide=0.09  struct-cb=0.65
+  last cand=0 actors=1 fractured=0 exports=1 awake=2 contacts=1
+## FPS cut + colors + fracture + fail cascade  n=45  median=58.63 fps  p95=50.41 fps  frame=17.06 ms (p95 19.84 max 21.80)
+  update=16.03  commit=0.00  draw=1.03  solve=15.74  probe=0.09  collide=0.11  struct-cb=15.86
+  last cand=0 actors=2 fractured=13 exports=1 awake=2 contacts=2
+## FPS cut + colors + fracture + fail after cascade  n=90  median=511.42 fps  p95=146.55 fps  frame=1.96 ms (p95 6.82 max 8.86)
+  update=0.01  commit=0.00  draw=1.93  solve=0.45  probe=0.10  collide=0.10  struct-cb=0.62
+  last cand=0 actors=2 fractured=13 exports=1 awake=2 contacts=2
+OK e2-perf live FPS

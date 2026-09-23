@@ -217,7 +217,6 @@ void VoxelScene::bindStructureTicks(GfxDevice& gfx) {
         }
         scene->structures_.onPhysicsTick(tickId, dt, imps.data(), static_cast<uint32_t>(imps.size()), kin.data(),
                                          static_cast<uint32_t>(kin.size()));
-        scene->structures_.applyPendingIfAny();
         // Materialize and rebind split actors before the next fixed physics tick,
         // including when a render frame runs multiple ticks.
         scene->physics_.syncTransformsToScene();
@@ -236,6 +235,7 @@ void VoxelScene::resetStructureSession() {
   physics_.resetTickSession();
   stressCylinderId_ = {};
   stressCylinderCut_ = false;
+  structureRemovals_.clear();
   stressCylinderDoubleDensity_ = false;
   stressCylinderDisplay_ = false;
   frameSpawnPosValid_ = false;
@@ -306,7 +306,81 @@ void VoxelScene::cleanup(GfxDevice& gfx) {
 
 // Fracture implementations live in VoxelSceneFracture.cpp.
 
+void VoxelScene::queueStructureRemoval(VoxelObjectId id, const std::vector<voxel::FineCoord>& fines) {
+  if (!structures_.ownsObject(id) || fines.empty()) {
+    return;
+  }
+  for (StructureRemoval& batch : structureRemovals_) {
+    if (batch.id == id) {
+      batch.fines.insert(batch.fines.end(), fines.begin(), fines.end());
+      return;
+    }
+  }
+  StructureRemoval batch;
+  batch.id = id;
+  batch.fines = fines;
+  structureRemovals_.push_back(std::move(batch));
+}
+
+void VoxelScene::noteStructureChild(VoxelObjectId parent, VoxelObjectId child) {
+  if (!child.valid()) {
+    return;
+  }
+  for (StructureRemoval& batch : structureRemovals_) {
+    if (batch.id == parent) {
+      batch.children.push_back(child);
+      return;
+    }
+  }
+  StructureRemoval batch;
+  batch.id = parent;
+  batch.children.push_back(child);
+  structureRemovals_.push_back(std::move(batch));
+}
+
+void VoxelScene::commitStructureRemovals() {
+  if (structureRemovals_.empty()) {
+    return;
+  }
+  for (const StructureRemoval& batch : structureRemovals_) {
+    std::vector<glm::ivec3> local;
+    local.reserve(batch.fines.size());
+    for (const voxel::FineCoord& f : batch.fines) {
+      local.push_back(glm::ivec3(f.x, f.y, f.z));
+    }
+    const blast::BlastError err =
+        structures_.applyOccupancyRemoval(batch.id, local.empty() ? nullptr : local.data(),
+                                          static_cast<uint32_t>(local.size()));
+    if (err == blast::BlastError::Ok) {
+      continue;
+    }
+    std::cerr << "Structure rebuild failed: " << structures_.lastError() << "\n";
+    for (VoxelObjectId child : batch.children) {
+      physics_.removeBody(child);
+      freeObjectSlot(child.slot);
+    }
+    VoxelObject* parent = tryGetObject(batch.id);
+    if (parent != nullptr) {
+      for (const voxel::FineCoord& f : batch.fines) {
+        glm::ivec3 c, m, fine;
+        splitFineIndex(f.x, f.y, f.z, c, m, fine);
+        if (!inBounds(*parent, c)) {
+          continue;
+        }
+        ensureCoarseBrick(*parent, c, 1u);
+        setFineCpu(*parent, c, m, fine, true);
+      }
+      parent->topologyRevision += 1;
+    }
+  }
+  structureRemovals_.clear();
+}
+
 void VoxelScene::update(float dt) {
+  commitStructureRemovals();
+  if (structureGfx_ != nullptr) {
+    commitStructureSplits(*structureGfx_);
+  }
   time_ += dt;
   for (VoxelObject& o : objects_) {
     if (!o.slotOccupied) {
@@ -2962,9 +3036,13 @@ void VoxelScene::handleEditInput(GLFWwindow* window, GfxDevice& gfx) {
   const uint32_t mat = static_cast<uint32_t>(std::clamp(brushMaterial_, 1, 255));
 
   std::vector<voxel::FineCoord> removed;
-  const bool wantFracture =
-      fractureEnabled_ && removeEdge && o.motionType == MotionType::Dynamic && o.slotOccupied;
-  std::vector<voxel::FineCoord>* removedOut = wantFracture ? &removed : nullptr;
+  const bool mounted = structures_.ownsObject(objectIdAt(objIndex));
+  // Mounted structures partition their rebuilt Blast graph and retain actor
+  // bindings; the generic fragment path intentionally has no stress ownership.
+  const bool wantFracture = fractureEnabled_ && removeEdge && o.slotOccupied &&
+                            o.motionType == MotionType::Dynamic && !mounted;
+  const bool trackStructure = mounted && removeEdge;
+  std::vector<voxel::FineCoord>* removedOut = (wantFracture || trackStructure) ? &removed : nullptr;
 
   int changed = 0;
   if (nestedMicroVoxels_ && nestedFineVoxels_ && (hit->hasFine || hit->hasMicro)) {
@@ -3032,6 +3110,9 @@ void VoxelScene::handleEditInput(GLFWwindow* window, GfxDevice& gfx) {
     recountOccupiedFine();
     flushObject(gfx, objIndex);
     notifyOccupancyChanged(objIndex);
+    if (trackStructure && !removed.empty()) {
+      queueStructureRemoval(objectIdAt(objIndex), removed);
+    }
     if (wantFracture && !removed.empty()) {
       enqueueFractureJob(objectIdAt(objIndex), std::move(removed));
     }

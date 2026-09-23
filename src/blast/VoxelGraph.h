@@ -162,6 +162,9 @@ struct VoxelStructureGraph {
 BlastError extractGraph(const VoxelGrid& grid, VoxelStructureGraph& graph, OwnerId ownerFilter);
 
 void breakBondFaces(VoxelGrid& grid, const GraphBond& bond);
+// Clears one structure-grid voxel and records faces shared with neighbors that stay solid.
+// Returns false when the voxel was already empty.
+bool markRemovedVoxel(VoxelGrid& grid, int x, int y, int z);
 float bondAgeo(const GraphBond& b, float voxelSize);
 float bondAeff(const GraphBond& b, float voxelSize);
 
@@ -217,6 +220,6 @@ struct RebuildResult {
 // Each owner currently copies the full dense grid; sparse local rebuild is not this round.
 RebuildResult compactReplace(TrackingAllocator& alloc, VoxelGrid& grid, VoxelStructureGraph& oldGraph,
                              VoxelBlast& oldBlast, std::vector<CompactFamily>& out, float strengthPa,
-                             const CompactReplaceOpts& opts = {});
+                             const CompactReplaceOpts& opts = {}, uint32_t solverIters = 50);
 
 }  // namespace blast

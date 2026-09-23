@@ -1,5 +1,7 @@
 #include "blast/VoxelGraph.h"
 
+#include "blast/OccupancySampler.h"
+
 #include "NvBlastGlobals.h"
 #include "NvBlastTypes.h"
 #include "NvCTypes.h"
@@ -538,6 +540,24 @@ BlastError extractGraph(const VoxelGrid& grid, VoxelStructureGraph& graph, Owner
   return BlastError::Ok;
 }
 
+bool markRemovedVoxel(VoxelGrid& grid, int x, int y, int z) {
+  if (!grid.isSolid(x, y, z)) {
+    return false;
+  }
+  for (int d = 0; d < 6; ++d) {
+    const int nx = x + kDx[d];
+    const int ny = y + kDy[d];
+    const int nz = z + kDz[d];
+    if (!grid.isSolid(nx, ny, nz)) {
+      continue;
+    }
+    grid.brokenFaces.insert(faceBetween(x, y, z, nx, ny, nz));
+  }
+  grid.setSolid(x, y, z, false);
+  grid.setAnchor(x, y, z, false);
+  return true;
+}
+
 void breakBondFaces(VoxelGrid& grid, const GraphBond& bond) {
   for (uint64_t f : bond.faces) {
     grid.brokenFaces.insert(f);
@@ -791,7 +811,7 @@ BlastError stampOwnersFromActors(VoxelGrid& grid, const VoxelStructureGraph& gra
 
 RebuildResult compactReplace(TrackingAllocator& alloc, VoxelGrid& grid, VoxelStructureGraph& oldGraph,
                              VoxelBlast& oldBlast, std::vector<CompactFamily>& out, float strengthPa,
-                             const CompactReplaceOpts& opts) {
+                             const CompactReplaceOpts& opts, uint32_t solverIters) {
   RebuildResult result;
   if (oldBlast.family == nullptr || oldBlast.asset == nullptr) {
     result.error = BlastError::FamilyCreateFailed;
@@ -851,6 +871,15 @@ RebuildResult compactReplace(TrackingAllocator& alloc, VoxelGrid& grid, VoxelStr
     cf.owner = o;
     // Full dense copy per owner. Sparse local rebuild is intentionally not this round.
     cf.grid = working;
+    // A replacement owns only its actor's occupancy. Keeping other actors' solids
+    // here makes the next owner-stamping pass reject them as unowned.
+    for (size_t i = 0; i < cf.grid.solid.size(); ++i) {
+      if (cf.grid.owner[i] != o) {
+        cf.grid.solid[i] = 0;
+        cf.grid.anchor[i] = 0;
+        cf.grid.owner[i] = kUnowned;
+      }
+    }
     cf.graph = oldGraph;
     cf.graph.nextStable = nextNode;
     cf.graph.nextBondId = nextBond;
@@ -863,7 +892,27 @@ RebuildResult compactReplace(TrackingAllocator& alloc, VoxelGrid& grid, VoxelStr
     if (cf.graph.nodes.empty()) {
       continue;
     }
-    const BlastError ce = createVoxelBlast(alloc, cf.graph, cf.grid, cf.blast, strengthPa);
+    bool anyAnchor = false;
+    for (const GraphNode& n : cf.graph.nodes) {
+      for (const VoxelCoord& p : n.voxels) {
+        if (cf.grid.isAnchor(p.x, p.y, p.z)) {
+          anyAnchor = true;
+          break;
+        }
+      }
+      if (anyAnchor) {
+        break;
+      }
+    }
+    if (anyAnchor) {
+      const BlastError ae = attachWorldBonds(cf.grid, cf.graph);
+      if (ae != BlastError::Ok && ae != BlastError::NotAnchored) {
+        result.error = ae;
+        result.message = blastErrorMessage(ae);
+        return result;
+      }
+    }
+    const BlastError ce = createVoxelBlast(alloc, cf.graph, cf.grid, cf.blast, strengthPa, solverIters);
     if (ce != BlastError::Ok) {
       result.error = ce;
       result.message = blastErrorMessage(ce);

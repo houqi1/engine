@@ -50,7 +50,8 @@ constexpr float kBaumgarte = 0.2f;
 constexpr float kRestitution = 0.0f;
 constexpr float kFriction = 0.5f;
 // One TGS substep still needs several SI passes so 4 simultaneous
-// corners can share the impact (Catto). Collision is still rebuilt each hSub.
+// corners can share the impact (Catto). Slow unchanged pairs reuse geometry
+// within a tick; each tick starts with a fresh manifold and cached impulses.
 constexpr int kContactIters = 8;
 
 constexpr float kSleepLin = 0.05f;
@@ -74,11 +75,12 @@ struct Contact {
   int nFace = 2;
   uint32_t fineA = 0;
   uint32_t fineB = 0;
+  uint32_t cachePoint = 0xFFFFFFFFu;
   float lambdaN = 0.0f;
   float lambdaT = 0.0f;
   // Collision-only normal impulse on A (excludes Baumgarte position correction).
   float lambdaNVel = 0.0f;
-  // Accumulated world-space friction impulse on A (sum of dLamT * t each iteration).
+  // Current-substep friction impulse on A (warm seed plus solver corrections).
   glm::vec3 JtWorld{0.0f};
   // Contact-point velocities before solveContacts. ExtImpactDamageManager builds
   // Viewer force from getVelocityAtPos; with kRestitution=0, post-solve Δv~0, so
@@ -114,12 +116,19 @@ struct DebugSolve {
   // Last physics tick only. Structure callback is timed separately from collide/solve.
   float rebuildMs = 0.0f;
   float collideMs = 0.0f;
+  float broadPhaseMs = 0.0f;
+  float narrowPhaseMs = 0.0f;
+  float solverOnlyMs = 0.0f;
+  float contactRecordMs = 0.0f;
   float contactSolveMs = 0.0f;
   float integrateMs = 0.0f;
   float structureCallbackMs = 0.0f;
   int awakeBodies = 0;
   int occupiedBodies = 0;
   int physicsTicksThisFrame = 0;
+  int narrowPhasePairs = 0;
+  int reusedContactPairs = 0;
+  int warmStartedPoints = 0;
 };
 
 inline uint32_t packFine(int x, int y, int z, int n) {

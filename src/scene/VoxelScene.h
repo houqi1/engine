@@ -271,6 +271,7 @@ public:
   // After beginFrame: upload stress or bond-damage colors without waitIdle.
   void refreshStressColors(GfxDevice& gfx);
   void commitStructureSplits(GfxDevice& gfx);
+  void commitStructureSplit(GfxDevice& gfx, blast::StructureInstance& inst);
   bool stressCylinderCut() const { return stressCylinderCut_; }
   bool stressCylinderDoubleDensity() const { return stressCylinderDoubleDensity_; }
   bool stressCylinderDisplay() const { return stressCylinderDisplay_; }
@@ -385,7 +386,16 @@ private:
     int objectIndex_ = -1;
   };
 
+  struct StructureRemoval {
+    VoxelObjectId id{};
+    std::vector<voxel::FineCoord> fines;
+    std::vector<VoxelObjectId> children;
+  };
+
   void enqueueFractureJob(VoxelObjectId id, std::vector<voxel::FineCoord> removed);
+  void queueStructureRemoval(VoxelObjectId id, const std::vector<voxel::FineCoord>& fines);
+  void noteStructureChild(VoxelObjectId parent, VoxelObjectId child);
+  void commitStructureRemovals();
   bool commitFractureJob(GfxDevice& gfx, FractureJob& job);
   bool extractFragmentFromMasks(GfxDevice& gfx, VoxelObject& parent, int parentIndex,
                                 const voxel::FinalizedComponent& comp, VoxelObjectId parentId,
@@ -397,7 +407,7 @@ private:
   bool commitOccupancySplit(GfxDevice& gfx, VoxelObjectId parentId,
                             const std::vector<std::vector<voxel::FineCoord>>& islands,
                             const std::vector<uint8_t>& anchored,
-                            const std::vector<NvBlastActor*>& actors = {});
+                            const std::vector<NvBlastActor*>& actors, blast::StructureInstance& inst);
   VoxelObjectId objectOwningFamilyFine(const glm::ivec3& absFine) const;
   bool familyFinesOnObject(VoxelObjectId id, const std::vector<voxel::FineCoord>& fines) const;
   glm::dvec3 computeLocalCom(int objectIndex) const;
@@ -500,6 +510,7 @@ private:
 
   bool fractureEnabled_ = true;
   std::vector<FractureJob> fractureJobs_;
+  std::vector<StructureRemoval> structureRemovals_;
   // Debris smaller than this many fines is deleted instead of becoming a body.
   static constexpr uint32_t kMinFragmentFines = 8;
   uint32_t gpuResourceSerial_ = 1;

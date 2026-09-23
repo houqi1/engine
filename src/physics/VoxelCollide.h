@@ -9,8 +9,15 @@ class VoxelScene;
 
 namespace physics {
 
+struct CollisionPose {
+  glm::vec3 min{0}, max{0};
+  glm::mat4 toWorld{1}, toLocal{1};
+  float fineSize = 0;
+};
+
 void collidePair(VoxelScene& scene, const RigidBody& a, const RigidBody& b, const ShapeClass& ca,
-                 const ShapeClass& cb, std::vector<Contact>& out);
+                 const ShapeClass& cb, std::vector<Contact>& out,
+                 const CollisionPose* poseA = nullptr, const CollisionPose* poseB = nullptr);
 
 bool worldAabb(const VoxelScene& scene, int objectIndex, const ShapeClass& sc, glm::vec3& wmn,
                glm::vec3& wmx);

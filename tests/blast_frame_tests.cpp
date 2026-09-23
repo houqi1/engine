@@ -367,6 +367,7 @@ void testRoofLandingSecondarySplit(blast::BlastRuntime& rt) {
   world.setImpactDamageEnabled(true);
   world.setStressImpactImpulses(false);
   blast::ImpactSettings impact = world.impactSettings();
+  impact.model = blast::ImpactModel::Viewer;  // Pins Viewer force magnitudes.
   impact.shearDamage = false;  // Explicitly exercise Viewer's ImpactSpread option.
   world.setImpactSettings(impact);
   driveUntilConverged(world, 24);
@@ -517,6 +518,7 @@ void testRoofLandingSecondarySplit(blast::BlastRuntime& rt) {
     w2.setImpactDamageEnabled(true);
     w2.setStressImpactImpulses(false);
     blast::ImpactSettings is = w2.impactSettings();
+    is.model = blast::ImpactModel::Viewer;
     is.shearDamage = false;
     w2.setImpactSettings(is);
     driveUntilConverged(w2, 24);
@@ -621,6 +623,7 @@ void testRoofLandingSecondarySplit(blast::BlastRuntime& rt) {
     w3.setImpactDamageEnabled(true);
     w3.setStressImpactImpulses(false);
     blast::ImpactSettings is = w3.impactSettings();
+    is.model = blast::ImpactModel::Viewer;
     is.shearDamage = false;
     w3.setImpactSettings(is);
     driveUntilConverged(w3, 24);

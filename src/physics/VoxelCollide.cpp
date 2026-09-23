@@ -1,10 +1,12 @@
 #include "physics/VoxelCollide.h"
+#include "physics/FineFeatureQuery.h"
 
 #include "scene/VoxelScene.h"
 
 #include <glm/gtc/matrix_inverse.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <vector>
 
@@ -162,16 +164,9 @@ void testList(const VoxelScene& scene, const RigidBody& a, const RigidBody& b,
     return;
   }
   const int n = ca.fineN;
-  for (int z = box.mn.z; z <= box.mx.z; ++z) {
-    for (int y = box.mn.y; y <= box.mx.y; ++y) {
-      const uint32_t lo = packFine(box.mn.x, y, z, n);
-      const uint32_t hi = packFine(box.mx.x, y, z, n);
-      auto it = std::lower_bound(ids.begin(), ids.end(), lo);
-      for (; it != ids.end() && *it <= hi; ++it) {
-        considerContact(scene, a, b, oa, ob, unpackFine(*it, n), a2w, b2w, b2o, out);
-      }
-    }
-  }
+  queryFineFeatures(ids, n, box.mn, box.mx, [&](uint32_t id) {
+    considerContact(scene, a, b, oa, ob, unpackFine(id, n), a2w, b2w, b2o, out);
+  });
 }
 
 void transformAabb(const glm::mat4& m, const glm::vec3& mn, const glm::vec3& mx, glm::vec3& wmn,
@@ -208,9 +203,11 @@ void reduceBucket(std::vector<Contact>& points) {
   const glm::vec3 n = points[0].n;
   const float bias = 0.95f;
   const float tolSqr = kSlop * kSlop;
-  std::vector<Contact> work = points;
-  std::vector<Contact> kept;
-  kept.reserve(4);
+  // Reduction already discards candidates. Consume its bucket in place and
+  // keep the four winners on the stack, avoiding a full contact copy/allocation.
+  std::vector<Contact>& work = points;
+  std::array<Contact, 4> kept;
+  size_t keptCount = 0;
 
   const glm::vec3 searchDir = arbitraryPerp(n);
   int bestIndex = -1;
@@ -234,7 +231,7 @@ void reduceBucket(std::vector<Contact>& points) {
       }
     }
   }
-  kept.push_back(work[static_cast<size_t>(bestIndex)]);
+  kept[keptCount++] = work[static_cast<size_t>(bestIndex)];
   work[static_cast<size_t>(bestIndex)] = work.back();
   work.pop_back();
   const glm::vec3 a = kept[0].p;
@@ -253,10 +250,10 @@ void reduceBucket(std::vector<Contact>& points) {
     }
   }
   if (bestIndex < 0 || bestScore < tolSqr) {
-    points.swap(kept);
+    points.assign(kept.begin(), kept.begin() + keptCount);
     return;
   }
-  kept.push_back(work[static_cast<size_t>(bestIndex)]);
+  kept[keptCount++] = work[static_cast<size_t>(bestIndex)];
   work[static_cast<size_t>(bestIndex)] = work.back();
   work.pop_back();
   const glm::vec3 bpt = kept[1].p;
@@ -276,10 +273,10 @@ void reduceBucket(std::vector<Contact>& points) {
     }
   }
   if (bestIndex < 0) {
-    points.swap(kept);
+    points.assign(kept.begin(), kept.begin() + keptCount);
     return;
   }
-  kept.push_back(work[static_cast<size_t>(bestIndex)]);
+  kept[keptCount++] = work[static_cast<size_t>(bestIndex)];
   work[static_cast<size_t>(bestIndex)] = work.back();
   work.pop_back();
   const glm::vec3 cpt = kept[2].p;
@@ -299,34 +296,32 @@ void reduceBucket(std::vector<Contact>& points) {
     }
   }
   if (bestIndex >= 0) {
-    kept.push_back(work[static_cast<size_t>(bestIndex)]);
+    kept[keptCount++] = work[static_cast<size_t>(bestIndex)];
   }
-  points.swap(kept);
+  points.assign(kept.begin(), kept.begin() + keptCount);
 }
 
 void reducePairContacts(std::vector<Contact>& out, size_t before) {
   if (out.size() <= before) {
     return;
   }
-  std::vector<Contact> src(out.begin() + static_cast<std::ptrdiff_t>(before), out.end());
+  // Two probing directions x six face normals. Preserve first-seen bucket
+  // order and point order exactly, while retaining capacity between pairs.
+  thread_local std::array<std::vector<Contact>, 12> buckets;
+  std::array<int, 12> order;
+  int count = 0;
+  for (auto& bucket : buckets) bucket.clear();
+  const int firstB = out[before].b;
+  for (size_t i = before; i < out.size(); ++i) {
+    const Contact& c = out[i];
+    const int index = (c.b == firstB ? 0 : 6) + c.nFace;
+    auto& bucket = buckets[static_cast<size_t>(index)];
+    if (bucket.empty()) order[count++] = index;
+    bucket.push_back(c);
+  }
   out.resize(before);
-  std::vector<char> done(src.size(), 0);
-  for (size_t i = 0; i < src.size(); ++i) {
-    if (done[i]) {
-      continue;
-    }
-    std::vector<Contact> bucket;
-    bucket.push_back(src[i]);
-    done[i] = 1;
-    for (size_t j = i + 1; j < src.size(); ++j) {
-      if (done[j]) {
-        continue;
-      }
-      if (src[j].b == src[i].b && src[j].nFace == src[i].nFace) {
-        bucket.push_back(src[j]);
-        done[j] = 1;
-      }
-    }
+  for (int i = 0; i < count; ++i) {
+    auto& bucket = buckets[static_cast<size_t>(order[i])];
     reduceBucket(bucket);
     out.insert(out.end(), bucket.begin(), bucket.end());
   }
@@ -359,15 +354,16 @@ bool worldAabb(const VoxelScene& scene, int objectIndex, const ShapeClass& sc, g
 }
 
 void collidePair(VoxelScene& scene, const RigidBody& a, const RigidBody& b, const ShapeClass& ca,
-                 const ShapeClass& cb, std::vector<Contact>& out) {
+                 const ShapeClass& cb, std::vector<Contact>& out,
+                 const CollisionPose* poseA, const CollisionPose* poseB) {
   if (a.shapeIndex < 0 || b.shapeIndex < 0 || a.shapeIndex == b.shapeIndex) {
     return;
   }
   glm::vec3 amn, amx, bmn, bmx;
-  if (!worldAabb(scene, a.shapeIndex, ca, amn, amx) ||
-      !worldAabb(scene, b.shapeIndex, cb, bmn, bmx)) {
-    return;
-  }
+  if (poseA) { amn = poseA->min; amx = poseA->max; }
+  else if (!worldAabb(scene, a.shapeIndex, ca, amn, amx)) return;
+  if (poseB) { bmn = poseB->min; bmx = poseB->max; }
+  else if (!worldAabb(scene, b.shapeIndex, cb, bmn, bmx)) return;
   const VoxelObject& oa = scene.cpuObject(a.shapeIndex);
   const VoxelObject& ob = scene.cpuObject(b.shapeIndex);
   // 6-neighbor probe sees one fine cell outside the occupancy AABB.
@@ -386,10 +382,10 @@ void collidePair(VoxelScene& scene, const RigidBody& a, const RigidBody& b, cons
     return;
   }
 
-  const glm::mat4 a2w = oa.objectToWorld();
-  const glm::mat4 b2w = ob.objectToWorld();
-  const glm::mat4 a2o = glm::inverse(a2w);
-  const glm::mat4 b2o = glm::inverse(b2w);
+  const glm::mat4 a2w = poseA ? poseA->toWorld : oa.objectToWorld();
+  const glm::mat4 b2w = poseB ? poseB->toWorld : ob.objectToWorld();
+  const glm::mat4 a2o = poseA ? poseA->toLocal : glm::inverse(a2w);
+  const glm::mat4 b2o = poseB ? poseB->toLocal : glm::inverse(b2w);
   glm::vec3 overlapInA_mn, overlapInA_mx, overlapInB_mn, overlapInB_mx;
   transformAabb(a2o, overlapMn, overlapMx, overlapInA_mn, overlapInA_mx);
   transformAabb(b2o, overlapMn, overlapMx, overlapInB_mn, overlapInB_mx);

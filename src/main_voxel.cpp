@@ -821,6 +821,15 @@ void runFrameFail(GfxDevice& gfx, VoxelScene& scene, PerfLog& out, const Options
                   st.candidateCount, st.fracturedBonds, st.splitActors, st.fractureEnabled ? 1 : 0,
                   (inst && inst->keepBox) ? 1 : 0, st.cut ? 1 : 0, enabled, st.nodes, st.bonds);
     out.line(line);
+    const auto phys = scene.physicsDebug();
+    std::snprintf(line, sizeof(line), "contact-cache narrow=%d reuse=%d warm=%d collideMs=%.4f solveMs=%.4f",
+                  phys.narrowPhasePairs, phys.reusedContactPairs, phys.warmStartedPoints,
+                  phys.collideMs, phys.contactSolveMs);
+    out.line(line);
+    std::snprintf(line, sizeof(line), "physics-stages broad=%.4f narrow=%.4f solver=%.4f record=%.4f structure=%.4f rebuild=%.4f awake=%d contacts=%d",
+                  phys.broadPhaseMs, phys.narrowPhaseMs, phys.solverOnlyMs, phys.contactRecordMs,
+                  phys.structureCallbackMs, phys.rebuildMs, phys.awakeBodies, phys.contacts);
+    out.line(line);
   };
   auto ticks = [&](int n) {
     for (int i = 0; i < n; ++i) {

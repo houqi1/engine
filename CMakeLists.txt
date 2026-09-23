@@ -145,6 +145,18 @@ target_compile_features(voxel_connectivity_tests PRIVATE cxx_std_20)
 
 include(cmake/NvBlast.cmake)
 
+add_executable(dynamic_aabb_tree_tests tests/dynamic_aabb_tree_tests.cpp)
+target_include_directories(dynamic_aabb_tree_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(dynamic_aabb_tree_tests PRIVATE glm::glm)
+
+add_executable(contact_cache_tests tests/contact_cache_tests.cpp src/physics/Solver.cpp)
+target_include_directories(contact_cache_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(contact_cache_tests PRIVATE glm::glm)
+
+add_executable(fine_feature_query_tests tests/fine_feature_query_tests.cpp)
+target_include_directories(fine_feature_query_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(fine_feature_query_tests PRIVATE glm::glm)
+
 add_library(ve_structure_core STATIC
   src/blast/BlastMemory.cpp
   src/blast/VoxelGraph.cpp

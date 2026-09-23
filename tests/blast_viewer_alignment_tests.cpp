@@ -33,6 +33,7 @@ bool mount(blast::StructureWorld& world, blast::BlastRuntime& rt, bool shear = f
   if (!world.init(rt) || world.mountSample(body, blast::sampleOccupancy(bar, opts), 100,
                                           5.0e7f, 0.0f, 0.0f) != blast::BlastError::Ok) return false;
   blast::ImpactSettings settings;
+  settings.model = blast::ImpactModel::Viewer;  // These tests pin the Viewer contact grouping.
   settings.shearDamage = shear;
   settings.damageRadiusMax = 100.0f; // All bonds receive the same radial fraction.
   world.setImpactSettings(settings);
@@ -60,6 +61,8 @@ void checkFractions(blast::StructureWorld& world, float remaining) {
   float minArea = 1.0f, maxArea = 0.0f;
   for (uint32_t i = 0; i < inst->bondMeta.size(); ++i) {
     if (inst->bondMeta[i].world) continue;
+    if (std::abs(health[i] / bonds[i].area - remaining) >= 0.0001f)
+      std::cerr << "bond " << i << " remaining=" << health[i] / bonds[i].area << " expected=" << remaining << '\n';
     expect(std::abs(health[i] / bonds[i].area - remaining) < 0.0001f,
            "Viewer normalized damage preserves remaining-health fraction");
     minArea = std::min(minArea, bonds[i].area);
@@ -165,6 +168,42 @@ void testShaderFractionEquivalence(blast::BlastRuntime& rt) {
     world.clear();
   }
 }
+// BodyPair: one event per body pair per tick, damage = (|F| / actor mass) / fullDamageDeltaV.
+void testBodyPairModel(blast::BlastRuntime& rt) {
+  for (int scenario = 0; scenario < 4; ++scenario) {
+    blast::StructureWorld world;
+    expect(mount(world, rt), "mount body-pair fixture");
+    blast::ImpactSettings s = world.impactSettings();
+    s.model = blast::ImpactModel::BodyPair;
+    s.fullDamageDeltaV = 25.0f;
+    world.setImpactSettings(s);
+    const float actorMass = world.bindings().front().mass;
+    expect(actorMass > 0.0f, "binding carries actor mass");
+    auto a = hit(world);
+    a.massA = actorMass;
+    a.velA = {0.0f, -5.0f, 0.0f};  // dv 5 / 25 = 0.2 of health.
+    auto b = a;
+    if (scenario == 1) b = hit(world, 0.7f), b.massA = actorMass, b.velA = a.velA;  // other node
+    if (scenario == 2) b.substep = 1;                                              // other substep
+    if (scenario == 3) b.velA = {0.0f, -2.5f, 0.0f};  // weaker contact must not dilute the strongest
+    const blast::WorldContactImpulse contacts[]{a, b};
+    world.onPhysicsTick(1, physics::kDt, contacts, 2);
+    checkFractions(world, 0.8f);  // Never multiplied by contact count, never averaged down.
+    world.clear();
+  }
+  // A velocity change below damageThresholdMin (0.1 of health) does nothing.
+  blast::StructureWorld world;
+  expect(mount(world, rt), "mount body-pair scale fixture");
+  blast::ImpactSettings s = world.impactSettings();
+  s.model = blast::ImpactModel::BodyPair;
+  world.setImpactSettings(s);
+  auto a = hit(world);
+  a.massA = world.bindings().front().mass;
+  a.velA = {0.0f, -1.25f, 0.0f};  // dv 1.25 / 25 = 0.05 < 0.1 threshold.
+  world.onPhysicsTick(1, physics::kDt, &a, 1);
+  checkFractions(world, 1.0f);
+  world.clear();
+}
 } // namespace
 
 int main() {
@@ -175,6 +214,7 @@ int main() {
   testContactGroups(rt);
   testAccumulationAndRouting(rt);
   testShaderFractionEquivalence(rt);
+  testBodyPairModel(rt);
   expect(rt.errorCount() == 0, "no Blast errors");
   rt.shutdown();
   if (!failures) std::cout << "OK Viewer damage fractions, shape pairs, substeps, routing and shaders\n";

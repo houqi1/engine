@@ -683,6 +683,7 @@ void testImpactSpreadBeatsShearOnThinSlab(blast::BlastRuntime& rt) {
     expect(world.mountSample(id, std::move(sample), 50, 1.0e6f, 0.0f, 0.0f) == blast::BlastError::Ok,
            shear ? "mount shear" : "mount spread");
     blast::ImpactSettings s = world.impactSettings();
+    s.model = blast::ImpactModel::Viewer;  // Pins Viewer force magnitudes.
     s.shearDamage = shear;
     world.setImpactSettings(s);
     world.setImpactDamageEnabled(true);

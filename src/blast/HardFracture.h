@@ -266,7 +266,10 @@ inline void applySdkBondDamage(NvBlastActor* actor, const NvBlastAsset* asset, c
   NvBlastActorApplyFracture(nullptr, actor, &buf, logFn, nullptr);
 }
 
-inline uint32_t splitAllRequired(NvBlastFamily* family, Nv::Blast::ExtStressSolver& solver, NvBlastLog logFn) {
+inline uint32_t splitAllRequired(NvBlastFamily* family, Nv::Blast::ExtStressSolver& solver, NvBlastLog logFn,
+                                 bool force = false) {
+  // Freshly rebuilt assets can already have disconnected islands without the
+  // damage-driven IsSplitRequired hint. Force their initial partition once.
   if (family == nullptr) {
     return 0;
   }
@@ -275,7 +278,7 @@ inline uint32_t splitAllRequired(NvBlastFamily* family, Nv::Blast::ExtStressSolv
   NvBlastFamilyGetActors(list.data(), nA, family, logFn);
   for (uint32_t i = 0; i < nA; ++i) {
     NvBlastActor* actor = list[i];
-    if (actor == nullptr || !NvBlastActorIsSplitRequired(actor, logFn)) {
+    if (actor == nullptr || (!force && !NvBlastActorIsSplitRequired(actor, logFn))) {
       continue;
     }
     solver.notifyActorDestroyed(*actor);
@@ -285,6 +288,9 @@ inline uint32_t splitAllRequired(NvBlastFamily* family, Nv::Blast::ExtStressSolv
     ev.newActors = created.data();
     std::vector<char> scratch(NvBlastActorGetRequiredScratchForSplit(actor, logFn));
     const uint32_t nNew = NvBlastActorSplit(&ev, actor, maxNew, scratch.data(), logFn, nullptr);
+    if (nNew == 0) {
+      solver.notifyActorCreated(*actor);
+    }
     for (uint32_t k = 0; k < nNew && k < maxNew; ++k) {
       if (created[k] != nullptr) {
         solver.notifyActorCreated(*created[k]);

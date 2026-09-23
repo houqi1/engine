@@ -99,6 +99,210 @@ void StructureWorld::unmount(VoxelObjectId objectId) {
                    instances_.end());
 }
 
+bool StructureWorld::ownsObject(VoxelObjectId objectId) const {
+  if (!objectId.valid()) {
+    return false;
+  }
+  for (const StructureInstance& inst : instances_) {
+    if (inst.objectId == objectId) {
+      return true;
+    }
+    for (const ActorBinding& b : inst.bindings) {
+      if (b.objectId == objectId) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+const std::vector<ActorBinding>& StructureWorld::bindings() const {
+  bindingCache_.clear();
+  for (const StructureInstance& inst : instances_) {
+    bindingCache_.insert(bindingCache_.end(), inst.bindings.begin(), inst.bindings.end());
+  }
+  return bindingCache_;
+}
+
+BlastError StructureWorld::applyOccupancyRemoval(VoxelObjectId objectId, const glm::ivec3* localFines,
+                                                 uint32_t count) {
+  lastError_ = "ok";
+  if (count == 0 || localFines == nullptr || !initialized_ || runtime_ == nullptr) {
+    return BlastError::Ok;
+  }
+  size_t index = instances_.size();
+  glm::ivec3 origin(0);
+  for (size_t i = 0; i < instances_.size(); ++i) {
+    const StructureInstance& inst = instances_[i];
+    if (inst.objectId == objectId) {
+      index = i;
+      break;
+    }
+    for (const ActorBinding& b : inst.bindings) {
+      if (b.objectId == objectId) {
+        index = i;
+        origin = b.fineOrigin;
+        break;
+      }
+    }
+    if (index != instances_.size()) {
+      break;
+    }
+  }
+  if (index >= instances_.size()) {
+    return BlastError::Ok;
+  }
+  StructureInstance& inst = instances_[index];
+  if (inst.objectId == objectId) {
+    for (const ActorBinding& b : inst.bindings) {
+      if (b.objectId == objectId) {
+        origin = b.fineOrigin;
+        break;
+      }
+    }
+  }
+  if (inst.blast.family == nullptr || inst.blast.asset == nullptr) {
+    lastError_ = "old family missing";
+    return BlastError::FamilyCreateFailed;
+  }
+
+  syncBondDamageFromHealth(inst);
+  VoxelGrid edited = inst.grid;
+  uint32_t cleared = 0;
+  for (uint32_t i = 0; i < count; ++i) {
+    const glm::ivec3 abs = localFines[i] + origin;
+    if (markRemovedVoxel(edited, abs.x, abs.y, abs.z)) {
+      ++cleared;
+    }
+  }
+  if (cleared == 0) {
+    return BlastError::Ok;
+  }
+
+  std::vector<VoxelObjectId> ownerObject(1);
+  std::vector<glm::ivec3> ownerOrigin(1);
+  std::vector<int> ownerFineN(1);
+  const uint32_t nA = NvBlastFamilyGetActorCount(inst.blast.family, blastLog);
+  std::vector<NvBlastActor*> actors(nA, nullptr);
+  NvBlastFamilyGetActors(actors.data(), nA, inst.blast.family, blastLog);
+  for (uint32_t i = 0; i < nA; ++i) {
+    NvBlastActor* actor = actors[i];
+    if (actor == nullptr || NvBlastActorGetVisibleChunkCount(actor, blastLog) == 0) {
+      continue;
+    }
+    VoxelObjectId id = inst.objectId;
+    glm::ivec3 org(0);
+    int fineN = 0;
+    for (const ActorBinding& b : inst.bindings) {
+      if (b.actor == actor) {
+        id = b.objectId.valid() ? b.objectId : id;
+        org = b.fineOrigin;
+        fineN = b.fineN;
+        break;
+      }
+    }
+    ownerObject.push_back(id);
+    ownerOrigin.push_back(org);
+    ownerFineN.push_back(fineN);
+  }
+
+  const float strength = inst.strengthPa;
+  const uint32_t iters = inst.solverIters;
+  const bool fracture = inst.fractureEnabled;
+  const uint64_t strengthEpoch = inst.strengthEpoch;
+  const float axisX = inst.axisX;
+  const float axisZ = inst.axisZ;
+  const float keepAz0 = inst.keepAz0;
+  const float keepAz1 = inst.keepAz1;
+  const bool keepBox = inst.keepBox;
+  const float keepX0 = inst.keepX0;
+  const float keepX1 = inst.keepX1;
+  const float keepZ0 = inst.keepZ0;
+  const float keepZ1 = inst.keepZ1;
+  const bool cut = inst.cutApplied;
+
+  std::vector<CompactFamily> families;
+  const RebuildResult rebuilt =
+      compactReplace(runtime_->allocator(), edited, inst.graph, inst.blast, families, strength, {}, iters);
+  if (!rebuilt) {
+    lastError_ = rebuilt.message != nullptr ? rebuilt.message : "rebuild failed";
+    return rebuilt.error;
+  }
+
+  instances_.erase(instances_.begin() + static_cast<std::ptrdiff_t>(index));
+  if (families.empty()) {
+    std::cout << "Structure rebuild: occupancy empty, family released\n";
+    return BlastError::Ok;
+  }
+  for (CompactFamily& cf : families) {
+    StructureInstance neu;
+    const bool known = cf.owner < ownerObject.size();
+    neu.objectId = known && ownerObject[cf.owner].valid() ? ownerObject[cf.owner] : objectId;
+    const glm::ivec3 org = known ? ownerOrigin[cf.owner] : origin;
+    neu.grid = std::move(cf.grid);
+    neu.graph = std::move(cf.graph);
+    neu.blast = std::move(cf.blast);
+    neu.fractureEnabled = fracture;
+    neu.strengthPa = strength;
+    neu.strengthEpoch = strengthEpoch == 0 ? 1 : strengthEpoch;
+    neu.solverIters = iters == 0 ? 200u : iters;
+    neu.axisX = axisX;
+    neu.axisZ = axisZ;
+    neu.keepAz0 = keepAz0;
+    neu.keepAz1 = keepAz1;
+    neu.keepBox = keepBox;
+    neu.keepX0 = keepX0;
+    neu.keepX1 = keepX1;
+    neu.keepZ0 = keepZ0;
+    neu.keepZ1 = keepZ1;
+    neu.cutApplied = cut;
+    neu.pending.valid = false;
+    if (neu.blast.solver != nullptr) {
+      applyExtStressStrength(*neu.blast.solver, strength);
+    }
+    rebuildBondMeta(neu);
+    splitAllRequired(&neu, true);
+    for (ActorBinding& b : neu.bindings) {
+      b.objectId = neu.objectId;
+      b.fineOrigin = org;
+      b.fineN = known ? ownerFineN[cf.owner] : 0;
+      fillBindingKinematics(neu, b);
+    }
+    uint32_t worldBonds = 0;
+    float mass = 0.0f;
+    uint32_t occupied = 0;
+    for (const GraphBond& b : neu.graph.bonds) {
+      if (b.world) {
+        ++worldBonds;
+      }
+    }
+    for (const GraphNode& n : neu.graph.nodes) {
+      mass += n.mass;
+      occupied += static_cast<uint32_t>(n.voxels.size());
+    }
+    neu.occupiedCached = occupied;
+    neu.debug.hasInstance = true;
+    neu.debug.status = "rebuilt";
+    neu.debug.occupied = occupied;
+    neu.debug.nodes = static_cast<uint32_t>(neu.graph.nodes.size());
+    neu.debug.bonds = static_cast<uint32_t>(neu.graph.bonds.size());
+    neu.debug.worldBonds = worldBonds;
+    neu.debug.mass = mass;
+    neu.debug.weight = mass * -kE1GravityY;
+    neu.debug.density = neu.grid.density;
+    neu.debug.solverIters = neu.solverIters;
+    neu.debug.fractureEnabled = fracture;
+    neu.debug.strengthPa = strength;
+    neu.debug.cut = cut;
+    neu.debug.bindingCount = static_cast<uint32_t>(neu.bindings.size());
+    // Removing a bridge can disconnect an actor without any new stress damage.
+    neu.occupancyDirty = neu.objectId == objectId;
+    instances_.push_back(std::move(neu));
+  }
+  std::cout << "Structure rebuild: cleared " << cleared << " voxels, families=" << families.size() << "\n";
+  return BlastError::Ok;
+}
+
 void StructureWorld::markCut(bool cut) {
   if (!instances_.empty()) {
     instances_.front().cutApplied = cut;
@@ -291,8 +495,8 @@ void StructureWorld::recacheOccupied() {
   inst->debug.occupied = inst->occupiedCached;
 }
 
-void StructureWorld::recachePendingFromProbes() {
-  StructureInstance* inst = instance();
+void StructureWorld::recachePendingFromProbes(StructureInstance* target) {
+  StructureInstance* inst = target != nullptr ? target : instance();
   if (inst != nullptr) {
     collectPendingFracture(*inst);
   }
@@ -367,18 +571,16 @@ void StructureWorld::refreshDebug(StructureInstance& inst, float solveMs) {
 }
 
 void StructureWorld::setFractureEnabled(bool on) {
-  StructureInstance* inst = instance();
-  if (inst == nullptr) {
-    return;
-  }
-  if (inst->fractureEnabled == on) {
-    return;
-  }
-  inst->fractureEnabled = on;
-  inst->debug.fractureEnabled = on;
-  if (!on) {
-    inst->pending.valid = false;
-    inst->pending.candidates.clear();
+  for (StructureInstance& inst : instances_) {
+    if (inst.fractureEnabled == on) {
+      continue;
+    }
+    inst.fractureEnabled = on;
+    inst.debug.fractureEnabled = on;
+    if (!on) {
+      inst.pending.valid = false;
+      inst.pending.candidates.clear();
+    }
   }
 }
 
@@ -393,18 +595,16 @@ void StructureWorld::setImpactDamageEnabled(bool on) { impactDamageEnabled_ = on
 void StructureWorld::setImpactSettings(const ImpactSettings& settings) { impactSettings_ = settings; }
 
 void StructureWorld::setStrengthPa(float strengthPa) {
-  StructureInstance* inst = instance();
-  if (inst == nullptr) {
-    return;
-  }
-  const bool changed = inst->strengthPa != strengthPa || inst->debug.strengthPa != strengthPa;
-  inst->strengthPa = strengthPa;
-  inst->debug.strengthPa = strengthPa;
-  if (changed) {
-    ++inst->strengthEpoch;
-  }
-  if (inst->blast.solver != nullptr) {
-    applyExtStressStrength(*inst->blast.solver, strengthPa);
+  for (StructureInstance& inst : instances_) {
+    const bool changed = inst.strengthPa != strengthPa || inst.debug.strengthPa != strengthPa;
+    inst.strengthPa = strengthPa;
+    inst.debug.strengthPa = strengthPa;
+    if (changed) {
+      ++inst.strengthEpoch;
+    }
+    if (inst.blast.solver != nullptr) {
+      applyExtStressStrength(*inst.blast.solver, strengthPa);
+    }
   }
 }
 
@@ -427,16 +627,17 @@ PendingFracture StructureWorld::takePendingFracture() {
   return out;
 }
 
-void StructureWorld::clearPendingFracture() {
-  if (instances_.empty()) {
+void StructureWorld::clearPendingFracture(StructureInstance* target) {
+  StructureInstance* inst = target != nullptr ? target : instance();
+  if (inst == nullptr) {
     return;
   }
-  instances_.front().pending.valid = false;
-  instances_.front().pending.candidates.clear();
+  inst->pending.valid = false;
+  inst->pending.candidates.clear();
 }
 
-bool StructureWorld::pendingSnapshotMatches(const PendingFracture& pending) const {
-  const StructureInstance* inst = instance();
+bool StructureWorld::pendingSnapshotMatches(const PendingFracture& pending, const StructureInstance* target) const {
+  const StructureInstance* inst = target != nullptr ? target : instance();
   if (inst == nullptr || inst->blast.solver == nullptr) {
     return false;
   }
@@ -571,8 +772,8 @@ void StructureWorld::collectPendingFracture(StructureInstance& inst) {
   inst.debug.candidateMs = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
-uint32_t StructureWorld::applyPendingCandidates(const PendingFracture& pending) {
-  StructureInstance* inst = instance();
+uint32_t StructureWorld::applyPendingCandidates(const PendingFracture& pending, StructureInstance* target) {
+  StructureInstance* inst = target != nullptr ? target : instance();
   if (inst == nullptr || inst->blast.family == nullptr || inst->blast.solver == nullptr ||
       inst->blast.asset == nullptr || !pending.valid || pending.candidates.empty()) {
     return 0;
@@ -627,8 +828,8 @@ uint32_t StructureWorld::applyPendingCandidates(const PendingFracture& pending) 
   return nfrac;
 }
 
-uint32_t StructureWorld::applyPendingIfAny() {
-  StructureInstance* inst = instance();
+uint32_t StructureWorld::applyPendingIfAny(StructureInstance* target) {
+  StructureInstance* inst = target != nullptr ? target : instance();
   if (inst == nullptr) {
     return 0;
   }
@@ -637,10 +838,10 @@ uint32_t StructureWorld::applyPendingIfAny() {
   if (impactOnly) {
     const uint32_t before =
         inst->blast.family != nullptr ? NvBlastFamilyGetActorCount(inst->blast.family, blastLog) : 0;
-    const uint32_t actors = splitAllRequired();
+    const uint32_t actors = splitAllRequired(inst);
     inst->debug.splitActors = actors;
     if (actors > before) {
-      occupancyDirty_ = true;
+      inst->occupancyDirty = true;
     }
     inst->impactAppliedThisTick = false;
     return inst->debug.impactDamageEvents;
@@ -648,12 +849,12 @@ uint32_t StructureWorld::applyPendingIfAny() {
   if (!inst->pending.valid || inst->pending.candidates.empty()) {
     return 0;
   }
-  if (!pendingSnapshotMatches(inst->pending)) {
-    recachePendingFromProbes();
-    if (!pendingSnapshotMatches(inst->pending) || !inst->pending.valid || inst->pending.candidates.empty()) {
-      clearPendingFracture();
+  if (!pendingSnapshotMatches(inst->pending, inst)) {
+    recachePendingFromProbes(inst);
+    if (!pendingSnapshotMatches(inst->pending, inst) || !inst->pending.valid || inst->pending.candidates.empty()) {
+      clearPendingFracture(inst);
       // Stale stress work must not cancel damage already applied by Impact.
-      return inst->impactAppliedThisTick ? applyPendingIfAny() : 0;
+      return inst->impactAppliedThisTick ? applyPendingIfAny(inst) : 0;
     }
   }
   for (const FractureCandidate& c : inst->pending.candidates) {
@@ -673,39 +874,41 @@ uint32_t StructureWorld::applyPendingIfAny() {
       }
     }
   }
-  const uint32_t nfrac = applyPendingCandidates(inst->pending);
+  const uint32_t nfrac = applyPendingCandidates(inst->pending, inst);
   inst->debug.fracturedBonds = nfrac;
   const uint32_t candKeep = inst->debug.candidateCount;
-  clearPendingFracture();
+  clearPendingFracture(inst);
   inst->debug.candidateCount = candKeep;
   if (nfrac == 0 && !inst->impactAppliedThisTick) {
     return 0;
   }
   const uint32_t before =
       inst->blast.family != nullptr ? NvBlastFamilyGetActorCount(inst->blast.family, blastLog) : 0;
-  const uint32_t actors = splitAllRequired();
+  const uint32_t actors = splitAllRequired(inst);
   inst->debug.splitActors = actors;
   if (actors > before) {
-    occupancyDirty_ = true;
+    inst->occupancyDirty = true;
   }
   inst->impactAppliedThisTick = false;
   return nfrac;
 }
 
-bool StructureWorld::takeOccupancyDirty() {
-  const bool dirty = occupancyDirty_;
-  occupancyDirty_ = false;
+bool StructureWorld::takeOccupancyDirty(StructureInstance* target) {
+  StructureInstance* inst = target != nullptr ? target : instance();
+  if (inst == nullptr) return false;
+  const bool dirty = inst->occupancyDirty;
+  inst->occupancyDirty = false;
   return dirty;
 }
 
-uint32_t StructureWorld::splitAllRequired() {
-  StructureInstance* inst = instance();
+uint32_t StructureWorld::splitAllRequired(StructureInstance* target, bool force) {
+  StructureInstance* inst = target != nullptr ? target : instance();
   if (inst == nullptr || inst->blast.family == nullptr || inst->blast.solver == nullptr) {
     return 0;
   }
   inst->loadSnapshots.clear();
   inst->blast.actor = nullptr;
-  const uint32_t actors = blast::splitAllRequired(inst->blast.family, *inst->blast.solver, blastLog);
+  const uint32_t actors = blast::splitAllRequired(inst->blast.family, *inst->blast.solver, blastLog, force);
   rebuildBindingsFromFamily(*inst);
   inst->lastBoundTopologyEpoch = inst->blast.solver->topologyEpoch();
   inst->blast.actor = nullptr;
@@ -735,13 +938,12 @@ ActorBinding* StructureWorld::bindingForObject(StructureInstance& inst, VoxelObj
 }
 
 uint32_t StructureWorld::applyImpactShaderToActor(StructureInstance& inst, NvBlastActor* actor,
-                                                  const glm::vec3& localPos, const glm::vec3& localForce) {
+                                                  const glm::vec3& localPos, const glm::vec3& localForce,
+                                                  float normalized) {
   if (actor == nullptr || inst.blast.asset == nullptr) {
     return 0;
   }
-  const float mag = glm::length(localForce);
-  const float normalized = viewerNormalizedDamage(mag, impactSettings_, impactMaterial_);
-  if (normalized <= 0.0f) {
+  if (!(normalized > 0.0f)) {
     return 0;
   }
   const float falloff = std::min(32.0f, std::max(1.0f, impactSettings_.damageFalloffRadiusFactor));
@@ -884,9 +1086,13 @@ void StructureWorld::applyViewerImpact(StructureInstance& inst, const WorldConta
     glm::vec3 xA{0.0f};
     glm::vec3 xB{0.0f};
     uint32_t n = 0;
+    float bestForce2 = -1.0f;
+    float bestImpulse2 = -1.0f;
   };
-  // Viewer averages within one PxShape pair, not across all shapes of an actor
-  // or across simulation steps. A voxel support node is our collision subshape.
+  const bool bodyPair = impactSettings_.model == ImpactModel::BodyPair;
+  // Viewer: average within one PxShape pair (a voxel support node here) per substep.
+  // BodyPair: one event per body pair per tick at the hardest-hit contact, so the
+  // damage does not multiply with the number of touching nodes or substeps.
   using PairKey = std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, int, uint32_t, uint32_t>;
   std::map<PairKey, PairAccum> pairs;
   for (uint32_t i = 0; i < nImpulses; ++i) {
@@ -919,12 +1125,34 @@ void StructureWorld::applyViewerImpact(StructureInstance& inst, const WorldConta
       NodeRef node;
       return b && pickContactNode(inst, *b, imp, sideA, node) ? node.graphNode : UINT32_MAX;
     };
-    const PairKey key{imp.idA.slot, imp.idA.generation, imp.idB.slot, imp.idB.generation,
-                      imp.substep, shape(bA, true), shape(bB, false)};
+    const PairKey key = bodyPair ? PairKey{imp.idA.slot, imp.idA.generation, imp.idB.slot, imp.idB.generation,
+                                           0, UINT32_MAX, UINT32_MAX}
+                                 : PairKey{imp.idA.slot, imp.idA.generation, imp.idB.slot, imp.idB.generation,
+                                           imp.substep, shape(bA, true), shape(bB, false)};
     PairAccum& acc = pairs[key];
     if (acc.n == 0) {
       acc.idA = imp.idA;
       acc.idB = imp.idB;
+    }
+    if (bodyPair) {
+      // Hardest contact wins: largest approach force, then largest solver impulse.
+      const float f2 = glm::dot(fA, fA);
+      const float j2 = glm::dot(imp.JA, imp.JA);
+      if (f2 > acc.bestForce2 || (f2 == acc.bestForce2 && j2 > acc.bestImpulse2)) {
+        acc.bestForce2 = f2;
+        acc.bestImpulse2 = j2;
+        acc.forceA = fA;
+        acc.forceB = fB;
+        acc.pos = imp.worldPoint;
+        acc.qA = imp.qA;
+        acc.qB = imp.qB;
+        acc.xA = imp.xA;
+        acc.xB = imp.xB;
+      }
+      acc.n = 1;
+      continue;
+    }
+    if (acc.n == 0) {
       acc.qA = imp.qA;
       acc.qB = imp.qB;
       acc.xA = imp.xA;
@@ -936,30 +1164,7 @@ void StructureWorld::applyViewerImpact(StructureInstance& inst, const WorldConta
     ++acc.n;
   }
   auto applySide = [&](ActorBinding* b, const glm::vec3& worldPos, const glm::vec3& worldForce, const glm::quat& q,
-                       const glm::vec3& x) {
-    if (b == nullptr || b->actor == nullptr || glm::dot(worldForce, worldForce) <= 0.0f) {
-      return;
-    }
-    BodyAssetFrame frame;
-    frame.objectId = b->objectId;
-    frame.assetCom = b->comAsset;
-    frame.worldCom = x;
-    frame.worldQ = q;
-    const glm::vec3 localPos = worldToAsset(worldPos, frame);
-    const glm::vec3 localForce = worldVecToAsset(worldForce, frame);
-    if (stressImpactImpulses_ && b->stressSolve) {
-      const glm::vec3 f = localForce * stressImpactScale_;
-      inst.blast.solver->addForce(*b->actor, NvcVec3{localPos.x, localPos.y, localPos.z},
-                                  NvcVec3{f.x, f.y, f.z}, Nv::Blast::ExtForceMode::FORCE);
-      ++inst.debug.impactDamageEvents;
-      return;
-    }
-    const uint32_t n = applyImpactShaderToActor(inst, b->actor, localPos, localForce);
-    if (n > 0) {
-      inst.impactAppliedThisTick = true;
-      inst.debug.impactDamageEvents += n;
-    }
-  };
+                       const glm::vec3& x) { applyImpactSide(inst, b, worldPos, worldForce, q, x); };
   uint32_t noBind = 0;
   uint32_t selfSkip = 0;
   for (auto& kv : pairs) {
@@ -987,6 +1192,41 @@ void StructureWorld::applyViewerImpact(StructureInstance& inst, const WorldConta
     std::cout << "ImpactDamage impulses=" << nImpulses << " pairs=" << pairs.size()
               << " events=" << inst.debug.impactDamageEvents << " noBind=" << noBind
               << " selfSkip=" << selfSkip << " bindings=" << inst.bindings.size() << "\n";
+  }
+}
+
+void StructureWorld::applyImpactSide(StructureInstance& inst, ActorBinding* b, const glm::vec3& worldPos,
+                                     const glm::vec3& worldForce, const glm::quat& q, const glm::vec3& x) {
+  if (b == nullptr || b->actor == nullptr || glm::dot(worldForce, worldForce) <= 0.0f) {
+    return;
+  }
+  BodyAssetFrame frame;
+  frame.objectId = b->objectId;
+  frame.assetCom = b->comAsset;
+  frame.worldCom = x;
+  frame.worldQ = q;
+  const glm::vec3 localPos = worldToAsset(worldPos, frame);
+  const glm::vec3 localForce = worldVecToAsset(worldForce, frame);
+  if (stressImpactImpulses_ && b->stressSolve) {
+    const glm::vec3 f = localForce * stressImpactScale_;
+    inst.blast.solver->addForce(*b->actor, NvcVec3{localPos.x, localPos.y, localPos.z}, NvcVec3{f.x, f.y, f.z},
+                                Nv::Blast::ExtForceMode::FORCE);
+    ++inst.debug.impactDamageEvents;
+    return;
+  }
+  const float mag = glm::length(localForce);
+  float normalized = 0.0f;
+  if (impactSettings_.model == ImpactModel::BodyPair) {
+    // Velocity change this actor experiences: scale free, and a light impactor
+    // cannot shatter a heavy actor just because the pair's reduced mass is large.
+    normalized = b->mass > 1.0e-6f ? bodyPairNormalizedDamage(mag / b->mass, impactSettings_, impactMaterial_) : 0.0f;
+  } else {
+    normalized = viewerNormalizedDamage(mag, impactSettings_, impactMaterial_);
+  }
+  const uint32_t n = applyImpactShaderToActor(inst, b->actor, localPos, localForce, normalized);
+  if (n > 0) {
+    inst.impactAppliedThisTick = true;
+    inst.debug.impactDamageEvents += n;
   }
 }
 
@@ -1106,6 +1346,7 @@ void StructureWorld::fillBindingKinematics(StructureInstance& inst, ActorBinding
   b.nodeRefs.clear();
   if (b.actor == nullptr) {
     b.graphNodeCount = 0;
+    b.mass = 0.0f;
     b.anchored = false;
     b.stressSolve = false;
     b.comAsset = glm::vec3(0.0f);
@@ -1135,6 +1376,7 @@ void StructureWorld::fillBindingKinematics(StructureInstance& inst, ActorBinding
     mass += n.mass;
     com += n.mass * glm::vec3(n.cx, n.cy, n.cz);
   }
+  b.mass = mass;
   b.comAsset = mass > 1e-8f ? com / mass : glm::vec3(0.0f);
 }
 
@@ -1215,8 +1457,8 @@ void StructureWorld::rebuildBindingsFromFamily(StructureInstance& inst) {
   }
 }
 
-void StructureWorld::bindVisibleActors(const std::vector<ActorObjectLink>& links) {
-  StructureInstance* inst = instance();
+void StructureWorld::bindVisibleActors(const std::vector<ActorObjectLink>& links, StructureInstance* target) {
+  StructureInstance* inst = target != nullptr ? target : instance();
   if (inst == nullptr) {
     return;
   }

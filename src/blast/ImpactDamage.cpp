@@ -32,9 +32,10 @@ bool viewerPairForce(const WorldContactImpulse& imp, glm::vec3& forceA, glm::vec
   return true;
 }
 
-float viewerNormalizedDamage(float forceMag, const ImpactSettings& settings, const NvBlastExtMaterial& material) {
-  const float damage = settings.hardness > 0.0f ? forceMag / settings.hardness : 0.0f;
-  float normalized = material.getNormalizedDamage(damage);
+namespace {
+
+float clampNormalized(float damageInHealth, const ImpactSettings& settings, const NvBlastExtMaterial& material) {
+  float normalized = material.getNormalizedDamage(damageInHealth);
   if (normalized == 0.0f || normalized < settings.damageThresholdMin) {
     return 0.0f;
   }
@@ -45,6 +46,20 @@ float viewerNormalizedDamage(float forceMag, const ImpactSettings& settings, con
     normalized = 0.0f;
   }
   return normalized;
+}
+
+}  // namespace
+
+float viewerNormalizedDamage(float forceMag, const ImpactSettings& settings, const NvBlastExtMaterial& material) {
+  const float damage = settings.hardness > 0.0f ? forceMag / settings.hardness : 0.0f;
+  return clampNormalized(damage, settings, material);
+}
+
+float bodyPairNormalizedDamage(float deltaV, const ImpactSettings& settings, const NvBlastExtMaterial& material) {
+  if (!(settings.fullDamageDeltaV > 0.0f) || !(deltaV > 0.0f)) {
+    return 0.0f;
+  }
+  return clampNormalized(deltaV / settings.fullDamageDeltaV * material.health, settings, material);
 }
 
 void viewerDamageToBondArea(NvBlastFractureBuffers& commands, const NvBlastAsset* asset) {

@@ -115,6 +115,7 @@ struct ActorBinding {
   bool anchored = false;
   bool stressSolve = false;
   uint32_t graphNodeCount = 0;
+  float mass = 0.0f;  // Sum of this actor's Blast node masses.
   glm::vec3 comAsset{0.0f};
   glm::ivec3 fineOrigin{0};
   int fineN = 0;
@@ -180,6 +181,7 @@ struct StructureInstance {
   uint32_t lastBoundTopologyEpoch = 0xFFFFFFFFu;
   ImpulseEvents impactEvents{};
   bool impactAppliedThisTick = false;
+  bool occupancyDirty = false;
 };
 
 class StructureWorld {
@@ -200,15 +202,16 @@ public:
   void onPhysicsTick(uint64_t tickId, float dt, const WorldContactImpulse* impulses, uint32_t nImpulses);
   void onPhysicsTick(uint64_t tickId, float dt, const WorldContactImpulse* impulses, uint32_t nImpulses,
                      const BodyKinematics* kinematics, uint32_t nKinematics);
-  void bindVisibleActors(const std::vector<ActorObjectLink>& links);
-  const std::vector<ActorBinding>& bindings() const {
-    static const std::vector<ActorBinding> kEmpty;
-    return instances_.empty() ? kEmpty : instances_.front().bindings;
-  }
+  void bindVisibleActors(const std::vector<ActorObjectLink>& links, StructureInstance* target = nullptr);
+  const std::vector<ActorBinding>& bindings() const;
 
   BlastError mountSample(VoxelObjectId objectId, OccupancySample sample, uint32_t solverIters, float strengthPa,
                          float axisX, float axisZ);
   void unmount(VoxelObjectId objectId);
+  bool ownsObject(VoxelObjectId objectId) const;
+  // Drop these object-local fines from the mounted structure and rebuild the family.
+  // Failure leaves the previous family in place.
+  BlastError applyOccupancyRemoval(VoxelObjectId objectId, const glm::ivec3* localFines, uint32_t count);
   bool setDensityScale(float scale);
   void setSolverIters(uint32_t iters);
   void markCut(bool cut);
@@ -230,14 +233,16 @@ public:
   const NvBlastExtMaterial& impactMaterial() const { return impactMaterial_; }
   PendingFracture takePendingFracture();
   const PendingFracture& pendingFracture() const { return instances_.empty() ? idlePending_ : instances_.front().pending; }
-  void clearPendingFracture();
-  bool pendingSnapshotMatches(const PendingFracture& pending) const;
-  uint32_t applyPendingCandidates(const PendingFracture& pending);
-  uint32_t applyPendingIfAny();
-  uint32_t splitAllRequired();
-  bool takeOccupancyDirty();
+  // Scene commits pass an explicit instance. Omitting it preserves the original
+  // single-structure API used by diagnostics and headless tests.
+  void clearPendingFracture(StructureInstance* target = nullptr);
+  bool pendingSnapshotMatches(const PendingFracture& pending, const StructureInstance* target = nullptr) const;
+  uint32_t applyPendingCandidates(const PendingFracture& pending, StructureInstance* target = nullptr);
+  uint32_t applyPendingIfAny(StructureInstance* target = nullptr);
+  uint32_t splitAllRequired(StructureInstance* target = nullptr, bool force = false);
+  bool takeOccupancyDirty(StructureInstance* target = nullptr);
   void recacheOccupied();
-  void recachePendingFromProbes();
+  void recachePendingFromProbes(StructureInstance* target = nullptr);
 
   bool initialized() const { return initialized_; }
   uint32_t instanceCount() const { return static_cast<uint32_t>(instances_.size()); }
@@ -249,6 +254,7 @@ public:
   int blastErrorCount() const;
   const StructureDebugSnapshot& debug() const;
   StructureInstance* instance();
+  StructureInstance* instanceAt(uint32_t index) { return index < instances_.size() ? &instances_[index] : nullptr; }
   const StructureInstance* instance() const;
   const char* lastError() const { return lastError_; }
 
@@ -269,7 +275,9 @@ private:
                           uint64_t tickId, float dt);
   void applyViewerImpact(StructureInstance& inst, const WorldContactImpulse* impulses, uint32_t nImpulses);
   uint32_t applyImpactShaderToActor(StructureInstance& inst, NvBlastActor* actor, const glm::vec3& localPos,
-                                    const glm::vec3& localForce);
+                                    const glm::vec3& localForce, float normalized);
+  void applyImpactSide(StructureInstance& inst, ActorBinding* b, const glm::vec3& worldPos,
+                       const glm::vec3& worldForce, const glm::quat& q, const glm::vec3& x);
   void syncBondDamageFromHealth(StructureInstance& inst);
   ActorBinding* bindingForObject(StructureInstance& inst, VoxelObjectId id);
 
@@ -279,10 +287,10 @@ private:
   uint64_t lastTickId_ = 0;
   float lastDt_ = 0.0f;
   std::vector<StructureInstance> instances_;
+  mutable std::vector<ActorBinding> bindingCache_;
   StructureDebugSnapshot idle_{};
   PendingFracture idlePending_{};
   const char* lastError_ = "ok";
-  bool occupancyDirty_ = false;
   bool stressImpactImpulses_ = false;
   float stressImpactScale_ = 0.01f;
   bool impactDamageEnabled_ = true;

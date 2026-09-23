@@ -2208,6 +2208,18 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
     if (pendingStressImpactImpulses_) {
       ImGui::DragFloat("Impact to stress factor", &pendingStressImpactScale_, 0.001f, 0.0f, 1000.0f, "%.4f");
     }
+    bool bodyPairModel = pendingImpactSettings_.model == blast::ImpactModel::BodyPair;
+    if (ImGui::Checkbox("Body-pair impact (dv / actor mass)", &bodyPairModel)) {
+      pendingImpactSettings_.model = bodyPairModel ? blast::ImpactModel::BodyPair : blast::ImpactModel::Viewer;
+    }
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip(
+          "On: one hit per body pair per tick at the hardest contact; damage = (force / actor mass) / full-damage dv.\n"
+          "Off: NVIDIA Viewer grouping (per node pair and substep, force / hardness).");
+    }
+    if (bodyPairModel) {
+      ImGui::DragFloat("Full-damage dv (m/s)", &pendingImpactSettings_.fullDamageDeltaV, 0.5f, 0.5f, 500.0f, "%.1f");
+    }
     if (ImGui::TreeNode("Viewer impact parameters")) {
       ImGui::Checkbox("Family self-collision damage", &pendingImpactSettings_.selfCollisionEnabled);
       ImGui::DragFloat("Material health", &pendingImpactMaterial_.health, 1.0f, 0.0f, 100000.0f);
@@ -2248,6 +2260,10 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
                 phys.structureCallbackMs);
     ImGui::Text("phys bodies occupied=%d awake=%d contacts=%d", phys.occupiedBodies, phys.awakeBodies,
                 phys.contacts);
+    ImGui::Text("contacts generated-pairs=%d reused-pairs=%d warm-points=%d (last tick)",
+                phys.narrowPhasePairs, phys.reusedContactPairs, phys.warmStartedPoints);
+    ImGui::Text("phys broad %.2f narrow %.2f solver %.2f load-record %.2f ms",
+                phys.broadPhaseMs, phys.narrowPhaseMs, phys.solverOnlyMs, phys.contactRecordMs);
     ImGui::Text("Physics ticks: %llu  last dt: %.6f s",
                 static_cast<unsigned long long>(sw.physicsTicksReceived()), sw.lastDt());
     ImGui::Text("Blast live bytes: %zu  (baseline %zu)  errors: %d", sw.blastLiveBytes(),

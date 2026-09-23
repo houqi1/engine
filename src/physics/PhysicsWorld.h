@@ -2,6 +2,9 @@
 
 #include "blast/ContactLoads.h"
 #include "physics/PhysicsTypes.h"
+#include "physics/DynamicAabbTree.h"
+#include "physics/ContactCache.h"
+#include "physics/VoxelCollide.h"
 #include "physics/RigidBody.h"
 #include "scene/VoxelTypes.h"
 
@@ -65,6 +68,12 @@ private:
   VoxelScene* scene_ = nullptr;
   std::vector<RigidBody> bodies_;
   std::vector<ShapeClass> classes_;
+  DynamicAabbTree broadPhase_;
+  ContactCache contactCache_;
+  std::vector<int> broadProxies_;
+  std::vector<PhysicsAabb> broadBounds_;
+  std::vector<CollisionPose> collisionPoses_;
+  std::vector<std::pair<int, int>> broadPairs_;
   FixedStepClock clock_{};
   FixedPhysicsTickFn tickFn_ = nullptr;
   void* tickUser_ = nullptr;
