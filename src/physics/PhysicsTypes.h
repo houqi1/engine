@@ -117,11 +117,13 @@ struct DebugSolve {
   float rebuildMs = 0.0f;
   float collideMs = 0.0f;
   float broadPhaseMs = 0.0f;
+  float broadSyncMs = 0.0f;  // proxy refresh part of broadPhaseMs
   float narrowPhaseMs = 0.0f;
   float solverOnlyMs = 0.0f;
   float contactRecordMs = 0.0f;
   float contactSolveMs = 0.0f;
   float integrateMs = 0.0f;
+  float sleepMs = 0.0f;
   float structureCallbackMs = 0.0f;
   int awakeBodies = 0;
   int occupiedBodies = 0;

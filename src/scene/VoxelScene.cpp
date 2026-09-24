@@ -1541,7 +1541,7 @@ void VoxelScene::clearScatterBoxes(GfxDevice& gfx) {
   physics_.rebuildFromScene();
 }
 
-void VoxelScene::spawnScatterBoxes(GfxDevice& gfx, uint32_t count) {
+void VoxelScene::spawnScatterBoxes(GfxDevice& gfx, uint32_t count, bool pile) {
   if (!tryGetObject(groundObjectId_)) {
     return;
   }
@@ -1584,6 +1584,23 @@ void VoxelScene::spawnScatterBoxes(GfxDevice& gfx, uint32_t count) {
                            3.2f + half + static_cast<float>(iy) * spacing,
                            (static_cast<float>(iz) - 0.5f * static_cast<float>(side)) * spacing +
                                6.0f);
+    if (pile) {
+      // Dense stress layout: solid cubes (2*vs) 15% apart in XZ, stacked in
+      // layers over the ground centre, each slightly tilted so the pile tumbles.
+      const int pileSide = std::max(1, std::min(16, static_cast<int>(std::ceil(std::sqrt(
+                                                       static_cast<float>(maxAdd))))));
+      const float pitch = 2.3f * vs;
+      const int px = static_cast<int>(i % static_cast<uint32_t>(pileSide));
+      const int pz = static_cast<int>((i / static_cast<uint32_t>(pileSide)) % static_cast<uint32_t>(pileSide));
+      const int py = static_cast<int>(i / static_cast<uint32_t>(pileSide * pileSide));
+      const glm::vec3 groundMin = gridOrigin();
+      const float groundHalf = 0.5f * static_cast<float>(std::clamp(gridSize_, 8, 64)) * voxelSize_;
+      o.position = glm::vec3(groundMin.x + groundHalf + (static_cast<float>(px) - 0.5f * pileSide) * pitch,
+                             groundMin.y + 2.0f * voxelSize_ + vs * 1.2f + static_cast<float>(py) * pitch,
+                             groundMin.z + groundHalf + (static_cast<float>(pz) - 0.5f * pileSide) * pitch);
+      const float a = 0.15f * static_cast<float>((i * 2654435761u) % 1000u) / 1000.0f;
+      o.rotation = glm::angleAxis(a, glm::normalize(glm::vec3(1.0f, 0.3f * static_cast<float>(i % 3), 0.7f)));
+    }
 
     const size_t cellCount =
         static_cast<size_t>(kN) * static_cast<size_t>(kN) * static_cast<size_t>(kN);

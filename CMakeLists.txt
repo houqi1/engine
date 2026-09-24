@@ -153,6 +153,10 @@ add_executable(contact_cache_tests tests/contact_cache_tests.cpp src/physics/Sol
 target_include_directories(contact_cache_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(contact_cache_tests PRIVATE glm::glm)
 
+add_executable(solver_island_tests tests/solver_island_tests.cpp src/physics/Solver.cpp)
+target_include_directories(solver_island_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(solver_island_tests PRIVATE glm::glm)
+
 add_executable(fine_feature_query_tests tests/fine_feature_query_tests.cpp)
 target_include_directories(fine_feature_query_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(fine_feature_query_tests PRIVATE glm::glm)

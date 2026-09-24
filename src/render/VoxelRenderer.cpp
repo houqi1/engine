@@ -2126,7 +2126,7 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
       const int testSlot = scene.testObjectId().valid() ? static_cast<int>(scene.testObjectId().slot) : 1;
       ImGui::Text("Test box corners: %u   edges: %u", scene.physicsCornerCount(testSlot),
                   scene.physicsEdgeCount(testSlot));
-      const physics::DebugSolve ds = scene.physicsDebug();
+      const physics::DebugSolve& ds = scene.physicsDebug();
       ImGui::Text("Solve contacts=%d  maxD=%.3f  minNy=%.2f", ds.contacts, ds.maxD, ds.minNy);
       ImGui::Text("Box v=(%.2f,%.2f,%.2f) |w|=%.2f", ds.v.x, ds.v.y, ds.v.z, glm::length(ds.w));
     }
@@ -2254,7 +2254,7 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
                 st.solverIters);
     ImGui::Text("probe %.2f ms  stats %.2f ms  candidates %.2f ms  exports %u", st.probeMs, st.statsMs,
                 st.candidateMs, st.probeExportCount);
-    const physics::DebugSolve phys = scene.physicsDebug();
+    const physics::DebugSolve& phys = scene.physicsDebug();
     ImGui::Text("phys collide %.2f  contacts %.2f  integrate %.2f  rebuild %.2f  struct-cb %.2f",
                 phys.collideMs, phys.contactSolveMs, phys.integrateMs, phys.rebuildMs,
                 phys.structureCallbackMs);

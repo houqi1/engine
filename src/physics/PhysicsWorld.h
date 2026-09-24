@@ -49,7 +49,8 @@ public:
   void activateBodiesInBounds(const glm::vec3& worldMin, const glm::vec3& worldMax);
 
   const ShapeClass* shapeClass(int objectIndex) const;
-  DebugSolve debugSolve() const { return debug_; }
+  // By reference: lastContacts can hold thousands of contacts in a pile-up.
+  const DebugSolve& debugSolve() const { return debug_; }
   const std::vector<blast::WorldContactImpulse>& tickImpulses() const { return tickImpulses_; }
 
 private:
@@ -80,6 +81,15 @@ private:
   DebugSolve debug_{};
   std::vector<blast::WorldContactImpulse> tickImpulses_;
   std::vector<std::pair<int, int>> lastTouching_;
+  // Sorted, unique pairKey(lo, hi) of lastTouching_ for O(log n) lookups.
+  std::vector<uint64_t> lastTouchingKeys_;
+  std::vector<Contact> contactScratch_;
+  // Narrow phase output per broad pair, merged in pair order (deterministic).
+  std::vector<std::vector<Contact>> pairContacts_;
+  std::vector<char> queriers_;
+  std::vector<std::vector<std::pair<int, int>>> bodyPairs_;
+  std::vector<ContactCache::Pair*> pairSlots_;
+  std::vector<ContactCache::Stats> pairStats_;
   int substepIndex_ = 0;
   int nextSleepIsland_ = 1;
 };

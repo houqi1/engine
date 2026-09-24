@@ -1,6 +1,7 @@
 #include "physics/PhysicsWorld.h"
 
 #include "physics/Classify.h"
+#include "physics/ParallelFor.h"
 #include "physics/Solver.h"
 #include "physics/VoxelCollide.h"
 #include "scene/VoxelScene.h"
@@ -17,6 +18,17 @@
 
 namespace physics {
 namespace {
+
+// Below this many broad pairs the narrow phase stays on the calling thread.
+constexpr size_t kParallelNarrowMinPairs = 16;
+// Below this many bodies broad-phase queries stay on the calling thread.
+constexpr size_t kParallelBroadMinBodies = 128;
+
+uint64_t touchKey(int a, int b) {
+  const uint32_t lo = static_cast<uint32_t>(std::min(a, b));
+  const uint32_t hi = static_cast<uint32_t>(std::max(a, b));
+  return (static_cast<uint64_t>(lo) << 32) | hi;
+}
 
 glm::vec3 gridCenterLocal(const VoxelObject& o) {
   const float e = 0.5f * static_cast<float>(o.gridSize) * o.voxelSize;
@@ -466,7 +478,11 @@ void PhysicsWorld::substep() {
       b.v += kGravity * kSubDt;
     }
   }
+  // Reuse the previous substep's buffer instead of regrowing thousands of
+  // contacts from empty every substep.
   std::vector<Contact> contacts;
+  contacts.swap(contactScratch_);
+  contacts.clear();
   const int n = static_cast<int>(bodies_.size());
   // Synchronize all proxies before querying: sleepers remain discoverable by
   // active/kinematic bodies, and edits, rotation, teleports and reused slots all
@@ -500,21 +516,40 @@ void PhysicsWorld::substep() {
     if (proxy == -1) proxy = broadPhase_.insert(i, bounds.expanded(fine));
     else broadPhase_.update(proxy, bounds, fine);
   }
+  const auto tSync = std::chrono::steady_clock::now();
+  debug_.broadSyncMs += std::chrono::duration<float, std::milli>(tSync - t0).count();
   broadPairs_.clear();
+  // Queriers: awake bodies and kinematic movers. A pair between two queriers is
+  // found from both sides, so only the lower index records it.
+  queriers_.assign(static_cast<size_t>(n), 0);
   for (int i = 0; i < n; ++i) {
     const RigidBody& a = bodies_[static_cast<size_t>(i)];
-    if (broadProxies_[static_cast<size_t>(i)] == -1 ||
-        !(a.awake || (!a.dynamic && !isStaticEnvironment(*scene_, a)))) continue;
-    broadPhase_.query(broadBounds_[static_cast<size_t>(i)], [&](int j) {
-      if (i == j || skipCollidePair(*scene_, a, bodies_[static_cast<size_t>(j)])) return;
+    queriers_[static_cast<size_t>(i)] = broadProxies_[static_cast<size_t>(i)] != -1 &&
+                                        (a.awake || (!a.dynamic && !isStaticEnvironment(*scene_, a)));
+  }
+  if (bodyPairs_.size() < static_cast<size_t>(n)) bodyPairs_.resize(static_cast<size_t>(n));
+  // The tree, bodies and poses are read-only here; each body fills its own list.
+  parallelFor(static_cast<size_t>(n), kParallelBroadMinBodies, [&](size_t si) {
+    const int i = static_cast<int>(si);
+    std::vector<std::pair<int, int>>& found = bodyPairs_[si];
+    found.clear();
+    if (!queriers_[si]) return;
+    const RigidBody& a = bodies_[si];
+    broadPhase_.query(broadBounds_[si], [&](int j) {
+      if (i == j || (j < i && queriers_[static_cast<size_t>(j)])) return;
+      if (skipCollidePair(*scene_, a, bodies_[static_cast<size_t>(j)])) return;
       // Fat tree proxies are conservative; reject their false positives before
       // allocating/updating a persistent contact pair. Same gate as collidePair.
-      const auto& pa = collisionPoses_[static_cast<size_t>(i)];
+      const auto& pa = collisionPoses_[si];
       const auto& pb = collisionPoses_[static_cast<size_t>(j)];
       const float pad = std::max(pa.fineSize, pb.fineSize);
       if (!PhysicsAabb{pa.min, pa.max}.expanded(pad).overlaps(PhysicsAabb{pb.min, pb.max}.expanded(pad))) return;
-      broadPairs_.emplace_back(std::min(i, j), std::max(i, j));
+      found.emplace_back(std::min(i, j), std::max(i, j));
     });
+  });
+  for (int i = 0; i < n; ++i) {
+    const auto& found = bodyPairs_[static_cast<size_t>(i)];
+    broadPairs_.insert(broadPairs_.end(), found.begin(), found.end());
   }
   // Preserve the old pair/solver order, independent of insertion/tree rotations.
   std::sort(broadPairs_.begin(), broadPairs_.end());
@@ -542,20 +577,52 @@ void PhysicsWorld::substep() {
   static const bool disableContactCache = std::getenv("VE_DISABLE_CONTACT_CACHE") != nullptr;
   const auto tBroad = std::chrono::steady_clock::now();
   contactCache_.beginSubstep();
-  for (const auto& [i, j] : broadPairs_) {
-    auto stamp = [&](int slot) {
-      const auto& o = scene_->cpuObject(slot);
-      return ContactBodyStamp{scene_->objectIdAt(slot).generation, o.topologyRevision,
+  {
+    // Pairs are independent: collidePair only reads the scene/poses and each
+    // pair owns its cache slot and output vector. Map insertion stays serial;
+    // outputs are concatenated in sorted pair order so results are identical
+    // to the serial loop regardless of thread scheduling.
+    const size_t pairCount = broadPairs_.size();
+    if (pairContacts_.size() < pairCount) pairContacts_.resize(pairCount);
+    pairSlots_.resize(pairCount);
+    pairStats_.assign(pairCount, ContactCache::Stats{});
+    const VoxelScene& scene = *scene_;
+    auto stamp = [&scene](int slot) {
+      const auto& o = scene.cpuObject(slot);
+      return ContactBodyStamp{scene.objectIdAt(slot).generation, o.topologyRevision,
                               o.voxelSize / VoxelScene::kFinePerCoarse};
     };
-    const auto stats = contactCache_.collect(bodies_[i], bodies_[j], stamp(i), stamp(j), substepIndex_, contacts,
-      [&](std::vector<Contact>& out) {
-        collidePair(*scene_, bodies_[i], bodies_[j], classes_[i], classes_[j], out,
+    for (size_t k = 0; k < pairCount; ++k) {
+      pairSlots_[k] = disableContactCache ? nullptr
+                                          : &contactCache_.slot(broadPairs_[k].first, broadPairs_[k].second);
+    }
+    const int substepIndex = substepIndex_;
+    auto narrow = [&](size_t k) {
+      const auto [i, j] = broadPairs_[k];
+      std::vector<Contact>& out = pairContacts_[k];
+      out.clear();
+      auto generate = [&](std::vector<Contact>& dst) {
+        collidePair(*scene_, bodies_[i], bodies_[j], classes_[i], classes_[j], dst,
                     &collisionPoses_[i], &collisionPoses_[j]);
-      }, !disableContactCache);
-    debug_.narrowPhasePairs += stats.generated;
-    debug_.reusedContactPairs += stats.reused;
-    debug_.warmStartedPoints += stats.warmPoints;
+      };
+      if (pairSlots_[k] == nullptr) {
+        generate(out);
+        pairStats_[k] = ContactCache::Stats{1, 0, 0};
+      } else {
+        pairStats_[k] = contactCache_.collectInto(*pairSlots_[k], bodies_[i], bodies_[j], stamp(i), stamp(j),
+                                                  substepIndex, out, generate);
+      }
+    };
+    parallelFor(pairCount, kParallelNarrowMinPairs, narrow);
+    size_t total = 0;
+    for (size_t k = 0; k < pairCount; ++k) total += pairContacts_[k].size();
+    contacts.reserve(total);
+    for (size_t k = 0; k < pairCount; ++k) {
+      contacts.insert(contacts.end(), pairContacts_[k].begin(), pairContacts_[k].end());
+      debug_.narrowPhasePairs += pairStats_[k].generated;
+      debug_.reusedContactPairs += pairStats_[k].reused;
+      debug_.warmStartedPoints += pairStats_[k].warmPoints;
+    }
   }
   contactCache_.endSubstep();
   wakeFromTouchingContacts(contacts, kSubDt);
@@ -589,13 +656,15 @@ void PhysicsWorld::substep() {
   debug_.contactSolveMs += std::chrono::duration<float, std::milli>(t2 - t1).count();
   debug_.integrateMs += std::chrono::duration<float, std::milli>(t3 - t2).count();
   debug_.contacts = static_cast<int>(contacts.size());
-  debug_.lastContacts = contacts;
   debug_.maxD = 0.0f;
   debug_.minNy = 1.0f;
   for (const Contact& c : contacts) {
     debug_.maxD = std::max(debug_.maxD, c.d);
     debug_.minNy = std::min(debug_.minNy, c.n.y);
   }
+  // Hand the contacts over instead of copying; the old buffer becomes scratch.
+  debug_.lastContacts.swap(contacts);
+  contactScratch_.swap(contacts);
   if (scene_) {
     const VoxelObjectId testId = scene_->testObjectId();
     if (testId.valid() && static_cast<int>(testId.slot) < n) {
@@ -608,6 +677,7 @@ void PhysicsWorld::substep() {
 
 void PhysicsWorld::updateSleep(float h) {
   const int n = static_cast<int>(bodies_.size());
+  lastTouchingKeys_.clear();
   if (n <= 0) {
     lastTouching_.clear();
     return;
@@ -625,6 +695,7 @@ void PhysicsWorld::updateSleep(float h) {
       continue;
     }
     lastTouching_.push_back({c.a, c.b});
+    lastTouchingKeys_.push_back(touchKey(c.a, c.b));
     RigidBody& A = bodies_[static_cast<size_t>(c.a)];
     RigidBody& B = bodies_[static_cast<size_t>(c.b)];
     if (A.dynamic && B.dynamic && A.awake && B.awake) {
@@ -639,6 +710,10 @@ void PhysicsWorld::updateSleep(float h) {
       }
     }
   }
+
+  std::sort(lastTouchingKeys_.begin(), lastTouchingKeys_.end());
+  lastTouchingKeys_.erase(std::unique(lastTouchingKeys_.begin(), lastTouchingKeys_.end()),
+                          lastTouchingKeys_.end());
 
   struct IslandAcc {
     float minTimer = 1.0e30f;
@@ -755,17 +830,8 @@ void PhysicsWorld::recordSubstepImpulses(const std::vector<Contact>& contacts, i
     rec.velA = c.preVelA;
     rec.velB = c.preVelB;
     rec.eventId = blast::contactPairKey(rec.idA, rec.idB);
-    rec.persistent = false;
-    const int lo = c.a < c.b ? c.a : c.b;
-    const int hi = c.a < c.b ? c.b : c.a;
-    for (const std::pair<int, int>& t : lastTouching_) {
-      const int tlo = t.first < t.second ? t.first : t.second;
-      const int thi = t.first < t.second ? t.second : t.first;
-      if (tlo == lo && thi == hi) {
-        rec.persistent = true;
-        break;
-      }
-    }
+    rec.persistent =
+        std::binary_search(lastTouchingKeys_.begin(), lastTouchingKeys_.end(), touchKey(c.a, c.b));
     if (!rec.persistent) {
       rec.eventId ^= tick * 0x9E3779B97F4A7C15ULL;
     }
@@ -802,7 +868,7 @@ void PhysicsWorld::step(float frameDt) {
   debug_.physicsTicksThisFrame = 0;
   clock_.advance(frameDt, [this](uint64_t id, float dt) {
     debug_.collideMs = 0.0f;
-    debug_.broadPhaseMs = debug_.narrowPhaseMs = debug_.solverOnlyMs = debug_.contactRecordMs = 0.0f;
+    debug_.broadPhaseMs = debug_.broadSyncMs = debug_.narrowPhaseMs = debug_.solverOnlyMs = debug_.contactRecordMs = 0.0f;
     debug_.contactSolveMs = 0.0f;
     debug_.integrateMs = 0.0f;
     debug_.structureCallbackMs = 0.0f;
@@ -819,7 +885,10 @@ void PhysicsWorld::step(float frameDt) {
       for (int s = 0; s < kSubsteps; ++s) {
         substep();
       }
+      const auto tSleep0 = std::chrono::steady_clock::now();
       updateSleep(dt);
+      debug_.sleepMs =
+          std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - tSleep0).count();
       for (size_t i = 0; i < bodies_.size(); ++i) {
         if (scene_->slotOccupied(static_cast<int>(i))) {
           ++debug_.occupiedBodies;

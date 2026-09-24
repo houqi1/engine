@@ -144,7 +144,7 @@ public:
   bool& fractureEnabled() { return fractureEnabled_; }
   void rebuildVoxels(GfxDevice& gfx);
   // Keep ground (+ optional spinner/test box), append `count` small solid boxes for scale tests.
-  void spawnScatterBoxes(GfxDevice& gfx, uint32_t count);
+  void spawnScatterBoxes(GfxDevice& gfx, uint32_t count, bool pile = false);
   void clearScatterBoxes(GfxDevice& gfx);
   void uploadObjectTransforms(GfxDevice& gfx, uint32_t frameIndex);
   void uploadObjectTransforms(GfxDevice& gfx) { uploadObjectTransforms(gfx, 0); }
@@ -250,7 +250,7 @@ public:
   void notifyOccupancyChanged(int objectIndex);
   uint32_t physicsCornerCount(int objectIndex) const;
   uint32_t physicsEdgeCount(int objectIndex) const;
-  physics::DebugSolve physicsDebug() const { return physics_.debugSolve(); }
+  const physics::DebugSolve& physicsDebug() const { return physics_.debugSolve(); }
   blast::StructureWorld& structures() { return structures_; }
   const blast::StructureWorld& structures() const { return structures_; }
   VoxelObjectId stressCylinderId() const { return stressCylinderId_; }

@@ -3,6 +3,7 @@
 #include "physics/RigidBody.h"
 #include <unordered_map>
 #include <cmath>
+#include <utility>
 
 namespace physics {
 
@@ -33,11 +34,23 @@ public:
   }
   size_t size() const { return pairs_.size(); }
 
+  struct Pair;
+  // Two-phase use for parallel narrow phase: call slot() serially for every
+  // pair (the only map mutation; node references stay valid across rehash),
+  // then collectInto() may run concurrently for distinct slots.
+  Pair& slot(int a, int b) { return pairs_[key(a, b)]; }
+
   template<class Generate>
   Stats collect(const RigidBody& a, const RigidBody& b, ContactBodyStamp sa, ContactBodyStamp sb,
                 int substep, std::vector<Contact>& out, Generate&& generate, bool enabled = true) {
     if (!enabled) { generate(out); return {1, 0, 0}; }
-    Pair& pair = pairs_[key(a.shapeIndex, b.shapeIndex)];
+    return collectInto(slot(a.shapeIndex, b.shapeIndex), a, b, sa, sb, substep, out,
+                       std::forward<Generate>(generate));
+  }
+
+  template<class Generate>
+  Stats collectInto(Pair& pair, const RigidBody& a, const RigidBody& b, ContactBodyStamp sa,
+                    ContactBodyStamp sb, int substep, std::vector<Contact>& out, Generate&& generate) const {
     const bool compatible = pair.seen + 1 == serial_ && pair.seen != 0 &&
         same(pair.a, a, pair.sa, sa) && same(pair.b, b, pair.sb, sb);
     const float limit = 0.2f * std::min(sa.fineSize, sb.fineSize);
@@ -113,7 +126,6 @@ public:
     }
   }
 
-private:
   struct Pose {
     glm::vec3 x{0}, com{0}; glm::quat q{1,0,0,0};
     float invM = 0, extent = 0; bool awake = false, dynamic = false;
@@ -122,6 +134,8 @@ private:
   struct Pair {
     Pose a, b; ContactBodyStamp sa, sb; std::vector<Point> points; uint64_t seen = 0;
   };
+
+private:
   std::unordered_map<uint64_t, Pair> pairs_;
   uint64_t serial_ = 0;
   static uint64_t key(int a, int b) {

@@ -50,6 +50,7 @@ struct Options {
   bool benchmark = false;
   bool e2Perf = false;
   bool frameFail = false;
+  int collisionPerf = 0;  // >0: spawn N scatter boxes and time physics stages
   float frameHeightMeters = 4.0f;
   std::string frameImpactMode = "shear";
   int frameRenderHz = 60;
@@ -94,6 +95,8 @@ Options parseOptions(int argc, char** argv) {
       options.e2Perf = true;
     } else if (arg == "--frame-fail") {
       options.frameFail = true;
+    } else if (arg == "--collision-perf") {
+      options.collisionPerf = integer(1, static_cast<int>(VoxelScene::kMaxVoxelObjects));
     } else if (arg == "--frame-height") {
       const std::string text = value();
       size_t parsed = 0;
@@ -153,7 +156,8 @@ Options parseOptions(int argc, char** argv) {
   if (options.benchmark && options.e2Perf) {
     throw std::runtime_error("Use either --benchmark or --e2-perf, not both");
   }
-  if (argc > 1 && !options.benchmark && !options.e2Perf && !options.frameFail && !options.help) {
+  if (argc > 1 && !options.benchmark && !options.e2Perf && !options.frameFail && options.collisionPerf == 0 &&
+      !options.help) {
     throw std::runtime_error("Rendering options require --benchmark; use --help for usage");
   }
   auto outputPath = [](const std::string& text) -> std::filesystem::path {
@@ -638,7 +642,7 @@ void runE2PerfLiveFps(Window& window, GfxDevice& gfx, VoxelScene& scene, PerfLog
     s.commitMs = std::chrono::duration<double, std::milli>(t2 - t1).count();
     s.drawMs = std::chrono::duration<double, std::milli>(t3 - t2).count();
     const blast::StructureDebugSnapshot& st = scene.structures().debug();
-    const physics::DebugSolve ds = scene.physicsDebug();
+    const physics::DebugSolve& ds = scene.physicsDebug();
     s.solveMs = st.solveMs;
     s.probeMs = st.probeMs;
     s.statsMs = st.statsMs;
@@ -720,7 +724,7 @@ void runE2PerfEngine(Window& window, GfxDevice& gfx, VoxelScene& scene, PerfLog&
       s.updateMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
       s.commitMs = std::chrono::duration<double, std::milli>(t2 - t1).count();
       const blast::StructureDebugSnapshot& st = scene.structures().debug();
-      const physics::DebugSolve ds = scene.physicsDebug();
+      const physics::DebugSolve& ds = scene.physicsDebug();
       s.solveMs = st.solveMs;
       s.probeMs = st.probeMs;
       s.statsMs = st.statsMs;
@@ -802,6 +806,72 @@ void showFatal(const char* message, bool dialogs) {
 
 }  // namespace
 
+// Many-body collision stress: N scatter boxes dropped in a stacked grid onto the
+// ground, timed per fixed tick. Covers the fall, the pile-up and settling.
+void runCollisionPerf(GfxDevice& gfx, VoxelScene& scene, int count) {
+  const std::filesystem::path reportPath =
+      std::filesystem::path(VE_ASSETS_DIR).parent_path() / "docs" / "collision-perf.txt";
+  FILE* report = std::fopen(reportPath.string().c_str(), "a");
+  if (report == nullptr) {
+    throw std::runtime_error("Cannot open " + reportPath.string());
+  }
+  scene.spawnScatterBoxes(gfx, static_cast<uint32_t>(count), /*pile=*/true);
+  scene.setSimulate(gfx, true);
+  struct Row { double tick, broad, sync, narrow, solver, record, sleep; int awake, contacts, pairs; };
+  std::vector<Row> rows;
+  constexpr int kTicks = 360;
+  for (int i = 0; i < kTicks; ++i) {
+    const auto t0 = std::chrono::steady_clock::now();
+    scene.update(physics::kDt);
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    const auto& d = scene.physicsDebug();
+    if (std::getenv("VE_COLLISION_PERF_TRACE") != nullptr && i % 10 == 0) {
+      float minY = 1e30f, maxY = -1e30f;
+      for (int s = 0; s < scene.cpuObjectCount(); ++s) {
+        const VoxelObject& o = scene.cpuObject(s);
+        if (o.slotOccupied && o.isScatter) { minY = std::min(minY, o.position.y); maxY = std::max(maxY, o.position.y); }
+      }
+      std::fprintf(report, "  tick %d y=[%.2f,%.2f] contacts=%d awake=%d pairs=%d\n", i, minY, maxY, d.contacts,
+                   d.awakeBodies, d.narrowPhasePairs);
+    }
+    rows.push_back({ms, d.broadPhaseMs, d.broadSyncMs, d.narrowPhaseMs, d.solverOnlyMs, d.contactRecordMs, d.sleepMs,
+                    d.awakeBodies, d.contacts, d.narrowPhasePairs});
+  }
+  auto stat = [&](auto field, int from, int to) {
+    std::vector<double> v;
+    for (int i = from; i < to; ++i)
+      if (rows[static_cast<size_t>(i)].awake > 0) v.push_back(field(rows[static_cast<size_t>(i)]));
+    if (v.empty()) return std::array<double, 3>{0, 0, 0};
+    std::sort(v.begin(), v.end());
+    return std::array<double, 3>{v[v.size() / 2], v[static_cast<size_t>(0.95 * (v.size() - 1))], v.back()};
+  };
+  auto phase = [&](const char* name, int from, int to) {
+    auto t = stat([](const Row& r) { return r.tick; }, from, to);
+    auto n = stat([](const Row& r) { return r.narrow; }, from, to);
+    auto b = stat([](const Row& r) { return r.broad; }, from, to);
+    auto sy = stat([](const Row& r) { return r.sync; }, from, to);
+    auto s = stat([](const Row& r) { return r.solver; }, from, to);
+    auto rc = stat([](const Row& r) { return r.record; }, from, to);
+    auto sl = stat([](const Row& r) { return r.sleep; }, from, to);
+    auto aw = stat([](const Row& r) { return static_cast<double>(r.awake); }, from, to);
+    auto ct = stat([](const Row& r) { return static_cast<double>(r.contacts); }, from, to);
+    std::fprintf(report, "N=%d %-8s tick med=%.2f p95=%.2f max=%.2f | narrow %.2f/%.2f broad %.2f/%.2f (sync %.2f) "
+                "solver %.2f/%.2f record %.2f/%.2f sleep %.2f/%.2f | awake~%.0f contacts~%.0f\n",
+                count, name, t[0], t[1], t[2], n[0], n[1], b[0], b[1], sy[0], s[0], s[1], rc[0], rc[1], sl[0], sl[1],
+                aw[0], ct[0]);
+  };
+  // Only ticks with awake bodies: once everything sleeps a tick costs ~nothing.
+  int active = 0;
+  double total = 0;
+  for (const Row& r : rows) {
+    if (r.awake > 0) ++active;
+    total += r.tick;
+  }
+  phase("active", 0, kTicks);
+  std::fprintf(report, "N=%d active ticks=%d total=%.1f ms\n", count, active, total);
+  std::fclose(report);
+}
+
 void runFrameFail(GfxDevice& gfx, VoxelScene& scene, PerfLog& out, const Options& options) {
   auto dump = [&](const char* tag) {
     const blast::StructureDebugSnapshot& st = scene.structures().debug();
@@ -821,7 +891,7 @@ void runFrameFail(GfxDevice& gfx, VoxelScene& scene, PerfLog& out, const Options
                   st.candidateCount, st.fracturedBonds, st.splitActors, st.fractureEnabled ? 1 : 0,
                   (inst && inst->keepBox) ? 1 : 0, st.cut ? 1 : 0, enabled, st.nodes, st.bonds);
     out.line(line);
-    const auto phys = scene.physicsDebug();
+    const auto& phys = scene.physicsDebug();
     std::snprintf(line, sizeof(line), "contact-cache narrow=%d reuse=%d warm=%d collideMs=%.4f solveMs=%.4f",
                   phys.narrowPhasePairs, phys.reusedContactPairs, phys.warmStartedPoints,
                   phys.collideMs, phys.contactSolveMs);
@@ -951,7 +1021,7 @@ int main(int argc, char** argv) {
         SetWindowPos(hwnd, HWND_NOTOPMOST, 160, 160, 0, 0, SWP_SHOWWINDOW | SWP_NOSIZE);
       }
     }
-    if (options.e2Perf || options.frameFail) {
+    if (options.e2Perf || options.frameFail || options.collisionPerf > 0) {
       if (AttachConsole(ATTACH_PARENT_PROCESS) || AllocConsole()) {
         FILE* fp = nullptr;
         freopen_s(&fp, "CONOUT$", "w", stdout);
@@ -963,6 +1033,14 @@ int main(int argc, char** argv) {
     GfxDevice gfx(window);
     VoxelScene scene;
     scene.init(gfx, blastRt);
+
+    if (options.collisionPerf > 0) {
+      runCollisionPerf(gfx, scene, options.collisionPerf);
+      gfx.waitIdle();
+      scene.cleanup(gfx);
+      blastRt.shutdown();
+      return 0;
+    }
 
     if (options.frameFail) {
       const std::filesystem::path reportPath =
