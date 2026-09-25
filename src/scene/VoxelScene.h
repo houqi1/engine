@@ -16,6 +16,7 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <unordered_set>
@@ -254,6 +255,15 @@ public:
   blast::StructureWorld& structures() { return structures_; }
   const blast::StructureWorld& structures() const { return structures_; }
   VoxelObjectId stressCylinderId() const { return stressCylinderId_; }
+  // Structure mounted for the stress demo object (cylinder or four-column frame).
+  blast::StructureInstance* stressStructure() { return structures_.find(stressCylinderId_); }
+  const blast::StructureInstance* stressStructure() const { return structures_.find(stressCylinderId_); }
+  // Mounts one voxel object's whole fine grid as a stress structure, replacing any
+  // structure already mounted for it. Density is the object's; anchors come from
+  // anchorFine (object-local fine coordinates). Returns nullptr on failure.
+  blast::StructureInstance* mountObjectStructure(VoxelObjectId id, int agg,
+                                                 const std::function<bool(int, int, int)>& anchorFine,
+                                                 blast::StructureMountDesc desc);
   bool spawnStressCylinder(GfxDevice& gfx);
   bool resetStressCylinder(GfxDevice& gfx);
   bool cutStressCylinder270(GfxDevice& gfx);

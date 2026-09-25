@@ -150,8 +150,8 @@ void testCutCandidatesAndSplit(blast::BlastRuntime& rt) {
     for (const auto& b : inst->graph.bonds) {
       const auto it = inst->blast.sdkBondFromStable.find(b.stableId);
       if (it != inst->blast.sdkBondFromStable.end() && it->second == h.blastBondIndex && !b.world) {
-        const float az = std::atan2(b.cz - inst->axisZ, b.cx - inst->axisX);
-        if (az >= inst->keepAz0 && az < inst->keepAz1) {
+        const float az = std::atan2(b.cz - inst->diag.axisZ, b.cx - inst->diag.axisX);
+        if (az >= inst->diag.keepAz0 && az < inst->diag.keepAz1) {
           ++stripHits;
         }
       }

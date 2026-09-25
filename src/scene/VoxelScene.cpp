@@ -3,6 +3,7 @@
 #include "blast/CylinderVoxels.h"
 #include "blast/FrameVoxels.h"
 #include "blast/HardFracture.h"
+#include "blast/ObjectOccupancyView.h"
 #include "blast/OccupancySampler.h"
 #include "gfx/GfxDevice.h"
 #include "gfx/Texture.h"
@@ -167,6 +168,8 @@ void VoxelScene::freeObjectSlot(uint32_t slot) {
   if (!o.slotOccupied) {
     return;
   }
+  // No structure may keep simulating or binding an object that no longer exists.
+  structures_.unmount(makeObjectId(slot));
   clearObjectPages(o);
   o = VoxelObject{};
   o.slotOccupied = false;
@@ -185,7 +188,6 @@ void VoxelScene::freeObjectSlot(uint32_t slot) {
     testObjectId_ = {};
   }
   if (stressCylinderId_.slot == slot) {
-    structures_.unmount(stressCylinderId_);
     stressCylinderId_ = {};
   }
 }
@@ -1803,55 +1805,43 @@ void VoxelScene::destroyStressCylinderObject() {
   freeObjectSlot(slot);
 }
 
-namespace {
-
-class CylinderObjectView final : public blast::OccupancyView {
-public:
-  CylinderObjectView(const VoxelScene& scene, int objectIndex, const blast::CylinderRaster& spec)
-      : scene_(scene), objectIndex_(objectIndex), spec_(spec) {}
-  int nx() const override { return spec_.nx; }
-  int ny() const override { return spec_.ny; }
-  int nz() const override { return spec_.nz; }
-  float voxelSize() const override { return spec_.voxelSize; }
-  float density() const override { return blast::kE1Density; }
-  bool solid(int x, int y, int z) const override {
-    glm::ivec3 c, m, f;
-    scene_.splitFineIndex(x, y, z, c, m, f);
-    return scene_.occupancyFine(objectIndex_, c, m, f);
+blast::StructureInstance* VoxelScene::mountObjectStructure(VoxelObjectId id, int agg,
+                                                           const std::function<bool(int, int, int)>& anchorFine,
+                                                           blast::StructureMountDesc desc) {
+  const VoxelObject* o = tryGetObject(id);
+  if (o == nullptr) {
+    return nullptr;
   }
-  bool anchor(int x, int y, int z) const override {
-    return solid(x, y, z) && blast::isBaseAnchorFine(x, y, z, spec_);
+  const int slot = static_cast<int>(id.slot);
+  const blast::ObjectOccupancyView view(
+      o->gridSize * kFinePerCoarse, o->voxelSize / static_cast<float>(kFinePerCoarse), o->density,
+      [this, slot](int x, int y, int z) {
+        glm::ivec3 c, m, f;
+        splitFineIndex(x, y, z, c, m, f);
+        return occupancyFine(slot, c, m, f);
+      },
+      anchorFine);
+  blast::OccupancySampleOpts opts;
+  opts.agg = agg;
+  const auto t0 = std::chrono::steady_clock::now();
+  blast::OccupancySample sample = blast::sampleOccupancy(view, opts);
+  const auto t1 = std::chrono::steady_clock::now();
+  if (sample.error != blast::BlastError::Ok) {
+    std::cerr << "OccupancySampler: " << sample.message << "\n";
+    return nullptr;
   }
-
-private:
-  const VoxelScene& scene_;
-  int objectIndex_;
-  blast::CylinderRaster spec_;
-};
-
-class FrameObjectView final : public blast::OccupancyView {
-public:
-  FrameObjectView(const VoxelScene& scene, int objectIndex) : scene_(scene), objectIndex_(objectIndex) {}
-  int nx() const override { return blast::kFrameGridFines; }
-  int ny() const override { return blast::kFrameGridFines; }
-  int nz() const override { return blast::kFrameGridFines; }
-  float voxelSize() const override { return blast::kE1FineMeters; }
-  float density() const override { return blast::kE1Density; }
-  bool solid(int x, int y, int z) const override {
-    glm::ivec3 c, m, f;
-    scene_.splitFineIndex(x, y, z, c, m, f);
-    return scene_.occupancyFine(objectIndex_, c, m, f);
+  desc.objectId = id;
+  blast::StructureHandle handle;
+  if (structures_.mount(desc, std::move(sample), &handle) != blast::BlastError::Ok) {
+    std::cerr << "StructureWorld mount: " << structures_.lastError() << "\n";
+    return nullptr;
   }
-  bool anchor(int x, int y, int z) const override {
-    return solid(x, y, z) && blast::isFrameAnchorFine(x, y, z);
-  }
-
-private:
-  const VoxelScene& scene_;
-  int objectIndex_;
-};
-
-}  // namespace
+  blast::StructureInstance* inst = structures_.find(handle);
+  inst->debug.extractMs = std::chrono::duration<float, std::milli>(t1 - t0).count();
+  inst->topologyRevision = o->topologyRevision;
+  inst->debug.topologyRevision = o->topologyRevision;
+  return inst;
+}
 
 bool VoxelScene::mountCylinderFromOccupancy(GfxDevice& gfx) {
   VoxelObject* o = tryGetObject(stressCylinderId_);
@@ -1859,39 +1849,31 @@ bool VoxelScene::mountCylinderFromOccupancy(GfxDevice& gfx) {
     return false;
   }
   const blast::CylinderRaster spec{};
-  CylinderObjectView view(*this, static_cast<int>(stressCylinderId_.slot), spec);
-  blast::OccupancySampleOpts opts;
-  opts.agg = blast::kE1Agg;
-  const auto t0 = std::chrono::steady_clock::now();
-  blast::OccupancySample sample = blast::sampleOccupancy(view, opts);
-  const auto t1 = std::chrono::steady_clock::now();
-  if (sample.error != blast::BlastError::Ok) {
-    std::cerr << "OccupancySampler: " << sample.message << "\n";
+  blast::StructureMountDesc desc;
+  desc.material.strengthPa = blast::kE1StrengthHoldPa;
+  desc.material.solverIters = stressCylinderCut_ ? 400u : 200u;
+  desc.diag.kind = blast::DiagnosticProfile::Kind::CylinderStrip;
+  desc.diag.axisX = blast::cylinderAxisX(spec);
+  desc.diag.axisZ = blast::cylinderAxisZ(spec);
+  desc.diag.keepAz0 = blast::kE1KeepAz0;
+  desc.diag.keepAz1 = blast::kE1KeepAz1;
+  desc.diag.cutApplied = stressCylinderCut_;
+  desc.keepMaterialOfReplaced = true;
+  blast::StructureInstance* inst = mountObjectStructure(
+      stressCylinderId_, blast::kE1Agg,
+      [spec](int x, int y, int z) { return blast::isBaseAnchorFine(x, y, z, spec); }, desc);
+  if (inst == nullptr) {
     return false;
-  }
-  const blast::BlastError err = structures_.mountSample(
-      stressCylinderId_, std::move(sample), stressCylinderCut_ ? 400u : 200u, blast::kE1StrengthHoldPa,
-      blast::cylinderAxisX(spec), blast::cylinderAxisZ(spec));
-  if (err != blast::BlastError::Ok) {
-    std::cerr << "StructureWorld mount: " << structures_.lastError() << "\n";
-    return false;
-  }
-  if (blast::StructureInstance* inst = structures_.instance()) {
-    inst->debug.extractMs = std::chrono::duration<float, std::milli>(t1 - t0).count();
-    inst->topologyRevision = o->topologyRevision;
-    inst->debug.topologyRevision = o->topologyRevision;
-    inst->cutApplied = stressCylinderCut_;
-    inst->debug.cut = stressCylinderCut_;
   }
   if (stressCylinderDoubleDensity_) {
-    structures_.setDensityScale(2.0f);
+    structures_.setDensityScale(2.0f, inst);
   }
   o->topologyRevision += 1;
   packObjectPool();
   flushObject(gfx, static_cast<int>(stressCylinderId_.slot));
   notifyOccupancyChanged(static_cast<int>(stressCylinderId_.slot));
   physics_.rebuildFromScene();
-  structures_.warmupGravity(stressCylinderCut_ ? 24u : 8u);
+  structures_.warmupGravity(stressCylinderCut_ ? 24u : 8u, inst);
   lastStressPaintSolveEpoch_ = 0;
   if (stressCylinderDisplay_) {
     paintCylinderStress(gfx);
@@ -1901,7 +1883,7 @@ bool VoxelScene::mountCylinderFromOccupancy(GfxDevice& gfx) {
 }
 
 void VoxelScene::paintCylinderStress(GfxDevice& gfx) {
-  const blast::StructureInstance* inst = structures_.instance();
+  const blast::StructureInstance* inst = stressStructure();
   if (inst == nullptr) {
     return;
   }
@@ -1966,7 +1948,7 @@ void VoxelScene::paintCylinderStress(GfxDevice& gfx) {
 }
 
 void VoxelScene::paintBondDamage(GfxDevice& gfx) {
-  const blast::StructureInstance* inst = structures_.instance();
+  const blast::StructureInstance* inst = stressStructure();
   if (inst == nullptr) {
     return;
   }
@@ -2042,7 +2024,7 @@ void VoxelScene::setBondDamageDisplay(GfxDevice& gfx, bool on) {
 }
 
 void VoxelScene::refreshStressColors(GfxDevice& gfx) {
-  const blast::StructureInstance* inst = structures_.instance();
+  const blast::StructureInstance* inst = stressStructure();
   if (inst == nullptr || !stressCylinderId_.valid()) {
     return;
   }
@@ -2158,42 +2140,29 @@ bool VoxelScene::mountFrameFromOccupancy(GfxDevice& gfx) {
   if (o == nullptr) {
     return false;
   }
-  FrameObjectView view(*this, static_cast<int>(stressCylinderId_.slot));
-  blast::OccupancySampleOpts opts;
-  opts.agg = blast::kFrameAgg;
-  const auto t0 = std::chrono::steady_clock::now();
-  blast::OccupancySample sample = blast::sampleOccupancy(view, opts);
-  const auto t1 = std::chrono::steady_clock::now();
-  if (sample.error != blast::BlastError::Ok) {
-    std::cerr << "OccupancySampler: " << sample.message << "\n";
-    return false;
-  }
-  const blast::BlastError err =
-      structures_.mountSample(stressCylinderId_, std::move(sample), 400, blast::kFrameStrengthHoldPa, 0.0f, 0.0f);
-  if (err != blast::BlastError::Ok) {
-    std::cerr << "StructureWorld mount: " << structures_.lastError() << "\n";
-    return false;
-  }
   blast::FrameRaster spec{};
-  float x0, x1, z0, z1;
-  blast::keepColumnWorldBox(spec, x0, x1, z0, z1);
-  structures_.setKeepColumnBox(x0, x1, z0, z1);
-  if (blast::StructureInstance* inst = structures_.instance()) {
-    inst->debug.extractMs = std::chrono::duration<float, std::milli>(t1 - t0).count();
-    inst->topologyRevision = o->topologyRevision;
-    inst->debug.topologyRevision = o->topologyRevision;
-    inst->cutApplied = stressCylinderCut_;
-    inst->debug.cut = stressCylinderCut_;
+  blast::StructureMountDesc desc;
+  desc.material.strengthPa = blast::kFrameStrengthHoldPa;
+  desc.material.solverIters = 400;
+  desc.diag.kind = blast::DiagnosticProfile::Kind::ColumnBox;
+  blast::keepColumnWorldBox(spec, desc.diag.keepX0, desc.diag.keepX1, desc.diag.keepZ0, desc.diag.keepZ1);
+  desc.diag.cutApplied = stressCylinderCut_;
+  desc.keepMaterialOfReplaced = true;
+  blast::StructureInstance* inst = mountObjectStructure(
+      stressCylinderId_, blast::kFrameAgg, [](int x, int y, int z) { return blast::isFrameAnchorFine(x, y, z); },
+      desc);
+  if (inst == nullptr) {
+    return false;
   }
   if (stressCylinderDoubleDensity_) {
-    structures_.setDensityScale(2.0f);
+    structures_.setDensityScale(2.0f, inst);
   }
   o->topologyRevision += 1;
   packObjectPool();
   flushObject(gfx, static_cast<int>(stressCylinderId_.slot));
   notifyOccupancyChanged(static_cast<int>(stressCylinderId_.slot));
   physics_.rebuildFromScene();
-  structures_.warmupGravity(stressCylinderCut_ ? 16u : 8u);
+  structures_.warmupGravity(stressCylinderCut_ ? 16u : 8u, inst);
   lastStressPaintSolveEpoch_ = 0;
   if (stressCylinderDisplay_) {
     paintCylinderStress(gfx);
@@ -2300,7 +2269,7 @@ bool VoxelScene::cutThreeColumns(GfxDevice& gfx) {
 }
 
 bool VoxelScene::liftStructureForRedrop() {
-  if (!frameSpawnPosValid_ || !structures_.instance()) {
+  if (!frameSpawnPosValid_ || structures_.instanceCount() == 0) {
     return false;
   }
   std::vector<VoxelObjectId> ids;
@@ -2378,10 +2347,15 @@ bool VoxelScene::liftStructureForRedrop() {
 
 bool VoxelScene::setStressCylinderDoubleDensity(bool on) {
   stressCylinderDoubleDensity_ = on;
-  return structures_.setDensityScale(on ? 2.0f : 1.0f);
+  blast::StructureInstance* inst = stressStructure();
+  return inst != nullptr && structures_.setDensityScale(on ? 2.0f : 1.0f, inst);
 }
 
-void VoxelScene::setStressCylinderSolverIters(uint32_t iters) { structures_.setSolverIters(iters); }
+void VoxelScene::setStressCylinderSolverIters(uint32_t iters) {
+  if (blast::StructureInstance* inst = stressStructure()) {
+    structures_.setSolverIters(iters, inst);
+  }
+}
 
 void VoxelScene::setStressCylinderDisplay(GfxDevice& gfx, bool on) {
   stressCylinderDisplay_ = on;

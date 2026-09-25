@@ -214,6 +214,7 @@ ve_blast_test(blast_e3_tests
   tests/blast_e3_tests.cpp
   src/physics/Solver.cpp
 )
+ve_blast_test(blast_e5_tests tests/blast_e5_tests.cpp)
 
 # ---- Shader compilation ----
 find_program(GLSLC glslc HINTS /opt/homebrew/bin ENV VULKAN_SDK PATH_SUFFIXES bin REQUIRED)

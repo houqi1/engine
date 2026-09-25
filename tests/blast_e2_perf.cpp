@@ -191,8 +191,8 @@ void currentNestedStats(blast::StructureInstance& inst, uint32_t n, float& maxT,
     if (pr == nullptr) {
       continue;
     }
-    const float az = bondAzimuth(b, inst.axisX, inst.axisZ);
-    if (az >= inst.keepAz0 && az < inst.keepAz1) {
+    const float az = bondAzimuth(b, inst.diag.axisX, inst.diag.axisZ);
+    if (az >= inst.diag.keepAz0 && az < inst.diag.keepAz1) {
       strip = std::max(strip, blast::probeMaxStress(*pr));
     }
   }
@@ -211,8 +211,8 @@ void linearStats(blast::StructureInstance& inst, uint32_t n, float& maxT, float&
     uint8_t f = 0;
     if (b.world) {
       f = 1;
-    } else if (bondAzimuth(b, inst.axisX, inst.axisZ) >= inst.keepAz0 &&
-               bondAzimuth(b, inst.axisX, inst.axisZ) < inst.keepAz1) {
+    } else if (bondAzimuth(b, inst.diag.axisX, inst.diag.axisZ) >= inst.diag.keepAz0 &&
+               bondAzimuth(b, inst.diag.axisX, inst.diag.axisZ) < inst.diag.keepAz1) {
       f = 2;
     }
     flag[it->second] = f;

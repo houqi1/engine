@@ -88,26 +88,36 @@ void StructureWorld::resetTickSession() {
   ticksReceived_ = 0;
   lastTickId_ = 0;
   lastDt_ = 0.0f;
-  for (StructureInstance& inst : instances_) {
-    inst.impactEvents.reset();
+  for (auto& inst : instances_) {
+    inst->impactEvents.reset();
   }
 }
 
 void StructureWorld::unmount(VoxelObjectId objectId) {
+  if (!objectId.valid()) {
+    return;
+  }
   instances_.erase(std::remove_if(instances_.begin(), instances_.end(),
-                                  [&](const StructureInstance& i) { return i.objectId == objectId; }),
+                                  [&](const std::unique_ptr<StructureInstance>& i) { return i->objectId == objectId; }),
                    instances_.end());
+  for (auto& inst : instances_) {
+    for (ActorBinding& b : inst->bindings) {
+      if (b.objectId == objectId) {
+        b.objectId = {};
+      }
+    }
+  }
 }
 
 bool StructureWorld::ownsObject(VoxelObjectId objectId) const {
   if (!objectId.valid()) {
     return false;
   }
-  for (const StructureInstance& inst : instances_) {
-    if (inst.objectId == objectId) {
+  for (const auto& inst : instances_) {
+    if (inst->objectId == objectId) {
       return true;
     }
-    for (const ActorBinding& b : inst.bindings) {
+    for (const ActorBinding& b : inst->bindings) {
       if (b.objectId == objectId) {
         return true;
       }
@@ -118,8 +128,8 @@ bool StructureWorld::ownsObject(VoxelObjectId objectId) const {
 
 const std::vector<ActorBinding>& StructureWorld::bindings() const {
   bindingCache_.clear();
-  for (const StructureInstance& inst : instances_) {
-    bindingCache_.insert(bindingCache_.end(), inst.bindings.begin(), inst.bindings.end());
+  for (const auto& inst : instances_) {
+    bindingCache_.insert(bindingCache_.end(), inst->bindings.begin(), inst->bindings.end());
   }
   return bindingCache_;
 }
@@ -133,7 +143,7 @@ BlastError StructureWorld::applyOccupancyRemoval(VoxelObjectId objectId, const g
   size_t index = instances_.size();
   glm::ivec3 origin(0);
   for (size_t i = 0; i < instances_.size(); ++i) {
-    const StructureInstance& inst = instances_[i];
+    const StructureInstance& inst = *instances_[i];
     if (inst.objectId == objectId) {
       index = i;
       break;
@@ -152,7 +162,7 @@ BlastError StructureWorld::applyOccupancyRemoval(VoxelObjectId objectId, const g
   if (index >= instances_.size()) {
     return BlastError::Ok;
   }
-  StructureInstance& inst = instances_[index];
+  StructureInstance& inst = *instances_[index];
   if (inst.objectId == objectId) {
     for (const ActorBinding& b : inst.bindings) {
       if (b.objectId == objectId) {
@@ -206,20 +216,13 @@ BlastError StructureWorld::applyOccupancyRemoval(VoxelObjectId objectId, const g
     ownerFineN.push_back(fineN);
   }
 
-  const float strength = inst.strengthPa;
-  const uint32_t iters = inst.solverIters;
-  const bool fracture = inst.fractureEnabled;
+  const StructureMaterial material = inst.material;
+  const DiagnosticProfile diag = inst.diag;
   const uint64_t strengthEpoch = inst.strengthEpoch;
-  const float axisX = inst.axisX;
-  const float axisZ = inst.axisZ;
-  const float keepAz0 = inst.keepAz0;
-  const float keepAz1 = inst.keepAz1;
-  const bool keepBox = inst.keepBox;
-  const float keepX0 = inst.keepX0;
-  const float keepX1 = inst.keepX1;
-  const float keepZ0 = inst.keepZ0;
-  const float keepZ1 = inst.keepZ1;
-  const bool cut = inst.cutApplied;
+  const StructureHandle oldHandle = inst.handle;
+  const VoxelObjectId oldRoot = inst.objectId;
+  const float strength = material.strengthPa;
+  const uint32_t iters = material.solverIters;
 
   std::vector<CompactFamily> families;
   const RebuildResult rebuilt =
@@ -234,28 +237,27 @@ BlastError StructureWorld::applyOccupancyRemoval(VoxelObjectId objectId, const g
     std::cout << "Structure rebuild: occupancy empty, family released\n";
     return BlastError::Ok;
   }
+  bool handleReused = false;
   for (CompactFamily& cf : families) {
-    StructureInstance neu;
+    auto owned = std::make_unique<StructureInstance>();
+    StructureInstance& neu = *owned;
     const bool known = cf.owner < ownerObject.size();
     neu.objectId = known && ownerObject[cf.owner].valid() ? ownerObject[cf.owner] : objectId;
+    // The piece still mounted for the original root object stays the same structure.
+    if (!handleReused && neu.objectId == oldRoot) {
+      neu.handle = oldHandle;
+      handleReused = true;
+    } else {
+      neu.handle.id = nextHandleId_++;
+    }
     const glm::ivec3 org = known ? ownerOrigin[cf.owner] : origin;
     neu.grid = std::move(cf.grid);
     neu.graph = std::move(cf.graph);
     neu.blast = std::move(cf.blast);
-    neu.fractureEnabled = fracture;
-    neu.strengthPa = strength;
+    neu.material = material;
+    neu.material.solverIters = iters == 0 ? 200u : iters;
+    neu.diag = diag;
     neu.strengthEpoch = strengthEpoch == 0 ? 1 : strengthEpoch;
-    neu.solverIters = iters == 0 ? 200u : iters;
-    neu.axisX = axisX;
-    neu.axisZ = axisZ;
-    neu.keepAz0 = keepAz0;
-    neu.keepAz1 = keepAz1;
-    neu.keepBox = keepBox;
-    neu.keepX0 = keepX0;
-    neu.keepX1 = keepX1;
-    neu.keepZ0 = keepZ0;
-    neu.keepZ1 = keepZ1;
-    neu.cutApplied = cut;
     neu.pending.valid = false;
     if (neu.blast.solver != nullptr) {
       applyExtStressStrength(*neu.blast.solver, strength);
@@ -290,28 +292,29 @@ BlastError StructureWorld::applyOccupancyRemoval(VoxelObjectId objectId, const g
     neu.debug.mass = mass;
     neu.debug.weight = mass * -kE1GravityY;
     neu.debug.density = neu.grid.density;
-    neu.debug.solverIters = neu.solverIters;
-    neu.debug.fractureEnabled = fracture;
+    neu.debug.solverIters = neu.material.solverIters;
+    neu.debug.fractureEnabled = material.fractureEnabled;
     neu.debug.strengthPa = strength;
-    neu.debug.cut = cut;
+    neu.debug.cut = diag.cutApplied;
     neu.debug.bindingCount = static_cast<uint32_t>(neu.bindings.size());
     // Removing a bridge can disconnect an actor without any new stress damage.
     neu.occupancyDirty = neu.objectId == objectId;
-    instances_.push_back(std::move(neu));
+    instances_.push_back(std::move(owned));
   }
   std::cout << "Structure rebuild: cleared " << cleared << " voxels, families=" << families.size() << "\n";
   return BlastError::Ok;
 }
 
-void StructureWorld::markCut(bool cut) {
-  if (!instances_.empty()) {
-    instances_.front().cutApplied = cut;
-    instances_.front().debug.cut = cut;
+void StructureWorld::markCut(bool cut, StructureInstance* target) {
+  StructureInstance* inst = target != nullptr ? target : instance();
+  if (inst != nullptr) {
+    inst->diag.cutApplied = cut;
+    inst->debug.cut = cut;
   }
 }
 
-uint32_t StructureWorld::warmupGravity(uint32_t maxPasses) {
-  StructureInstance* inst = instance();
+uint32_t StructureWorld::warmupGravity(uint32_t maxPasses, StructureInstance* target) {
+  StructureInstance* inst = target != nullptr ? target : instance();
   if (inst == nullptr || inst->blast.solver == nullptr || maxPasses == 0) {
     return 0;
   }
@@ -337,22 +340,24 @@ uint32_t StructureWorld::warmupGravity(uint32_t maxPasses) {
   return n + 1;
 }
 
-void StructureWorld::setKeepColumnBox(float x0, float x1, float z0, float z1) {
-  if (instances_.empty()) {
+void StructureWorld::setKeepColumnBox(float x0, float x1, float z0, float z1, StructureInstance* target) {
+  StructureInstance* inst = target != nullptr ? target : instance();
+  if (inst == nullptr) {
     return;
   }
-  StructureInstance& inst = instances_.front();
-  inst.keepBox = true;
-  inst.keepX0 = x0;
-  inst.keepX1 = x1;
-  inst.keepZ0 = z0;
-  inst.keepZ1 = z1;
-  rebuildBondMeta(inst);
+  inst->diag.kind = DiagnosticProfile::Kind::ColumnBox;
+  inst->diag.keepX0 = x0;
+  inst->diag.keepX1 = x1;
+  inst->diag.keepZ0 = z0;
+  inst->diag.keepZ1 = z1;
+  rebuildBondMeta(*inst);
 }
 
-BlastError StructureWorld::mountSample(VoxelObjectId objectId, OccupancySample sample, uint32_t solverIters,
-                                       float strengthPa, float axisX, float axisZ) {
+BlastError StructureWorld::mount(const StructureMountDesc& desc, OccupancySample sample, StructureHandle* outHandle) {
   lastError_ = "ok";
+  if (outHandle != nullptr) {
+    *outHandle = {};
+  }
   if (!initialized_ || runtime_ == nullptr) {
     lastError_ = "runtime not initialized";
     return BlastError::SolverCreateFailed;
@@ -361,27 +366,28 @@ BlastError StructureWorld::mountSample(VoxelObjectId objectId, OccupancySample s
     lastError_ = sample.message;
     return sample.error;
   }
-  StructureInstance inst;
-  inst.objectId = objectId;
+  auto owned = std::make_unique<StructureInstance>();
+  StructureInstance& inst = *owned;
+  inst.objectId = desc.objectId;
   inst.grid = std::move(sample.grid);
   inst.graph = std::move(sample.graph);
-  inst.axisX = axisX;
-  inst.axisZ = axisZ;
-  inst.keepAz0 = kE1KeepAz0;
-  inst.keepAz1 = kE1KeepAz1;
-  inst.solverIters = solverIters == 0 ? 200u : solverIters;
+  inst.diag = desc.diag;
+  inst.material = desc.material;
+  inst.material.baseDensity = inst.grid.density;
+  inst.material.solverIters = desc.material.solverIters == 0 ? 200u : desc.material.solverIters;
+  inst.strengthEpoch = 1;
   inst.debug.extractMs = 0.0f;
-  bool keepFrac = false;
-  float keepS = strengthPa;
-  uint64_t keepStrengthEpoch = 1;
-  if (StructureInstance* old = instance()) {
-    keepFrac = old->fractureEnabled;
-    keepS = old->strengthPa;
-    keepStrengthEpoch = old->strengthEpoch == 0 ? 1 : old->strengthEpoch;
+  if (desc.keepMaterialOfReplaced) {
+    if (const StructureInstance* old = find(desc.objectId)) {
+      inst.material.fractureEnabled = old->material.fractureEnabled;
+      inst.material.strengthPa = old->material.strengthPa;
+      inst.strengthEpoch = old->strengthEpoch == 0 ? 1 : old->strengthEpoch;
+    }
   }
+  const float strengthPa = inst.material.strengthPa;
   const auto t0 = std::chrono::steady_clock::now();
-  const BlastError ce =
-      createVoxelBlast(runtime_->allocator(), inst.graph, inst.grid, inst.blast, keepS, inst.solverIters);
+  const BlastError ce = createVoxelBlast(runtime_->allocator(), inst.graph, inst.grid, inst.blast, strengthPa,
+                                         inst.material.solverIters);
   const auto t1 = std::chrono::steady_clock::now();
   inst.debug.assetMs = std::chrono::duration<float, std::milli>(t1 - t0).count();
   if (ce != BlastError::Ok) {
@@ -404,34 +410,49 @@ BlastError StructureWorld::mountSample(VoxelObjectId objectId, OccupancySample s
   inst.debug.mass = sample.mass;
   inst.debug.weight = sample.mass * -kE1GravityY;
   inst.debug.density = inst.grid.density;
-  inst.debug.solverIters = inst.solverIters;
-  inst.debug.assetMs = inst.debug.assetMs;
+  inst.debug.solverIters = inst.material.solverIters;
   inst.debug.probeExportCount = 0;
-  inst.fractureEnabled = keepFrac;
-  inst.strengthPa = keepS;
-  inst.strengthEpoch = keepStrengthEpoch;
-  inst.debug.fractureEnabled = keepFrac;
-  inst.debug.strengthPa = keepS;
+  inst.debug.fractureEnabled = inst.material.fractureEnabled;
+  inst.debug.strengthPa = strengthPa;
+  inst.debug.cut = inst.diag.cutApplied;
   if (inst.blast.solver != nullptr) {
-    applyExtStressStrength(*inst.blast.solver, keepS);
+    applyExtStressStrength(*inst.blast.solver, strengthPa);
   }
   rebuildBindingsFromFamily(inst);
   if (!inst.bindings.empty()) {
-    inst.bindings.front().objectId = objectId;
+    inst.bindings.front().objectId = desc.objectId;
   }
-  unmount(objectId);
-  instances_.push_back(std::move(inst));
+  unmount(desc.objectId);
+  inst.handle.id = nextHandleId_++;
+  if (outHandle != nullptr) {
+    *outHandle = inst.handle;
+  }
+  instances_.push_back(std::move(owned));
   return BlastError::Ok;
 }
 
-bool StructureWorld::setDensityScale(float scale) {
-  StructureInstance* inst = instance();
+BlastError StructureWorld::mountSample(VoxelObjectId objectId, OccupancySample sample, uint32_t solverIters,
+                                       float strengthPa, float axisX, float axisZ) {
+  StructureMountDesc desc;
+  desc.objectId = objectId;
+  desc.material.strengthPa = strengthPa;
+  desc.material.solverIters = solverIters;
+  desc.diag.kind = DiagnosticProfile::Kind::CylinderStrip;
+  desc.diag.axisX = axisX;
+  desc.diag.axisZ = axisZ;
+  desc.diag.keepAz0 = kE1KeepAz0;
+  desc.diag.keepAz1 = kE1KeepAz1;
+  desc.keepMaterialOfReplaced = true;
+  return mount(desc, std::move(sample));
+}
+
+bool StructureWorld::setDensityScale(float scale, StructureInstance* target) {
+  StructureInstance* inst = target != nullptr ? target : instance();
   if (inst == nullptr || inst->blast.solver == nullptr) {
     return false;
   }
   const float s = scale > 0.0f ? scale : 1.0f;
-  const float baseRho = kE1Density;
-  inst->grid.density = baseRho * s;
+  inst->grid.density = inst->material.baseDensity * s;
   for (GraphNode& n : inst->graph.nodes) {
     n.mass = inst->grid.density * n.volume;
     const uint32_t g = inst->blast.graphFromStable[n.stableId];
@@ -446,16 +467,16 @@ bool StructureWorld::setDensityScale(float scale) {
   return true;
 }
 
-void StructureWorld::setSolverIters(uint32_t iters) {
-  StructureInstance* inst = instance();
+void StructureWorld::setSolverIters(uint32_t iters, StructureInstance* target) {
+  StructureInstance* inst = target != nullptr ? target : instance();
   if (inst == nullptr || inst->blast.solver == nullptr) {
     return;
   }
-  inst->solverIters = iters == 0 ? 25u : iters;
+  inst->material.solverIters = iters == 0 ? 25u : iters;
   auto st = inst->blast.solver->getSettings();
-  st.maxSolverIterationsPerFrame = inst->solverIters;
+  st.maxSolverIterationsPerFrame = inst->material.solverIters;
   inst->blast.solver->setSettings(st);
-  inst->debug.solverIters = inst->solverIters;
+  inst->debug.solverIters = inst->material.solverIters;
 }
 
 void StructureWorld::rebuildBondMeta(StructureInstance& inst) {
@@ -471,14 +492,12 @@ void StructureWorld::rebuildBondMeta(StructureInstance& inst) {
     m.stableId = b.stableId;
     m.graphIndex = gi;
     m.world = b.world ? 1 : 0;
-    if (inst.keepBox) {
-      m.inStrip = (!b.world && b.cx >= inst.keepX0 && b.cx < inst.keepX1 && b.cz >= inst.keepZ0 &&
-                   b.cz < inst.keepZ1)
-                      ? 1
-                      : 0;
-    } else {
-      const float az = bondAzimuth(b, inst.axisX, inst.axisZ);
-      m.inStrip = (!b.world && az >= inst.keepAz0 && az < inst.keepAz1) ? 1 : 0;
+    const DiagnosticProfile& d = inst.diag;
+    if (d.kind == DiagnosticProfile::Kind::ColumnBox) {
+      m.inStrip = (!b.world && b.cx >= d.keepX0 && b.cx < d.keepX1 && b.cz >= d.keepZ0 && b.cz < d.keepZ1) ? 1 : 0;
+    } else if (d.kind == DiagnosticProfile::Kind::CylinderStrip) {
+      const float az = bondAzimuth(b, d.axisX, d.axisZ);
+      m.inStrip = (!b.world && az >= d.keepAz0 && az < d.keepAz1) ? 1 : 0;
     }
     const float y0 = static_cast<float>(kE1AnchorFines) * kE1FineMeters;
     const float y1 = static_cast<float>(kE1AnchorFines + kE1CutFines) * kE1FineMeters;
@@ -486,8 +505,8 @@ void StructureWorld::rebuildBondMeta(StructureInstance& inst) {
   }
 }
 
-void StructureWorld::recacheOccupied() {
-  StructureInstance* inst = instance();
+void StructureWorld::recacheOccupied(StructureInstance* target) {
+  StructureInstance* inst = target != nullptr ? target : instance();
   if (inst == nullptr) {
     return;
   }
@@ -510,8 +529,8 @@ void StructureWorld::refreshDebug(StructureInstance& inst, float solveMs) {
   inst.debug.occupied = inst.occupiedCached;
   inst.debug.nodes = static_cast<uint32_t>(inst.graph.nodes.size());
   inst.debug.bonds = static_cast<uint32_t>(inst.graph.bonds.size());
-  inst.debug.cut = inst.cutApplied;
-  inst.debug.solverIters = inst.solverIters;
+  inst.debug.cut = inst.diag.cutApplied;
+  inst.debug.solverIters = inst.material.solverIters;
   inst.debug.density = inst.grid.density;
   inst.debug.probeExportCount = 0;
   inst.debug.probeCount = inst.probeCount;
@@ -566,16 +585,17 @@ void StructureWorld::refreshDebug(StructureInstance& inst, float solveMs) {
   inst.debug.stripMaxStress = strip;
   inst.debug.reactionY = ry;
   inst.debug.weight = inst.debug.mass * -kE1GravityY;
-  inst.debug.fractureEnabled = inst.fractureEnabled;
-  inst.debug.strengthPa = inst.strengthPa;
+  inst.debug.fractureEnabled = inst.material.fractureEnabled;
+  inst.debug.strengthPa = inst.material.strengthPa;
 }
 
 void StructureWorld::setFractureEnabled(bool on) {
-  for (StructureInstance& inst : instances_) {
-    if (inst.fractureEnabled == on) {
+  for (auto& p : instances_) {
+    StructureInstance& inst = *p;
+    if (inst.material.fractureEnabled == on) {
       continue;
     }
-    inst.fractureEnabled = on;
+    inst.material.fractureEnabled = on;
     inst.debug.fractureEnabled = on;
     if (!on) {
       inst.pending.valid = false;
@@ -595,9 +615,10 @@ void StructureWorld::setImpactDamageEnabled(bool on) { impactDamageEnabled_ = on
 void StructureWorld::setImpactSettings(const ImpactSettings& settings) { impactSettings_ = settings; }
 
 void StructureWorld::setStrengthPa(float strengthPa) {
-  for (StructureInstance& inst : instances_) {
-    const bool changed = inst.strengthPa != strengthPa || inst.debug.strengthPa != strengthPa;
-    inst.strengthPa = strengthPa;
+  for (auto& p : instances_) {
+    StructureInstance& inst = *p;
+    const bool changed = inst.material.strengthPa != strengthPa || inst.debug.strengthPa != strengthPa;
+    inst.material.strengthPa = strengthPa;
     inst.debug.strengthPa = strengthPa;
     if (changed) {
       ++inst.strengthEpoch;
@@ -613,7 +634,7 @@ PendingFracture StructureWorld::takePendingFracture() {
   if (instances_.empty()) {
     return out;
   }
-  PendingFracture& src = instances_.front().pending;
+  PendingFracture& src = instances_.front()->pending;
   out.valid = src.valid;
   out.objectId = src.objectId;
   out.topologyRevision = src.topologyRevision;
@@ -646,7 +667,7 @@ bool StructureWorld::pendingSnapshotMatches(const PendingFracture& pending, cons
          pending.topologyRevision == inst->topologyRevision &&
          pending.solverTopologyEpoch == inst->blast.solver->topologyEpoch() &&
          pending.solveEpoch == inst->solveEpoch && pending.strengthEpoch == inst->strengthEpoch &&
-         pending.strengthPa == inst->strengthPa;
+         pending.strengthPa == inst->material.strengthPa;
 }
 
 void StructureWorld::fillNodeOwners(StructureInstance& inst, const NvBlastSupportGraph& graph) {
@@ -685,7 +706,7 @@ void StructureWorld::collectPendingFracture(StructureInstance& inst) {
   inst.debug.candidateCount = 0;
   inst.debug.candidateInStrip = 0;
   inst.debug.candidateMs = 0.0f;
-  if (!inst.fractureEnabled || inst.blast.family == nullptr || inst.blast.solver == nullptr ||
+  if (!inst.material.fractureEnabled || inst.blast.family == nullptr || inst.blast.solver == nullptr ||
       inst.blast.asset == nullptr) {
     inst.debug.candidateMs = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - t0).count();
     return;
@@ -726,7 +747,7 @@ void StructureWorld::collectPendingFracture(StructureInstance& inst) {
       c.damage = d.health;
       c.owner = owner;
       c.anchored = anchored;
-      c.strength = inst.strengthPa;
+      c.strength = inst.material.strengthPa;
       c.sdkIndex = sdkBondFromNodes(graph, d.nodeIndex0, d.nodeIndex1);
       if (c.owner == 0) {
         if (d.nodeIndex0 < inst.nodeOwner.size() && inst.nodeOwner[d.nodeIndex0] != 0) {
@@ -767,7 +788,7 @@ void StructureWorld::collectPendingFracture(StructureInstance& inst) {
   inst.pending.solverTopologyEpoch = inst.blast.solver->topologyEpoch();
   inst.pending.solveEpoch = inst.solveEpoch;
   inst.pending.strengthEpoch = inst.strengthEpoch;
-  inst.pending.strengthPa = inst.strengthPa;
+  inst.pending.strengthPa = inst.material.strengthPa;
   inst.debug.candidateCount = static_cast<uint32_t>(inst.pending.candidates.size());
   inst.debug.candidateMs = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
@@ -1320,8 +1341,8 @@ void StructureWorld::onPhysicsTick(uint64_t tickId, float dt, const WorldContact
   if (instances_.empty()) {
     return;
   }
-  for (StructureInstance& inst : instances_) {
-    solveInstance(inst, impulses, nImpulses, kinematics, nKinematics);
+  for (auto& inst : instances_) {
+    solveInstance(*inst, impulses, nImpulses, kinematics, nKinematics);
   }
 }
 
@@ -1335,11 +1356,14 @@ std::size_t StructureWorld::blastRuntimeBaselineBytes() const {
 
 int StructureWorld::blastErrorCount() const { return runtime_ != nullptr ? runtime_->errorCount() : 0; }
 
-const StructureDebugSnapshot& StructureWorld::debug() const {
+const StructureDebugSnapshot& StructureWorld::debug(const StructureInstance* target) const {
+  if (target != nullptr) {
+    return target->debug;
+  }
   if (instances_.empty()) {
     return idle_;
   }
-  return instances_.front().debug;
+  return instances_.front()->debug;
 }
 
 void StructureWorld::fillBindingKinematics(StructureInstance& inst, ActorBinding& b) {
@@ -1606,10 +1630,42 @@ void StructureWorld::buildLoadSnapshots(StructureInstance& inst, const WorldCont
   }
 }
 
-StructureInstance* StructureWorld::instance() { return instances_.empty() ? nullptr : &instances_.front(); }
+StructureInstance* StructureWorld::instance() { return instances_.empty() ? nullptr : instances_.front().get(); }
 
 const StructureInstance* StructureWorld::instance() const {
-  return instances_.empty() ? nullptr : &instances_.front();
+  return instances_.empty() ? nullptr : instances_.front().get();
+}
+
+StructureInstance* StructureWorld::find(StructureHandle handle) {
+  return const_cast<StructureInstance*>(static_cast<const StructureWorld*>(this)->find(handle));
+}
+
+const StructureInstance* StructureWorld::find(StructureHandle handle) const {
+  if (!handle.valid()) {
+    return nullptr;
+  }
+  for (const auto& inst : instances_) {
+    if (inst->handle == handle) {
+      return inst.get();
+    }
+  }
+  return nullptr;
+}
+
+StructureInstance* StructureWorld::find(VoxelObjectId objectId) {
+  return const_cast<StructureInstance*>(static_cast<const StructureWorld*>(this)->find(objectId));
+}
+
+const StructureInstance* StructureWorld::find(VoxelObjectId objectId) const {
+  if (!objectId.valid()) {
+    return nullptr;
+  }
+  for (const auto& inst : instances_) {
+    if (inst->objectId == objectId) {
+      return inst.get();
+    }
+  }
+  return nullptr;
 }
 
 }  // namespace blast

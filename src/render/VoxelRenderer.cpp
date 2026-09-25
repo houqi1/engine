@@ -2133,7 +2133,7 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
   }
   {
     const blast::StructureWorld& sw = scene.structures();
-    const blast::StructureDebugSnapshot& st = sw.debug();
+    const blast::StructureDebugSnapshot& st = sw.debug(scene.stressCylinderId());
     ImGui::Separator();
     ImGui::TextUnformatted("Structure (four-column roof)");
     ImGui::SliderFloat("Column height", &pendingFrameHeightMeters_, 1.0f, 9.2f, "%.1f m");

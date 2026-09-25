@@ -421,6 +421,10 @@ S_fail=5×10⁵ Pa，S_hold=5×10⁷ Pa。收敛后收集超限键；提交时�
 
 退出：引擎内 T14–T17；连续挖不泄漏。
 
+### E5 任意体素物体接入
+
+多实例正确性、通用 occupancy view、挂载时自动锚固、无锚 Dynamic 结构、持续接触 `addLoad`、导入网格独立成物体、最小休眠。方案见 `docs/blast-e5-arbitrary-objects.md`。
+
 之后才是原方案 P5：休眠、跨 family 并行、碎屑退出应力、预算。没有 E1–E4 的 P5 是空优化。
 
 ---

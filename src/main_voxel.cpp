@@ -641,7 +641,7 @@ void runE2PerfLiveFps(Window& window, GfxDevice& gfx, VoxelScene& scene, PerfLog
     s.updateMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
     s.commitMs = std::chrono::duration<double, std::milli>(t2 - t1).count();
     s.drawMs = std::chrono::duration<double, std::milli>(t3 - t2).count();
-    const blast::StructureDebugSnapshot& st = scene.structures().debug();
+    const blast::StructureDebugSnapshot& st = scene.structures().debug(scene.stressCylinderId());
     const physics::DebugSolve& ds = scene.physicsDebug();
     s.solveMs = st.solveMs;
     s.probeMs = st.probeMs;
@@ -723,7 +723,7 @@ void runE2PerfEngine(Window& window, GfxDevice& gfx, VoxelScene& scene, PerfLog&
       const auto t2 = std::chrono::steady_clock::now();
       s.updateMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
       s.commitMs = std::chrono::duration<double, std::milli>(t2 - t1).count();
-      const blast::StructureDebugSnapshot& st = scene.structures().debug();
+      const blast::StructureDebugSnapshot& st = scene.structures().debug(scene.stressCylinderId());
       const physics::DebugSolve& ds = scene.physicsDebug();
       s.solveMs = st.solveMs;
       s.probeMs = st.probeMs;
@@ -874,7 +874,7 @@ void runCollisionPerf(GfxDevice& gfx, VoxelScene& scene, int count) {
 
 void runFrameFail(GfxDevice& gfx, VoxelScene& scene, PerfLog& out, const Options& options) {
   auto dump = [&](const char* tag) {
-    const blast::StructureDebugSnapshot& st = scene.structures().debug();
+    const blast::StructureDebugSnapshot& st = scene.structures().debug(scene.stressCylinderId());
     int enabled = 0;
     for (int i = 0; i < scene.cpuObjectCount(); ++i) {
       const VoxelObject& o = scene.cpuObject(i);
@@ -882,14 +882,14 @@ void runFrameFail(GfxDevice& gfx, VoxelScene& scene, PerfLog& out, const Options
         ++enabled;
       }
     }
-    const blast::StructureInstance* inst = scene.structures().instance();
+    const blast::StructureInstance* inst = scene.stressStructure();
     char line[512];
     std::snprintf(line, sizeof(line),
                   "%s conv=%d status=%s strip=%.4g S=%.4g cand=%u fracBonds=%u actors=%u "
                   "frac=%d keepBox=%d cut=%d enabledObj=%d nodes=%u bonds=%u",
                   tag, st.converged ? 1 : 0, st.status, st.stripMaxStress, st.strengthPa,
                   st.candidateCount, st.fracturedBonds, st.splitActors, st.fractureEnabled ? 1 : 0,
-                  (inst && inst->keepBox) ? 1 : 0, st.cut ? 1 : 0, enabled, st.nodes, st.bonds);
+                  (inst && inst->diag.kind == blast::DiagnosticProfile::Kind::ColumnBox) ? 1 : 0, st.cut ? 1 : 0, enabled, st.nodes, st.bonds);
     out.line(line);
     const auto& phys = scene.physicsDebug();
     std::snprintf(line, sizeof(line), "contact-cache narrow=%d reuse=%d warm=%d collideMs=%.4f solveMs=%.4f",
@@ -933,7 +933,7 @@ void runFrameFail(GfxDevice& gfx, VoxelScene& scene, PerfLog& out, const Options
   for (int i = 0; i < options.frameRenderHz * 4; ++i) {
     scene.update(1.0f / static_cast<float>(options.frameRenderHz));
     scene.commitStructureSplits(gfx);
-    const auto& st = scene.structures().debug();
+    const auto& st = scene.structures().debug(scene.stressCylinderId());
     if (firstSplitActors == 0 && st.splitActors > 1) {
       firstSplitActors = st.splitActors;
     } else if (firstSplitActors > 0 && st.splitActors > firstSplitActors && st.impactDamageEvents > 0) {

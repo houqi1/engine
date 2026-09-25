@@ -15,6 +15,7 @@
 #include <glm/glm.hpp>
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace blast {
@@ -142,7 +143,49 @@ struct ActorLoadSnapshot {
   uint32_t mappedNodes = 0;
 };
 
+// Stable identity of a mounted structure. Ids are never reused, so a handle to a
+// released or rebuilt instance resolves to nullptr instead of another structure.
+struct StructureHandle {
+  uint32_t id = 0;
+  bool valid() const { return id != 0; }
+  bool operator==(const StructureHandle& o) const { return id == o.id; }
+  bool operator!=(const StructureHandle& o) const { return id != o.id; }
+};
+
+struct StructureMaterial {
+  float baseDensity = 1000.0f;  // kg/m^3 of the sampled occupancy; setDensityScale multiplies it
+  float strengthPa = 5.0e7f;
+  uint32_t solverIters = 200;
+  bool fractureEnabled = false;
+};
+
+// Cylinder / four-column regression diagnostics: which bonds form the surviving
+// strip and neck. Only affects debug statistics, never fracture decisions.
+struct DiagnosticProfile {
+  enum class Kind : uint8_t { None, CylinderStrip, ColumnBox };
+  Kind kind = Kind::None;
+  float axisX = 0.0f;
+  float axisZ = 0.0f;
+  float keepAz0 = 0.0f;
+  float keepAz1 = 1.5707963267948966f;
+  float keepX0 = 0.0f;
+  float keepX1 = 0.0f;
+  float keepZ0 = 0.0f;
+  float keepZ1 = 0.0f;
+  bool cutApplied = false;
+};
+
+struct StructureMountDesc {
+  VoxelObjectId objectId{};
+  StructureMaterial material{};
+  DiagnosticProfile diag{};
+  // Remounting the same object keeps its current strength, fracture switch and
+  // strength epoch instead of desc.material's (other instances never donate).
+  bool keepMaterialOfReplaced = false;
+};
+
 struct StructureInstance {
+  StructureHandle handle{};
   VoxelObjectId objectId{};
   uint64_t topologyRevision = 0;
   uint64_t solveEpoch = 0;
@@ -160,19 +203,8 @@ struct StructureInstance {
   std::vector<NvBlastBondFractureData> cmdScratch;
   std::vector<NvBlastChunkFractureData> chunkScratch;
   StructureDebugSnapshot debug{};
-  float axisX = 0.0f;
-  float axisZ = 0.0f;
-  float keepAz0 = 0.0f;
-  float keepAz1 = 1.5707963267948966f;
-  bool keepBox = false;
-  float keepX0 = 0.0f;
-  float keepX1 = 0.0f;
-  float keepZ0 = 0.0f;
-  float keepZ1 = 0.0f;
-  uint32_t solverIters = 200;
-  bool cutApplied = false;
-  bool fractureEnabled = false;
-  float strengthPa = 5.0e7f;
+  StructureMaterial material{};
+  DiagnosticProfile diag{};
   PendingFracture pending{};
   std::vector<ActorBinding> bindings;
   std::vector<ActorLoadSnapshot> loadSnapshots;
@@ -205,18 +237,25 @@ public:
   void bindVisibleActors(const std::vector<ActorObjectLink>& links, StructureInstance* target = nullptr);
   const std::vector<ActorBinding>& bindings() const;
 
+  // Replaces any instance already mounted for desc.objectId.
+  BlastError mount(const StructureMountDesc& desc, OccupancySample sample, StructureHandle* outHandle = nullptr);
+  // Legacy cylinder-strip mount used by headless tests; remounts keep material.
   BlastError mountSample(VoxelObjectId objectId, OccupancySample sample, uint32_t solverIters, float strengthPa,
                          float axisX, float axisZ);
+  // Releases instances mounted for this object and detaches it from any other
+  // instance's actor bindings (e.g. a freed fragment slot).
   void unmount(VoxelObjectId objectId);
   bool ownsObject(VoxelObjectId objectId) const;
   // Drop these object-local fines from the mounted structure and rebuild the family.
   // Failure leaves the previous family in place.
   BlastError applyOccupancyRemoval(VoxelObjectId objectId, const glm::ivec3* localFines, uint32_t count);
-  bool setDensityScale(float scale);
-  void setSolverIters(uint32_t iters);
-  void markCut(bool cut);
-  void setKeepColumnBox(float x0, float x1, float z0, float z1);
-  uint32_t warmupGravity(uint32_t maxPasses);
+  // Omitted targets below mean the first instance (single-structure tests only);
+  // scene code always passes the instance it means.
+  bool setDensityScale(float scale, StructureInstance* target = nullptr);
+  void setSolverIters(uint32_t iters, StructureInstance* target = nullptr);
+  void markCut(bool cut, StructureInstance* target = nullptr);
+  void setKeepColumnBox(float x0, float x1, float z0, float z1, StructureInstance* target = nullptr);
+  uint32_t warmupGravity(uint32_t maxPasses, StructureInstance* target = nullptr);
   void setFractureEnabled(bool on);
   void setStrengthPa(float strengthPa);
   // SampleAssetViewer: pass impact to stress instead of the damage shader.
@@ -232,7 +271,7 @@ public:
   void setImpactMaterial(const NvBlastExtMaterial& material) { impactMaterial_ = material; }
   const NvBlastExtMaterial& impactMaterial() const { return impactMaterial_; }
   PendingFracture takePendingFracture();
-  const PendingFracture& pendingFracture() const { return instances_.empty() ? idlePending_ : instances_.front().pending; }
+  const PendingFracture& pendingFracture() const { return instances_.empty() ? idlePending_ : instances_.front()->pending; }
   // Scene commits pass an explicit instance. Omitting it preserves the original
   // single-structure API used by diagnostics and headless tests.
   void clearPendingFracture(StructureInstance* target = nullptr);
@@ -241,7 +280,7 @@ public:
   uint32_t applyPendingIfAny(StructureInstance* target = nullptr);
   uint32_t splitAllRequired(StructureInstance* target = nullptr, bool force = false);
   bool takeOccupancyDirty(StructureInstance* target = nullptr);
-  void recacheOccupied();
+  void recacheOccupied(StructureInstance* target = nullptr);
   void recachePendingFromProbes(StructureInstance* target = nullptr);
 
   bool initialized() const { return initialized_; }
@@ -252,10 +291,23 @@ public:
   std::size_t blastLiveBytes() const;
   std::size_t blastRuntimeBaselineBytes() const;
   int blastErrorCount() const;
-  const StructureDebugSnapshot& debug() const;
+  const StructureDebugSnapshot& debug(const StructureInstance* target = nullptr) const;
+  // Idle snapshot when nothing is mounted for this object.
+  const StructureDebugSnapshot& debug(VoxelObjectId objectId) const {
+    const StructureInstance* inst = find(objectId);
+    return inst != nullptr ? inst->debug : idle_;
+  }
+  // First instance; single-structure tests and diagnostics only.
   StructureInstance* instance();
-  StructureInstance* instanceAt(uint32_t index) { return index < instances_.size() ? &instances_[index] : nullptr; }
   const StructureInstance* instance() const;
+  StructureInstance* instanceAt(uint32_t index) {
+    return index < instances_.size() ? instances_[index].get() : nullptr;
+  }
+  StructureInstance* find(StructureHandle handle);
+  const StructureInstance* find(StructureHandle handle) const;
+  // Instance mounted for this object (its root objectId, not a fragment binding).
+  StructureInstance* find(VoxelObjectId objectId);
+  const StructureInstance* find(VoxelObjectId objectId) const;
   const char* lastError() const { return lastError_; }
 
 private:
@@ -286,7 +338,9 @@ private:
   uint64_t ticksReceived_ = 0;
   uint64_t lastTickId_ = 0;
   float lastDt_ = 0.0f;
-  std::vector<StructureInstance> instances_;
+  // unique_ptr keeps instance addresses stable across mounts and rebuilds.
+  std::vector<std::unique_ptr<StructureInstance>> instances_;
+  uint32_t nextHandleId_ = 1;
   mutable std::vector<ActorBinding> bindingCache_;
   StructureDebugSnapshot idle_{};
   PendingFracture idlePending_{};

@@ -316,7 +316,7 @@ void testWorldRemovalAndSecondInstance(blast::BlastRuntime& runtime) {
     pending.solverTopologyEpoch = second->blast.solver->topologyEpoch();
     pending.solveEpoch = second->solveEpoch;
     pending.strengthEpoch = second->strengthEpoch;
-    pending.strengthPa = second->strengthPa;
+    pending.strengthPa = second->material.strengthPa;
     pending.candidates.push_back(candidate);
     expect(world.pendingSnapshotMatches(pending, second), "E4 second pending snapshot matches");
     expect(!world.pendingSnapshotMatches(pending, first), "E4 first rejects second snapshot");
