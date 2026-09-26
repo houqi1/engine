@@ -2182,6 +2182,20 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
     if (ImGui::IsItemHovered()) {
       ImGui::SetTooltip("Blue=intact, yellow/red=Impact bond damage fraction (accumulates across drops).");
     }
+    bool groundAnchors = scene.groundContactAnchors();
+    if (ImGui::Checkbox("Ground-contact anchors (E5.2)", &groundAnchors)) {
+      scene.setGroundContactAnchors(groundAnchors);
+    }
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip(
+          "Applies on the next Spawn / Cut.\n"
+          "On: world bonds on the fines that touch the ground (real contact layer).\n"
+          "Off: fixed base rule (bottom 2 fines), used by the regression runs.");
+    }
+    bool anchorDisp = scene.anchorDisplay();
+    if (ImGui::Checkbox("Show anchors (green)", &anchorDisp)) {
+      scene.setAnchorDisplay(gfx_, anchorDisp);
+    }
     bool frac = pendingCylinderFracture_;
     if (ImGui::Checkbox("Stress fracture", &frac)) {
       pendingCylinderFracture_ = frac;
@@ -2240,6 +2254,7 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
                 scene.stressCylinderId().valid() ? "yes" : "no", scene.stressCylinderCut() ? "yes" : "no");
     ImGui::Text("Occupied fines: %u  mass: %.3f kg  weight: %.1f N", st.occupied, st.mass, st.weight);
     ImGui::Text("Nodes: %u  bonds: %u  world bonds: %u", st.nodes, st.bonds, st.worldBonds);
+    ImGui::Text("Anchors: %s", scene.structureMountStatus().empty() ? "-" : scene.structureMountStatus().c_str());
     ImGui::Text("Status: %s  lin=%.3g ang=%.3g", st.status, st.linErr, st.angErr);
     ImGui::Text("Reaction Ry=%.1f N   strip max=%.3g Pa   S=%.3g Pa", st.reactionY, st.stripMaxStress,
                 st.strengthPa);

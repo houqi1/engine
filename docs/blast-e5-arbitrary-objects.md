@@ -302,6 +302,32 @@ E5.0 和 E5.1 是纯重构，不改行为，适合先单独提交。
 - 引擎 `--frame-fail --frame-height 4 --frame-impact shear --frame-render-hz 60`：改动前后 730 行输出（屏蔽毫秒值后）完全一致，最终 `single-node=20 multi-node=6 largestNodes=66`。
 - 引擎 `--e2-perf`：圆柱生成、切 270° 重挂载、失效分裂流程通过（`split=yes`）。改动前未录圆柱引擎基线，圆柱等价性以无头测试为准。
 - 其余 18 个测试（P0–P4、图回归、E0–E3、四柱、Viewer 对齐、探针导出、物理）全部通过。
+- 补充：圆柱（保持强度、断裂关）与切口四柱（失效强度、断裂开）同时挂载，各运行 6 tick，与各自单独挂载时的求解结果逐位相同。
+
+**E5.2 完成（2026-09-26）**
+
+决定（用户确认方案 A）：自动锚点只标记**实际接触的那一层**，锚固面积 = 真实接触面积。验收标准由「与手写规则逐位一致」改为「锚固节点集合相同，支反力相对误差 ≤ `kE1ReactionRelTol`（1e-3）」。回归场景继续用手写规则。
+
+- `src/blast/GroundAnchors.{h,cpp}`：不依赖场景的纯函数 `findGroundAnchors`。实心体素的每个外露面，取「面中心外 0.5 格」（即相邻格中心）换到各静态来源的局部坐标；落在来源实心格内即为接触。容差为半格：间隙 < 0.05 m 算接触。
+- 来源：未挂载、启用中的 Static 物体（地面等），不含自身。已挂载结构的面记为 `blockedFaces`，不产生锚点。
+- `VoxelScene::findGroundContactAnchors / mountObjectOnGround`：只接受 Static 物体；有 blocked 面则拒绝并提示合并；无接触则拒绝（悬空）。挂载状态写入 `structureMountStatus()`。
+- UI：「Ground-contact anchors (E5.2)」开关（下次生成/切割生效）、「Show anchors (green)」锚点高亮、面板「Anchors:」状态行。
+- 引擎：`--frame-anchors ground|explicit`（默认 explicit）。
+
+**验收**
+
+- `blast_e5_tests` 边界：静置箱体只锚 8×8 底面；间隙 0.04 m 仍接触、0.06 m / 0.1 m 不接触；绕 Y 旋转 30° 不变；绕 Z 倾倒 90° 改为锚 x=4 侧面；压在已挂载结构上全部 blocked；一半压在结构上时一半 blocked、一半锚固；远离地面时无锚点。
+- 回归几何（场景地面与生成位姿）：锚点恰为底层接触体素；锚固节点集合与手写规则相同；锚固面积为手写规则的一半。
+
+  | 场景 | 锚点体素 | 锚固节点 | 重量 W (N) | Ry 手写 | Ry 自动 | 相对差 |
+  |---|---:|---:|---:|---:|---:|---:|
+  | 圆柱 | 244 | 100 | 143618 | 143625 | 143626 | 8.9e-6 |
+  | 四柱 | 144 | 16 | 86641.9 | 86642 | 86642 | 0 |
+  | 四柱切口 | 144 | 16 | 46381.7 | 46404.4 | 46384.3 | 4.3e-4 |
+
+- 引擎 `--frame-fail`（手写锚点）：与 E5 前基线 730 行差异 0。
+- 引擎 `--frame-fail --frame-anchors ground`：`anchors=ground fines=144 faces=144 blocked=0`，站立与切柱后均收敛，塌落结果 `single-node=20 multi-node=6 largestNodes=66`，`OK frame-fail`。
+- 19 个测试全部通过。
 
 ---
 

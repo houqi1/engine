@@ -1,5 +1,6 @@
 #pragma once
 
+#include "blast/GroundAnchors.h"
 #include "blast/StructureWorld.h"
 #include "core/Camera.h"
 #include "gfx/GfxDevice.h"
@@ -264,6 +265,19 @@ public:
   blast::StructureInstance* mountObjectStructure(VoxelObjectId id, int agg,
                                                  const std::function<bool(int, int, int)>& anchorFine,
                                                  blast::StructureMountDesc desc);
+  // E5.2: fines whose exposed faces rest on unmounted static objects (the ground).
+  // Faces against another mounted structure are counted as blocked.
+  blast::GroundAnchorResult findGroundContactAnchors(VoxelObjectId id) const;
+  // Mounts a static object anchored where it actually touches the ground. Refuses
+  // objects that touch no ground or touch another mounted structure.
+  blast::StructureInstance* mountObjectOnGround(VoxelObjectId id, int agg, blast::StructureMountDesc desc);
+  // Stress demo spawns/cuts use ground-contact anchors instead of the explicit base rule.
+  void setGroundContactAnchors(bool on) { groundContactAnchors_ = on; }
+  bool groundContactAnchors() const { return groundContactAnchors_; }
+  const std::string& structureMountStatus() const { return structureMountStatus_; }
+  const blast::GroundAnchorResult& lastGroundAnchors() const { return lastGroundAnchors_; }
+  void setAnchorDisplay(GfxDevice& gfx, bool on);
+  bool anchorDisplay() const { return anchorDisplay_; }
   bool spawnStressCylinder(GfxDevice& gfx);
   bool resetStressCylinder(GfxDevice& gfx);
   bool cutStressCylinder270(GfxDevice& gfx);
@@ -364,6 +378,9 @@ private:
   bool mountFrameFromOccupancy(GfxDevice& gfx);
   void paintCylinderStress(GfxDevice& gfx);
   void paintBondDamage(GfxDevice& gfx);
+  void paintAnchors(GfxDevice& gfx);
+  // Writes the anchor color over world-anchored fines of every object bound to inst.
+  void overlayAnchorFines(const blast::StructureInstance& inst);
   void destroyStressCylinderObject();
 
   int applyCoarseSphereBrush(VoxelObject& o, const glm::ivec3& center, float radius,
@@ -513,6 +530,10 @@ private:
   bool stressCylinderDoubleDensity_ = false;
   bool stressCylinderDisplay_ = false;
   uint64_t lastStressPaintSolveEpoch_ = 0;
+  bool groundContactAnchors_ = false;
+  bool anchorDisplay_ = false;
+  std::string structureMountStatus_;
+  blast::GroundAnchorResult lastGroundAnchors_;
 
   bool prevLmb_ = false;
   bool prevF_ = false;

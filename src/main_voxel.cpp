@@ -54,6 +54,7 @@ struct Options {
   float frameHeightMeters = 4.0f;
   std::string frameImpactMode = "shear";
   int frameRenderHz = 60;
+  bool frameGroundAnchors = false;  // --frame-anchors ground (E5.2)
   bool help = false;
   uint32_t frames = 300;
   uint32_t warmup = 60;
@@ -111,6 +112,12 @@ Options parseOptions(int argc, char** argv) {
         throw std::runtime_error("--frame-impact must be shear, spread or stress");
     } else if (arg == "--frame-render-hz") {
       options.frameRenderHz = integer(30, 240);
+    } else if (arg == "--frame-anchors") {
+      const std::string mode = value();
+      if (mode != "explicit" && mode != "ground") {
+        throw std::runtime_error("--frame-anchors must be explicit or ground");
+      }
+      options.frameGroundAnchors = mode == "ground";
     } else if (arg == "--help" || arg == "-h") {
       options.help = true;
     } else if (arg == "--frames") {
@@ -911,12 +918,19 @@ void runFrameFail(GfxDevice& gfx, VoxelScene& scene, PerfLog& out, const Options
   impact.shearDamage = options.frameImpactMode != "spread";
   scene.structures().setImpactSettings(impact);
   scene.structures().setStressImpactImpulses(options.frameImpactMode == "stress");
+  scene.setGroundContactAnchors(options.frameGroundAnchors);
   if (!scene.spawnStressFrame(gfx, options.frameHeightMeters)) {
     throw std::runtime_error("spawnStressFrame failed");
   }
   ticks(24);
   out.line("columnHeightMeters=" + std::to_string(scene.frameColumnHeightMeters()));
   out.line("impactMode=" + options.frameImpactMode + " renderHz=" + std::to_string(options.frameRenderHz));
+  if (options.frameGroundAnchors) {
+    const blast::GroundAnchorResult& anchors = scene.lastGroundAnchors();
+    out.line("anchors=ground fines=" + std::to_string(anchors.anchorFines) + " faces=" +
+             std::to_string(anchors.contactFaces) + " blocked=" + std::to_string(anchors.blockedFaces) + " " +
+             scene.structureMountStatus());
+  }
   dump("after-spawn");
 
   if (!scene.cutThreeColumns(gfx)) {
@@ -985,6 +999,7 @@ int main(int argc, char** argv) {
                    "  --frame-height M Column height for --frame-fail (1.0-9.2 m, default 4.0)\n"
                    "  --frame-impact MODE  shear (Viewer default), spread, or stress\n"
                    "  --frame-render-hz N  Frame test cadence (30-240, default 60)\n"
+                   "  --frame-anchors M    explicit (column-base rule, default) or ground (E5.2 contact)\n"
                    "  --e2-perf        Headless-ish E2 layer D: spawn cylinder, time scene+collision, exit\n"
                    "  --frames N       Measured submitted frames (default 300, >0)\n"
                    "  --warmup N       Excluded submitted frames (default 60, >=0)\n"

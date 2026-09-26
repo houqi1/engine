@@ -2,13 +2,16 @@
 #include "blast/BlastMemory.h"
 #include "blast/CylinderVoxels.h"
 #include "blast/FrameVoxels.h"
+#include "blast/GroundAnchors.h"
 #include "blast/ObjectOccupancyView.h"
 #include "blast/OccupancySampler.h"
 #include "blast/StructureWorld.h"
 #include "blast/VoxelGraph.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <functional>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -462,6 +465,234 @@ void testDiagnosticProfile(blast::BlastRuntime& rt) {
   world.clear();
 }
 
+// E5.0 acceptance as worded: the cylinder and the four-column frame mounted at the same
+// time, with different materials, evolve exactly as each does alone.
+void testCylinderAndFrameTogether(blast::BlastRuntime& rt) {
+  std::cout << "E5.0 cylinder and frame mounted together\n";
+  const blast::CylinderRaster cyl{};
+  const DenseBits cylOcc = cylinderOccupancy(false);
+  const DenseBits frameOcc = frameOccupancy(blast::kFrameColH, true);
+  auto cylSample = [&] {
+    return genericSample(cylOcc, blast::kE1Density, blast::kE1Agg,
+                         [cyl](int x, int y, int z) { return blast::isBaseAnchorFine(x, y, z, cyl); });
+  };
+  auto frameSample = [&] {
+    return genericSample(frameOcc, blast::kE1Density, blast::kFrameAgg,
+                         [](int x, int y, int z) { return blast::isFrameAnchorFine(x, y, z); });
+  };
+  const VoxelObjectId cylId{50, 1}, frameId{51, 1};
+  const blast::StructureMountDesc cylDesc = descFor(cylId, blast::kE1StrengthHoldPa, false, 200);
+  const blast::StructureMountDesc frameDesc = descFor(frameId, blast::kFrameStrengthFailPa, true, 400);
+  constexpr uint64_t kTicks = 6;
+
+  blast::StructureWorld solo;
+  blast::StructureWorld pair;
+  expect(solo.init(rt) && pair.init(rt), "worlds");
+  // Solo runs, one structure at a time.
+  blast::StructureHandle h;
+  expect(solo.mount(cylDesc, cylSample(), &h) == blast::BlastError::Ok, "solo cylinder");
+  for (uint64_t t = 1; t <= kTicks; ++t) solo.onPhysicsTick(t, 1.0f / 60.0f);
+  const blast::StructureDebugSnapshot cylAlone = solo.debug(solo.find(h));
+  solo.clear();
+  expect(solo.mount(frameDesc, frameSample(), &h) == blast::BlastError::Ok, "solo frame");
+  for (uint64_t t = 1; t <= kTicks; ++t) solo.onPhysicsTick(t, 1.0f / 60.0f);
+  const blast::StructureDebugSnapshot frameAlone = solo.debug(solo.find(h));
+  solo.clear();
+
+  blast::StructureHandle hc, hf;
+  expect(pair.mount(cylDesc, cylSample(), &hc) == blast::BlastError::Ok, "pair cylinder");
+  expect(pair.mount(frameDesc, frameSample(), &hf) == blast::BlastError::Ok, "pair frame");
+  expect(pair.instanceCount() == 2, "two instances");
+  for (uint64_t t = 1; t <= kTicks; ++t) pair.onPhysicsTick(t, 1.0f / 60.0f);
+  const blast::StructureInstance* c = pair.find(hc);
+  const blast::StructureInstance* f = pair.find(hf);
+  expect(c != nullptr && f != nullptr, "both resolve");
+  if (c == nullptr || f == nullptr) return;
+  expect(c->material.strengthPa == blast::kE1StrengthHoldPa && !c->material.fractureEnabled,
+         "cylinder keeps hold strength, fracture off");
+  expect(f->material.strengthPa == blast::kFrameStrengthFailPa && f->material.fractureEnabled,
+         "frame keeps fail strength, fracture on");
+  compareSolves(cylAlone, c->debug, "cylinder beside frame");
+  compareSolves(frameAlone, f->debug, "frame beside cylinder");
+  expect(c->debug.candidateCount == 0, "cylinder at hold strength has no candidates");
+  expect(f->debug.candidateCount > 0, "cut frame at fail strength has candidates");
+  std::cout << "  cylinder Ry=" << c->debug.reactionY << " cand=" << c->debug.candidateCount
+            << " | frame cand=" << f->debug.candidateCount << "\n";
+}
+
+// Scene ground: 64 coarse cells of 1.6 m, 2 cells thick, grid centred at x=z=0, top at y=3.2 m.
+constexpr int kGroundCoarse = 64;
+constexpr int kGroundFines = kGroundCoarse * kFinesPerCoarse;
+constexpr int kGroundTopFine = 2 * kFinesPerCoarse;
+constexpr float kGroundTopMeters = 3.2f;
+
+blast::AnchorSource sceneGround() {
+  blast::AnchorSource g;
+  g.frame.fineN = kGroundFines;
+  g.frame.fineSize = kCoarseMeters / static_cast<float>(kFinesPerCoarse);
+  g.frame.position = glm::vec3(0.0f, 0.5f * static_cast<float>(kGroundCoarse) * kCoarseMeters, 0.0f);
+  g.solid = [](int, int y, int) { return y < kGroundTopFine; };
+  return g;
+}
+
+// Grid of gridSize coarse cells whose bottom face rests on the ground (the demo spawn pose).
+blast::AnchorGridFrame onGround(int gridSize, float lift = 0.0f) {
+  blast::AnchorGridFrame f;
+  f.fineN = gridSize * kFinesPerCoarse;
+  f.fineSize = kCoarseMeters / static_cast<float>(kFinesPerCoarse);
+  f.position = glm::vec3(0.0f, kGroundTopMeters + lift + 0.5f * static_cast<float>(gridSize) * kCoarseMeters, 0.0f);
+  return f;
+}
+
+std::vector<uint32_t> worldBondNodes(const blast::OccupancySample& s) {
+  std::vector<uint32_t> nodes;
+  for (const blast::GraphBond& b : s.graph.bonds) {
+    if (b.world) nodes.push_back(b.nodeA);
+  }
+  std::sort(nodes.begin(), nodes.end());
+  return nodes;
+}
+
+float settledReaction(blast::StructureWorld& world, blast::StructureInstance* inst, bool& converged) {
+  world.warmupGravity(96, inst);
+  converged = inst->debug.converged;
+  return inst->debug.reactionY;
+}
+
+// E5.2 acceptance on the regression geometry: ground-contact anchors mark only the
+// contact layer, anchor exactly the same nodes as the explicit base rule, and give the
+// same total reaction within kE1ReactionRelTol of the weight.
+void testGroundAnchorsMatchExplicitNodes(blast::BlastRuntime& rt) {
+  std::cout << "E5.2 ground-contact anchors vs explicit base rule\n";
+  const blast::CylinderRaster cyl{};
+  struct Case {
+    std::string tag;
+    DenseBits occ;
+    int gridSize;
+    int agg;
+    std::function<bool(int, int, int)> explicitAnchor;
+  };
+  std::vector<Case> cases;
+  cases.push_back({"cylinder", cylinderOccupancy(false), blast::kE1GridFines / kFinesPerCoarse, blast::kE1Agg,
+                   [cyl](int x, int y, int z) { return blast::isBaseAnchorFine(x, y, z, cyl); }});
+  cases.push_back({"frame", frameOccupancy(blast::kFrameColH, false), blast::kFrameGridFines / kFinesPerCoarse,
+                   blast::kFrameAgg, [](int x, int y, int z) { return blast::isFrameAnchorFine(x, y, z); }});
+  cases.push_back({"frame cut", frameOccupancy(blast::kFrameColH, true), blast::kFrameGridFines / kFinesPerCoarse,
+                   blast::kFrameAgg, [](int x, int y, int z) { return blast::isFrameAnchorFine(x, y, z); }});
+  const std::vector<blast::AnchorSource> sources{sceneGround()};
+  for (Case& k : cases) {
+    const DenseBits& occ = k.occ;
+    const blast::GroundAnchorResult r =
+        blast::findGroundAnchors(onGround(k.gridSize), [&occ](int x, int y, int z) { return occ.get(x, y, z); },
+                                 sources);
+    uint32_t mismatched = 0;
+    uint32_t bottom = 0;
+    for (int z = 0; z < occ.n(); ++z) {
+      for (int y = 0; y < occ.n(); ++y) {
+        for (int x = 0; x < occ.n(); ++x) {
+          const bool expected = occ.get(x, y, z) && y == 0;
+          bottom += expected ? 1u : 0u;
+          mismatched += r.isAnchor(x, y, z) != expected ? 1u : 0u;
+        }
+      }
+    }
+    expect(mismatched == 0, k.tag + " anchors are exactly the ground contact layer");
+    expect(r.anchorFines == bottom && r.contactFaces == bottom && r.blockedFaces == 0,
+           k.tag + " one contact face per bottom fine");
+
+    blast::OccupancySample expl = genericSample(occ, blast::kE1Density, k.agg, k.explicitAnchor);
+    blast::OccupancySample autoS =
+        genericSample(occ, blast::kE1Density, k.agg, [&r](int x, int y, int z) { return r.isAnchor(x, y, z); });
+    expect(expl.error == blast::BlastError::Ok && autoS.error == blast::BlastError::Ok, k.tag + " samples");
+    const size_t anchoredNodes = worldBondNodes(expl).size();
+    expect(anchoredNodes > 0 && worldBondNodes(expl) == worldBondNodes(autoS), k.tag + " same anchored node set");
+    uint32_t explFaces = 0, autoFaces = 0;
+    for (const blast::GraphBond& b : expl.graph.bonds) explFaces += b.world ? static_cast<uint32_t>(b.nFaces) : 0u;
+    for (const blast::GraphBond& b : autoS.graph.bonds) autoFaces += b.world ? static_cast<uint32_t>(b.nFaces) : 0u;
+    expect(autoFaces == bottom && explFaces == 2 * bottom, k.tag + " anchor area = contact area (half the 2-fine rule)");
+
+    blast::StructureWorld world;
+    expect(world.init(rt), k.tag + " world");
+    blast::StructureHandle he, ha;
+    expect(world.mount(descFor({60, 1}, blast::kE1StrengthHoldPa, false, 400), std::move(expl), &he) ==
+               blast::BlastError::Ok,
+           k.tag + " mount explicit");
+    expect(world.mount(descFor({61, 1}, blast::kE1StrengthHoldPa, false, 400), std::move(autoS), &ha) ==
+               blast::BlastError::Ok,
+           k.tag + " mount ground");
+    bool convE = false, convA = false;
+    const float re = settledReaction(world, world.find(he), convE);
+    const float ra = settledReaction(world, world.find(ha), convA);
+    const float weight = world.find(ha)->debug.weight;
+    expect(convE && convA, k.tag + " both converge");
+    const float relPair = std::abs(ra - re) / weight;
+    const float relWeight = std::abs(ra - weight) / weight;
+    expect(relPair <= blast::kE1ReactionRelTol, k.tag + " reaction matches explicit within tolerance");
+    expect(relWeight <= blast::kE1ReactionRelTol, k.tag + " ground reaction balances the weight");
+    std::cout << "  " << k.tag << ": anchors=" << r.anchorFines << " nodes=" << anchoredNodes
+              << " W=" << weight << " Ry explicit=" << re << " ground=" << ra << " rel=" << relPair << "\n";
+  }
+}
+
+// Small solid box (x,z in [4,12), y in [0,6)) in a one-coarse-cell grid.
+bool boxSolid(int x, int y, int z) { return x >= 4 && x < 12 && z >= 4 && z < 12 && y >= 0 && y < 6; }
+
+uint32_t anchorsWhere(const blast::GroundAnchorResult& r, const std::function<bool(int, int, int)>& pred) {
+  uint32_t n = 0;
+  for (int z = 0; z < r.fineN; ++z)
+    for (int y = 0; y < r.fineN; ++y)
+      for (int x = 0; x < r.fineN; ++x) n += (r.isAnchor(x, y, z) && pred(x, y, z)) ? 1u : 0u;
+  return n;
+}
+
+void testGroundAnchorEdges() {
+  std::cout << "E5.2 ground anchor edge cases\n";
+  const std::vector<blast::AnchorSource> ground{sceneGround()};
+  auto bottomLayer = [](int, int y, int) { return y == 0; };
+
+  const auto resting = blast::findGroundAnchors(onGround(1), boxSolid, ground);
+  expect(resting.anchorFines == 64 && resting.contactFaces == 64 && anchorsWhere(resting, bottomLayer) == 64,
+         "resting box anchors its 8x8 footprint only");
+
+  // Contact tolerance is half a fine: the probe is the neighbouring cell centre.
+  expect(blast::findGroundAnchors(onGround(1, 0.04f), boxSolid, ground).anchorFines == 64,
+         "0.04 m gap is still contact");
+  expect(blast::findGroundAnchors(onGround(1, 0.06f), boxSolid, ground).anchorFines == 0,
+         "0.06 m gap is not contact");
+  const auto lifted = blast::findGroundAnchors(onGround(1, 0.1f), boxSolid, ground);
+  expect(lifted.anchorFines == 0 && lifted.contactFaces == 0, "box one fine above ground is not anchored");
+
+  blast::AnchorGridFrame yaw = onGround(1);
+  yaw.rotation = glm::angleAxis(glm::radians(30.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+  const auto yawed = blast::findGroundAnchors(yaw, boxSolid, ground);
+  expect(yawed.anchorFines == 64 && anchorsWhere(yawed, bottomLayer) == 64, "30 deg yaw keeps the footprint");
+
+  // Tipped 90 deg about Z: local -X faces down, so the x=4 layer rests on the ground.
+  blast::AnchorGridFrame tipped = onGround(1);
+  tipped.rotation = glm::angleAxis(glm::radians(90.0f), glm::vec3(0.0f, 0.0f, 1.0f));
+  tipped.position.y = kGroundTopMeters + 0.4f;
+  const auto side = blast::findGroundAnchors(tipped, boxSolid, ground);
+  expect(side.anchorFines == 48 && anchorsWhere(side, [](int x, int, int) { return x == 4; }) == 48,
+         "box tipped on its side anchors the x=4 face");
+
+  // Touching a mounted structure never anchors and is reported.
+  blast::AnchorSource mountedSlab = sceneGround();
+  mountedSlab.blocksMount = true;
+  const auto onStructure = blast::findGroundAnchors(onGround(1), boxSolid, {mountedSlab});
+  expect(onStructure.anchorFines == 0 && onStructure.blockedFaces == 64, "resting on a mounted structure is blocked");
+  blast::AnchorSource halfSlab = sceneGround();
+  halfSlab.blocksMount = true;
+  halfSlab.solid = [](int x, int y, int) { return y < kGroundTopFine && x < kGroundFines / 2; };  // world x < 0
+  const auto half = blast::findGroundAnchors(onGround(1), boxSolid, {sceneGround(), halfSlab});
+  expect(half.blockedFaces == 32 && half.anchorFines == 32 &&
+             anchorsWhere(half, [](int x, int, int) { return x >= 8; }) == 32,
+         "half on a mounted structure: that half blocked, the other half anchored");
+
+  blast::AnchorGridFrame far = onGround(1);
+  far.position.x = 1000.0f;
+  expect(blast::findGroundAnchors(far, boxSolid, ground).anchorFines == 0, "no source nearby, no anchors");
+}
+
 }  // namespace
 
 int main() {
@@ -472,10 +703,13 @@ int main() {
   testRebuildHandlesAndUnmountBinding(rt);
   testDiagnosticProfile(rt);
   testGenericViewMatchesLegacy(rt);
+  testCylinderAndFrameTogether(rt);
+  testGroundAnchorEdges();
+  testGroundAnchorsMatchExplicitNodes(rt);
   expect(rt.errorCount() == 0, "no NvBlast errors");
   rt.shutdown();
   if (gFailures == 0) {
-    std::cout << "OK E5.0 multi-instance, E5.1 generic object mount\n";
+    std::cout << "OK E5.0 multi-instance, E5.1 generic object mount, E5.2 ground-contact anchors\n";
     return 0;
   }
   std::cerr << gFailures << " failure(s)\n";

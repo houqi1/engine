@@ -1827,12 +1827,14 @@ blast::StructureInstance* VoxelScene::mountObjectStructure(VoxelObjectId id, int
   blast::OccupancySample sample = blast::sampleOccupancy(view, opts);
   const auto t1 = std::chrono::steady_clock::now();
   if (sample.error != blast::BlastError::Ok) {
+    structureMountStatus_ = std::string("sampler: ") + sample.message;
     std::cerr << "OccupancySampler: " << sample.message << "\n";
     return nullptr;
   }
   desc.objectId = id;
   blast::StructureHandle handle;
   if (structures_.mount(desc, std::move(sample), &handle) != blast::BlastError::Ok) {
+    structureMountStatus_ = std::string("mount: ") + structures_.lastError();
     std::cerr << "StructureWorld mount: " << structures_.lastError() << "\n";
     return nullptr;
   }
@@ -1840,6 +1842,81 @@ blast::StructureInstance* VoxelScene::mountObjectStructure(VoxelObjectId id, int
   inst->debug.extractMs = std::chrono::duration<float, std::milli>(t1 - t0).count();
   inst->topologyRevision = o->topologyRevision;
   inst->debug.topologyRevision = o->topologyRevision;
+  return inst;
+}
+
+namespace {
+
+blast::AnchorGridFrame anchorFrameOf(const VoxelObject& o) {
+  blast::AnchorGridFrame f;
+  f.position = o.position;
+  f.rotation = o.rotation;
+  f.fineSize = o.voxelSize / static_cast<float>(VoxelScene::kFinePerCoarse);
+  f.fineN = o.gridSize * VoxelScene::kFinePerCoarse;
+  return f;
+}
+
+}  // namespace
+
+blast::GroundAnchorResult VoxelScene::findGroundContactAnchors(VoxelObjectId id) const {
+  const VoxelObject* o = tryGetObject(id);
+  if (o == nullptr) {
+    return {};
+  }
+  auto fineSolid = [this](int slot) {
+    return [this, slot](int x, int y, int z) {
+      glm::ivec3 c, m, f;
+      splitFineIndex(x, y, z, c, m, f);
+      return occupancyFine(slot, c, m, f);
+    };
+  };
+  std::vector<blast::AnchorSource> sources;
+  for (uint32_t s = 0; s < objects_.size(); ++s) {
+    const VoxelObject& src = objects_[s];
+    if (s == id.slot || !src.slotOccupied || !src.enabled || src.cells.empty() ||
+        src.motionType != MotionType::Static) {
+      continue;
+    }
+    blast::AnchorSource a;
+    a.frame = anchorFrameOf(src);
+    a.solid = fineSolid(static_cast<int>(s));
+    a.blocksMount = structures_.ownsObject(makeObjectId(s));
+    sources.push_back(std::move(a));
+  }
+  return blast::findGroundAnchors(anchorFrameOf(*o), fineSolid(static_cast<int>(id.slot)), sources);
+}
+
+blast::StructureInstance* VoxelScene::mountObjectOnGround(VoxelObjectId id, int agg, blast::StructureMountDesc desc) {
+  const VoxelObject* o = tryGetObject(id);
+  lastGroundAnchors_ = {};
+  if (o == nullptr) {
+    structureMountStatus_ = "ground anchors: no object";
+    return nullptr;
+  }
+  if (o->motionType != MotionType::Static) {
+    structureMountStatus_ = "ground anchors: object is not static";
+    std::cerr << "Structure mount refused: " << structureMountStatus_ << "\n";
+    return nullptr;
+  }
+  lastGroundAnchors_ = findGroundContactAnchors(id);
+  const blast::GroundAnchorResult& anchors = lastGroundAnchors_;
+  if (anchors.blockedFaces > 0) {
+    structureMountStatus_ = "refused: touches another mounted structure on " +
+                            std::to_string(anchors.blockedFaces) + " faces; merge them into one object";
+    std::cerr << "Structure mount " << structureMountStatus_ << "\n";
+    return nullptr;
+  }
+  if (anchors.anchorFines == 0) {
+    structureMountStatus_ = "refused: not anchored, the object touches no static ground";
+    std::cerr << "Structure mount " << structureMountStatus_ << "\n";
+    return nullptr;
+  }
+  blast::StructureInstance* inst = mountObjectStructure(
+      id, agg, [&anchors](int x, int y, int z) { return anchors.isAnchor(x, y, z); }, std::move(desc));
+  if (inst != nullptr) {
+    structureMountStatus_ = "ground anchors: " + std::to_string(anchors.anchorFines) + " fines, " +
+                            std::to_string(anchors.contactFaces) + " faces";
+  }
   return inst;
 }
 
@@ -1859,9 +1936,17 @@ bool VoxelScene::mountCylinderFromOccupancy(GfxDevice& gfx) {
   desc.diag.keepAz1 = blast::kE1KeepAz1;
   desc.diag.cutApplied = stressCylinderCut_;
   desc.keepMaterialOfReplaced = true;
-  blast::StructureInstance* inst = mountObjectStructure(
-      stressCylinderId_, blast::kE1Agg,
-      [spec](int x, int y, int z) { return blast::isBaseAnchorFine(x, y, z, spec); }, desc);
+  blast::StructureInstance* inst = nullptr;
+  if (groundContactAnchors_) {
+    inst = mountObjectOnGround(stressCylinderId_, blast::kE1Agg, desc);
+  } else {
+    inst = mountObjectStructure(
+        stressCylinderId_, blast::kE1Agg,
+        [spec](int x, int y, int z) { return blast::isBaseAnchorFine(x, y, z, spec); }, desc);
+    if (inst != nullptr) {
+      structureMountStatus_ = "explicit anchors (cylinder base)";
+    }
+  }
   if (inst == nullptr) {
     return false;
   }
@@ -1877,6 +1962,8 @@ bool VoxelScene::mountCylinderFromOccupancy(GfxDevice& gfx) {
   lastStressPaintSolveEpoch_ = 0;
   if (stressCylinderDisplay_) {
     paintCylinderStress(gfx);
+  } else if (anchorDisplay_) {
+    paintAnchors(gfx);
   }
   (void)gfx;
   return true;
@@ -1942,6 +2029,9 @@ void VoxelScene::paintCylinderStress(GfxDevice& gfx) {
     if (b.objectId.valid() && b.objectId != stressCylinderId_) {
       paintObject(b.objectId);
     }
+  }
+  if (anchorDisplay_) {
+    overlayAnchorFines(*inst);
   }
   flushDirtyPages(gfx);
   lastStressPaintSolveEpoch_ = inst->solveEpoch;
@@ -2011,9 +2101,131 @@ void VoxelScene::paintBondDamage(GfxDevice& gfx) {
       paintObject(b.objectId);
     }
   }
+  if (anchorDisplay_) {
+    overlayAnchorFines(*inst);
+  }
   flushDirtyPages(gfx);
   lastBondDamagePaintEvents_ = inst->debug.impactDamageEvents;
   lastStressPaintSolveEpoch_ = inst->solveEpoch;
+}
+
+void VoxelScene::overlayAnchorFines(const blast::StructureInstance& inst) {
+  constexpr uint32_t kAnchorRgb = 0x20E040u;
+  const uint32_t packed = packRgb888a(kAnchorRgb);
+  auto paintObject = [&](VoxelObjectId id) {
+    VoxelObject* o = tryGetObject(id);
+    if (o == nullptr || !o->enabled || !o->slotOccupied) {
+      return;
+    }
+    o->useImportPalette = true;
+    const int slot = static_cast<int>(id.slot);
+    const glm::ivec3 origin = o->structureFineOrigin;
+    for (const blast::GraphNode& n : inst.graph.nodes) {
+      for (const blast::VoxelCoord& p : n.voxels) {
+        if (!inst.grid.isAnchor(p.x, p.y, p.z)) {
+          continue;
+        }
+        const glm::ivec3 local(p.x - origin.x, p.y - origin.y, p.z - origin.z);
+        glm::ivec3 c, m, f;
+        splitFineIndex(local.x, local.y, local.z, c, m, f);
+        if (!inBounds(*o, c) || !occupancyFine(slot, c, m, f)) {
+          continue;
+        }
+        const uint32_t page = cellAt(*o, indexOf(*o, c)).brickPage;
+        if (page == kInvalidBrickPage) {
+          continue;
+        }
+        const uint32_t ci = fineColorIndex(m, f);
+        if (readFineRgb(page, ci) == packed) {
+          continue;
+        }
+        writeFineRgb(page, ci, kAnchorRgb);
+        dirtyPages_.insert(page);
+      }
+    }
+  };
+  paintObject(inst.objectId);
+  for (const blast::ActorBinding& b : inst.bindings) {
+    if (b.objectId.valid() && b.objectId != inst.objectId) {
+      paintObject(b.objectId);
+    }
+  }
+}
+
+void VoxelScene::paintAnchors(GfxDevice& gfx) {
+  const blast::StructureInstance* inst = stressStructure();
+  if (inst == nullptr) {
+    return;
+  }
+  // Neutral base so only the anchored contact layer stands out.
+  constexpr uint32_t kBaseRgb = 0x808080u;
+  const uint32_t packed = packRgb888a(kBaseRgb);
+  auto paintObject = [&](VoxelObjectId id) {
+    VoxelObject* o = tryGetObject(id);
+    if (o == nullptr || !o->enabled || !o->slotOccupied) {
+      return;
+    }
+    o->useImportPalette = true;
+    const int slot = static_cast<int>(id.slot);
+    const glm::ivec3 origin = o->structureFineOrigin;
+    for (const blast::GraphNode& n : inst->graph.nodes) {
+      for (const blast::VoxelCoord& p : n.voxels) {
+        const glm::ivec3 local(p.x - origin.x, p.y - origin.y, p.z - origin.z);
+        glm::ivec3 c, m, f;
+        splitFineIndex(local.x, local.y, local.z, c, m, f);
+        if (!inBounds(*o, c) || !occupancyFine(slot, c, m, f)) {
+          continue;
+        }
+        const uint32_t page = cellAt(*o, indexOf(*o, c)).brickPage;
+        if (page == kInvalidBrickPage) {
+          continue;
+        }
+        const uint32_t ci = fineColorIndex(m, f);
+        if (readFineRgb(page, ci) == packed) {
+          continue;
+        }
+        writeFineRgb(page, ci, kBaseRgb);
+        dirtyPages_.insert(page);
+      }
+    }
+  };
+  paintObject(inst->objectId);
+  for (const blast::ActorBinding& b : inst->bindings) {
+    if (b.objectId.valid() && b.objectId != inst->objectId) {
+      paintObject(b.objectId);
+    }
+  }
+  overlayAnchorFines(*inst);
+  flushDirtyPages(gfx);
+}
+
+void VoxelScene::setAnchorDisplay(GfxDevice& gfx, bool on) {
+  anchorDisplay_ = on;
+  const blast::StructureInstance* inst = stressStructure();
+  if (inst == nullptr) {
+    return;
+  }
+  // Repaint the active color mode so the overlay is added or removed.
+  if (bondDamageDisplay_) {
+    paintBondDamage(gfx);
+  } else if (stressCylinderDisplay_) {
+    lastStressPaintSolveEpoch_ = 0;
+    paintCylinderStress(gfx);
+  } else if (on) {
+    paintAnchors(gfx);
+  } else {
+    auto restore = [&](VoxelObjectId id) {
+      if (VoxelObject* o = tryGetObject(id)) {
+        o->useImportPalette = false;
+      }
+    };
+    restore(inst->objectId);
+    for (const blast::ActorBinding& b : inst->bindings) {
+      restore(b.objectId);
+    }
+    fillGpuObjectRecords();
+    uploadObjectTransforms(gfx, 0);
+  }
 }
 
 void VoxelScene::setBondDamageDisplay(GfxDevice& gfx, bool on) {
@@ -2148,9 +2360,17 @@ bool VoxelScene::mountFrameFromOccupancy(GfxDevice& gfx) {
   blast::keepColumnWorldBox(spec, desc.diag.keepX0, desc.diag.keepX1, desc.diag.keepZ0, desc.diag.keepZ1);
   desc.diag.cutApplied = stressCylinderCut_;
   desc.keepMaterialOfReplaced = true;
-  blast::StructureInstance* inst = mountObjectStructure(
-      stressCylinderId_, blast::kFrameAgg, [](int x, int y, int z) { return blast::isFrameAnchorFine(x, y, z); },
-      desc);
+  blast::StructureInstance* inst = nullptr;
+  if (groundContactAnchors_) {
+    inst = mountObjectOnGround(stressCylinderId_, blast::kFrameAgg, desc);
+  } else {
+    inst = mountObjectStructure(
+        stressCylinderId_, blast::kFrameAgg,
+        [](int x, int y, int z) { return blast::isFrameAnchorFine(x, y, z); }, desc);
+    if (inst != nullptr) {
+      structureMountStatus_ = "explicit anchors (column bases)";
+    }
+  }
   if (inst == nullptr) {
     return false;
   }
@@ -2166,6 +2386,8 @@ bool VoxelScene::mountFrameFromOccupancy(GfxDevice& gfx) {
   lastStressPaintSolveEpoch_ = 0;
   if (stressCylinderDisplay_) {
     paintCylinderStress(gfx);
+  } else if (anchorDisplay_) {
+    paintAnchors(gfx);
   }
   return true;
 }

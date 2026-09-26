@@ -165,6 +165,7 @@ add_library(ve_structure_core STATIC
   src/blast/BlastMemory.cpp
   src/blast/VoxelGraph.cpp
   src/blast/ContactLoads.cpp
+  src/blast/GroundAnchors.cpp
   src/blast/ImpactDamage.cpp
   src/blast/OccupancySampler.cpp
   src/blast/StructureWorld.cpp
