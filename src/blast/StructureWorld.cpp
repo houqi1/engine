@@ -633,6 +633,22 @@ void StructureWorld::setStrengthPa(float globalStrengthPa) {
   }
 }
 
+void StructureWorld::setOwnStrengthPa(float strengthPa) {
+  for (auto& p : instances_) {
+    StructureInstance& inst = *p;
+    if (inst.material.ownStrengthPa <= 0.0f || inst.material.ownStrengthPa == strengthPa) {
+      continue;
+    }
+    inst.material.ownStrengthPa = strengthPa;
+    inst.material.strengthPa = strengthPa;
+    inst.debug.strengthPa = strengthPa;
+    ++inst.strengthEpoch;
+    if (inst.blast.solver != nullptr) {
+      applyExtStressStrength(*inst.blast.solver, strengthPa);
+    }
+  }
+}
+
 PendingFracture StructureWorld::takePendingFracture() {
   PendingFracture out;
   if (instances_.empty()) {

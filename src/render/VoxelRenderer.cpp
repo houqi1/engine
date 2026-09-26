@@ -2160,6 +2160,19 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
     ImGui::SliderFloat("Column height", &pendingFrameHeightMeters_, 1.0f, 9.2f, "%.1f m");
     ImGui::TextUnformatted("Height applies on Spawn / reset four columns.");
     ImGui::Text("State: %s", sw.initialized() ? "initialized" : "not initialized");
+    if (const blast::StructureInstance* focus = scene.stressStructure()) {
+      const bool own = focus->material.ownStrengthPa > 0.0f;
+      ImGui::Text("Focused %s: strength %.2f MPa (%s), fracture %s",
+                  scene.structureFocusId() == scene.importedObjectId() ? "import" : "demo",
+                  focus->material.strengthPa * 1.0e-6f, own ? "own" : "hold/fail switch",
+                  focus->material.fractureEnabled ? "on" : "OFF");
+      ImGui::Text("  nodes %u, pieces %zu, %s", focus->debug.nodes, focus->bindings.size(),
+                  focus->debug.converged ? "converged" : "converging");
+    }
+    if (sw.instanceCount() > 0 && !pendingCylinderFracture_) {
+      ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.3f, 1.0f),
+                         "Stress fracture is OFF: stress is computed, nothing breaks.");
+    }
     if (ImGui::Button("Spawn / reset four columns")) {
       spawnFrameRequested_ = true;
     }
@@ -2396,10 +2409,13 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
   if (scene.importAsObject()) {
     ImGui::Checkbox("Mount As Structure", &scene.importMount());
     ImGui::DragFloat("Import Density", &scene.importDensity(), 10.0f, 50.0f, 8000.0f, "%.0f kg/m3");
-    ImGui::DragFloat("Import Strength", &scene.importStrengthMPa(), 0.1f, 0.1f, 50.0f, "%.1f MPa");
+    if (ImGui::DragFloat("Own Strength", &scene.importStrengthMPa(), 0.05f, 0.05f, 50.0f, "%.2f MPa")) {
+      scene.structures().setOwnStrengthPa(std::max(0.05f, scene.importStrengthMPa()) * 1.0e6f);
+    }
     if (ImGui::IsItemHovered()) {
-      ImGui::SetTooltip("Applies on import. The hut peaks near 2.4 MPa under its own weight.\n"
-                        "Fail strength (1 MPa) does not apply to imports; lower this instead.");
+      ImGui::SetTooltip("Live: every structure with its own strength (imports, all their pieces, the E5.4\n"
+                        "beam), and the next import. The hut peaks near 2.4 MPa under its own weight.\n"
+                        "The Hold/Fail strength switch only drives the demos.");
     }
     const char* aggNames[] = {"Auto (2, 4 if over budget)", "2", "4"};
     int aggIndex = scene.importAgg() == 4 ? 2 : (scene.importAgg() == 2 ? 1 : 0);

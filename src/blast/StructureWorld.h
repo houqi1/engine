@@ -287,6 +287,8 @@ public:
   uint32_t warmupGravity(uint32_t maxPasses, StructureInstance* target = nullptr);
   void setFractureEnabled(bool on);
   void setStrengthPa(float strengthPa);
+  // Changes every structure that keeps its own strength (imports, their pieces, the E5.4 beam).
+  void setOwnStrengthPa(float strengthPa);
   // E5.4: persistent contacts load the stress solver (addLoad); one-shot impacts keep
   // the Viewer route. Off keeps the pre-E5.4 behavior.
   void setContactLoadsEnabled(bool on) { contactLoadsEnabled_ = on; }
