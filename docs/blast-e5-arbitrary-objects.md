@@ -329,6 +329,15 @@ E5.0 和 E5.1 是纯重构，不改行为，适合先单独提交。
 - 引擎 `--frame-fail --frame-anchors ground`：`anchors=ground fines=144 faces=144 blocked=0`，站立与切柱后均收敛，塌落结果 `single-node=20 multi-node=6 largestNodes=66`，`OK frame-fail`。
 - 19 个测试全部通过。
 
+**E5.3 完成（2026-09-26，用户手动验收通过；按用户要求未新增自动测试）**
+
+- `OccupancySampleOpts::allowFloating`（默认关）：接受无 world bond 的图和到不了锚点的节点。`validateStructureGraph(..., requireAnchored)` 的可达性检查改为从所有锚点出发的一次多源 BFS（原为每节点一次搜索，O(N²)）。
+- `mountObjectStructure(..., allowFloating)`：图有多个连通分量时，挂载后立即 `splitAllRequired(force)` 并标记 `occupancyDirty`，下一次结构提交按现有分裂流程把每块变成物体，无锚的块为 Dynamic。完整连通的物体不分裂，E5.2 行为不变。
+- `mountObjectOnGround` 允许浮空块；Static 物体完全不接触地面仍拒绝。
+- `mountObjectFree`：只接受 Dynamic 物体，无 world bond、无假锚点，只受离心力与撞击载荷。`mountObjectAuto`：Static 走贴地锚点，Dynamic 走自由体，Kinematic 拒绝。
+- 演示：「Spawn free plank (E5.3)」（4 m 木板，ρ=600，倾斜，从约 4 m 高落下；Lift & drop again 可重复）、「Spawn pillar + floating block (E5.3)」（同一物体内的立柱与浮空方块）。
+- 回归：19 个已有测试通过；`--frame-fail` 手写锚点与 E5 前基线、自动锚点与 E5.2 结果均逐行一致。
+
 ---
 
 ## 5. 验收

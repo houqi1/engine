@@ -262,9 +262,19 @@ public:
   // Mounts one voxel object's whole fine grid as a stress structure, replacing any
   // structure already mounted for it. Density is the object's; anchors come from
   // anchorFine (object-local fine coordinates). Returns nullptr on failure.
+  // allowFloating (E5.3): accept no world bonds and disconnected islands; islands are
+  // split right away and become their own bodies on the next structure commit.
   blast::StructureInstance* mountObjectStructure(VoxelObjectId id, int agg,
                                                  const std::function<bool(int, int, int)>& anchorFine,
-                                                 blast::StructureMountDesc desc);
+                                                 blast::StructureMountDesc desc, bool allowFloating = false);
+  // E5.3: a dynamic object as a free body. No world bonds, no fake anchor; the solver
+  // only sees centrifugal and impact loads.
+  blast::StructureInstance* mountObjectFree(VoxelObjectId id, int agg, blast::StructureMountDesc desc);
+  // Static objects anchor on the ground they touch, dynamic objects mount free.
+  blast::StructureInstance* mountObjectAuto(VoxelObjectId id, int agg, blast::StructureMountDesc desc);
+  // E5.3 demos on the stress demo slot (replace the cylinder / frame).
+  bool spawnFreePlank(GfxDevice& gfx);
+  bool spawnBlockWithFloatingPart(GfxDevice& gfx);
   // E5.2: fines whose exposed faces rest on unmounted static objects (the ground).
   // Faces against another mounted structure are counted as blocked.
   blast::GroundAnchorResult findGroundContactAnchors(VoxelObjectId id) const;
@@ -379,6 +389,12 @@ private:
   void paintCylinderStress(GfxDevice& gfx);
   void paintBondDamage(GfxDevice& gfx);
   void paintAnchors(GfxDevice& gfx);
+  // Allocates the stress demo object (replacing the previous one) filled by fill(x,y,z).
+  VoxelObject* allocStressDemoObject(GfxDevice& gfx, int gridSize, MotionType motion, float density,
+                                     const glm::vec3& position, const glm::quat& rotation,
+                                     const std::function<bool(int, int, int)>& fill);
+  // Upload, physics rebuild and color refresh after a demo structure mount.
+  void finishDemoMount(GfxDevice& gfx);
   // Writes the anchor color over world-anchored fines of every object bound to inst.
   void overlayAnchorFines(const blast::StructureInstance& inst);
   void destroyStressCylinderObject();

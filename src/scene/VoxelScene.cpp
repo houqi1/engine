@@ -1805,9 +1805,48 @@ void VoxelScene::destroyStressCylinderObject() {
   freeObjectSlot(slot);
 }
 
+namespace {
+
+// Connected components of the non-world bond graph (floating islands at mount time).
+uint32_t graphComponents(const blast::VoxelStructureGraph& graph) {
+  std::unordered_map<uint32_t, std::vector<uint32_t>> adj;
+  for (const blast::GraphBond& b : graph.bonds) {
+    if (!b.world) {
+      adj[b.nodeA].push_back(b.nodeB);
+      adj[b.nodeB].push_back(b.nodeA);
+    }
+  }
+  std::unordered_set<uint32_t> seen;
+  uint32_t components = 0;
+  std::vector<uint32_t> stack;
+  for (const blast::GraphNode& n : graph.nodes) {
+    if (!seen.insert(n.stableId).second) {
+      continue;
+    }
+    ++components;
+    stack.assign(1, n.stableId);
+    while (!stack.empty()) {
+      const uint32_t u = stack.back();
+      stack.pop_back();
+      const auto it = adj.find(u);
+      if (it == adj.end()) {
+        continue;
+      }
+      for (uint32_t v : it->second) {
+        if (seen.insert(v).second) {
+          stack.push_back(v);
+        }
+      }
+    }
+  }
+  return components;
+}
+
+}  // namespace
+
 blast::StructureInstance* VoxelScene::mountObjectStructure(VoxelObjectId id, int agg,
                                                            const std::function<bool(int, int, int)>& anchorFine,
-                                                           blast::StructureMountDesc desc) {
+                                                           blast::StructureMountDesc desc, bool allowFloating) {
   const VoxelObject* o = tryGetObject(id);
   if (o == nullptr) {
     return nullptr;
@@ -1823,6 +1862,7 @@ blast::StructureInstance* VoxelScene::mountObjectStructure(VoxelObjectId id, int
       anchorFine);
   blast::OccupancySampleOpts opts;
   opts.agg = agg;
+  opts.allowFloating = allowFloating;
   const auto t0 = std::chrono::steady_clock::now();
   blast::OccupancySample sample = blast::sampleOccupancy(view, opts);
   const auto t1 = std::chrono::steady_clock::now();
@@ -1831,6 +1871,7 @@ blast::StructureInstance* VoxelScene::mountObjectStructure(VoxelObjectId id, int
     std::cerr << "OccupancySampler: " << sample.message << "\n";
     return nullptr;
   }
+  const uint32_t islands = allowFloating ? graphComponents(sample.graph) : 1u;
   desc.objectId = id;
   blast::StructureHandle handle;
   if (structures_.mount(desc, std::move(sample), &handle) != blast::BlastError::Ok) {
@@ -1842,6 +1883,13 @@ blast::StructureInstance* VoxelScene::mountObjectStructure(VoxelObjectId id, int
   inst->debug.extractMs = std::chrono::duration<float, std::milli>(t1 - t0).count();
   inst->topologyRevision = o->topologyRevision;
   inst->debug.topologyRevision = o->topologyRevision;
+  if (islands > 1) {
+    // Separate the islands now; the next structure commit turns each into a body
+    // (unanchored ones dynamic) exactly like a damage-driven split.
+    structures_.splitAllRequired(inst, true);
+    inst->occupancyDirty = true;
+    std::cout << "Structure mount: " << islands << " islands, split on the next commit\n";
+  }
   return inst;
 }
 
@@ -1912,12 +1960,50 @@ blast::StructureInstance* VoxelScene::mountObjectOnGround(VoxelObjectId id, int 
     return nullptr;
   }
   blast::StructureInstance* inst = mountObjectStructure(
-      id, agg, [&anchors](int x, int y, int z) { return anchors.isAnchor(x, y, z); }, std::move(desc));
+      id, agg, [&anchors](int x, int y, int z) { return anchors.isAnchor(x, y, z); }, std::move(desc),
+      /*allowFloating=*/true);
   if (inst != nullptr) {
     structureMountStatus_ = "ground anchors: " + std::to_string(anchors.anchorFines) + " fines, " +
                             std::to_string(anchors.contactFaces) + " faces";
+    if (inst->occupancyDirty) {
+      structureMountStatus_ += ", floating parts split off";
+    }
   }
   return inst;
+}
+
+blast::StructureInstance* VoxelScene::mountObjectFree(VoxelObjectId id, int agg, blast::StructureMountDesc desc) {
+  const VoxelObject* o = tryGetObject(id);
+  lastGroundAnchors_ = {};
+  if (o == nullptr) {
+    structureMountStatus_ = "free body: no object";
+    return nullptr;
+  }
+  if (o->motionType != MotionType::Dynamic) {
+    structureMountStatus_ = "free body: object is not dynamic";
+    std::cerr << "Structure mount refused: " << structureMountStatus_ << "\n";
+    return nullptr;
+  }
+  blast::StructureInstance* inst = mountObjectStructure(id, agg, nullptr, std::move(desc), /*allowFloating=*/true);
+  if (inst != nullptr) {
+    structureMountStatus_ = "free body: no world bonds";
+    if (inst->occupancyDirty) {
+      structureMountStatus_ += ", disconnected parts split off";
+    }
+  }
+  return inst;
+}
+
+blast::StructureInstance* VoxelScene::mountObjectAuto(VoxelObjectId id, int agg, blast::StructureMountDesc desc) {
+  const VoxelObject* o = tryGetObject(id);
+  if (o != nullptr && o->motionType == MotionType::Dynamic) {
+    return mountObjectFree(id, agg, std::move(desc));
+  }
+  if (o != nullptr && o->motionType == MotionType::Kinematic) {
+    structureMountStatus_ = "refused: kinematic objects are not structures";
+    return nullptr;
+  }
+  return mountObjectOnGround(id, agg, std::move(desc));
 }
 
 bool VoxelScene::mountCylinderFromOccupancy(GfxDevice& gfx) {
@@ -2487,6 +2573,132 @@ bool VoxelScene::cutThreeColumns(GfxDevice& gfx) {
     mountFrameFromOccupancy(gfx);
     return false;
   }
+  return true;
+}
+
+VoxelObject* VoxelScene::allocStressDemoObject(GfxDevice& gfx, int gridSize, MotionType motion, float density,
+                                               const glm::vec3& position, const glm::quat& rotation,
+                                               const std::function<bool(int, int, int)>& fill) {
+  nestedMicroVoxels_ = true;
+  nestedFineVoxels_ = true;
+  if (!simulate_) {
+    setSimulate(gfx, true);
+  }
+  if (VoxelObject* test = tryGetObject(testObjectId_)) {
+    test->enabled = false;
+    physics_.removeBody(testObjectId_);
+  }
+  destroyStressCylinderObject();
+  const uint32_t slot = allocObjectSlot();
+  VoxelObject& o = objects_[slot];
+  o.gridSize = gridSize;
+  o.voxelSize = voxelSize_;
+  o.nestedMicro = true;
+  o.editable = true;
+  o.enabled = true;
+  o.slotOccupied = true;
+  o.isScatter = false;
+  o.motionType = motion;
+  o.density = density;
+  o.topologyRevision = 1;
+  o.useImportPalette = false;
+  o.rotation = rotation;
+  o.position = position;
+  o.cells.assign(static_cast<size_t>(gridSize * gridSize * gridSize), CoarseCell{});
+  const int n = gridSize * kFinePerCoarse;
+  for (int z = 0; z < n; ++z) {
+    for (int y = 0; y < n; ++y) {
+      for (int x = 0; x < n; ++x) {
+        if (!fill(x, y, z)) {
+          continue;
+        }
+        glm::ivec3 c, m, f;
+        splitFineIndex(x, y, z, c, m, f);
+        ensureCoarseBrick(o, c, 2u);
+        setFineCpu(o, c, m, f, true);
+      }
+    }
+  }
+  stressCylinderId_ = makeObjectId(slot);
+  stressCylinderCut_ = false;
+  return &o;
+}
+
+void VoxelScene::finishDemoMount(GfxDevice& gfx) {
+  const int slot = static_cast<int>(stressCylinderId_.slot);
+  if (VoxelObject* o = tryGetObject(stressCylinderId_)) {
+    o->topologyRevision += 1;
+  }
+  packObjectPool();
+  flushObject(gfx, slot);
+  notifyOccupancyChanged(slot);
+  physics_.rebuildFromScene();
+  lastStressPaintSolveEpoch_ = 0;
+  if (stressCylinderDisplay_) {
+    paintCylinderStress(gfx);
+  } else if (anchorDisplay_) {
+    paintAnchors(gfx);
+  }
+}
+
+bool VoxelScene::spawnFreePlank(GfxDevice& gfx) {
+  // 4.0 x 0.3 x 0.6 m wooden plank centred in a 3-cell grid, tilted, 4 m above the ground.
+  constexpr int kGrid = 3;
+  const glm::quat tilt = glm::angleAxis(glm::radians(20.0f), glm::vec3(0.0f, 1.0f, 0.0f)) *
+                         glm::angleAxis(glm::radians(12.0f), glm::vec3(0.0f, 0.0f, 1.0f));
+  const glm::vec3 center(0.0f, 3.2f + 4.0f, 0.0f);
+  allocStressDemoObject(gfx, kGrid, MotionType::Dynamic, physics::kDensityWood, center, tilt,
+                        [](int x, int y, int z) { return x >= 4 && x < 44 && y >= 22 && y < 25 && z >= 21 && z < 27; });
+  frameSpawnPosValid_ = true;  // "Lift & drop again" re-drops the plank pieces
+  frameExtentY_ = 2.0f;
+  camera_.setOrbitTarget(glm::vec3(0.0f, 4.5f, 0.0f));
+  camera_.setOrbitDistance(14.0f);
+  blast::StructureMountDesc desc;
+  desc.material.strengthPa = blast::kFrameStrengthHoldPa;
+  desc.material.solverIters = 200;
+  if (mountObjectFree(stressCylinderId_, 2, desc) == nullptr) {
+    destroyStressCylinderObject();
+    packObjectPool();
+    fillGpuObjectRecords();
+    ensureGpuBuffers(gfx);
+    uploadWorldAndObjects(gfx);
+    physics_.rebuildFromScene();
+    return false;
+  }
+  finishDemoMount(gfx);
+  return true;
+}
+
+bool VoxelScene::spawnBlockWithFloatingPart(GfxDevice& gfx) {
+  // A 0.6 x 3.0 x 0.6 m pillar on the ground and, 0.5 m beside it, a 1.0 x 0.6 x 0.8 m
+  // block that is part of the same object but touches nothing.
+  constexpr int kGrid = 4;
+  const glm::vec3 center(0.0f, 3.2f + 0.5f * static_cast<float>(kGrid) * voxelSize_, 0.0f);
+  allocStressDemoObject(gfx, kGrid, MotionType::Static, blast::kE1Density, center, glm::quat(1.0f, 0.0f, 0.0f, 0.0f),
+                        [](int x, int y, int z) {
+                          const bool pillar = x >= 29 && x < 35 && z >= 29 && z < 35 && y >= 0 && y < 30;
+                          const bool floating = x >= 40 && x < 50 && z >= 28 && z < 36 && y >= 20 && y < 26;
+                          return pillar || floating;
+                        });
+  frameSpawnPosValid_ = true;
+  frameExtentY_ = 3.0f;
+  camera_.setOrbitTarget(glm::vec3(0.0f, 4.8f, 0.0f));
+  camera_.setOrbitDistance(16.0f);
+  blast::StructureMountDesc desc;
+  desc.material.strengthPa = blast::kFrameStrengthHoldPa;
+  desc.material.solverIters = 200;
+  blast::StructureInstance* inst = mountObjectOnGround(stressCylinderId_, 2, desc);
+  if (inst == nullptr) {
+    destroyStressCylinderObject();
+    packObjectPool();
+    fillGpuObjectRecords();
+    ensureGpuBuffers(gfx);
+    uploadWorldAndObjects(gfx);
+    physics_.rebuildFromScene();
+    return false;
+  }
+  finishDemoMount(gfx);
+  structures_.warmupGravity(8u, structures_.find(stressCylinderId_));
   return true;
 }
 

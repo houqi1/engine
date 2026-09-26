@@ -1364,7 +1364,7 @@ bool VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
       scatterClearRequested_ || simulateRequested_ || spawnTestBoxRequested_ || fineProbesRequested_ ||
       spawnCylinderRequested_ ||
       spawnFrameRequested_ || resetCylinderRequested_ || cutCylinderRequested_ || cutThreeColumnsRequested_ ||
-      liftStructureRedropRequested_ ||
+      liftStructureRedropRequested_ || spawnFreePlankRequested_ || spawnFloatingPartRequested_ ||
       cylinderDensityRequested_ || cylinderItersRequested_ || cylinderDisplayRequested_) {
     gfx_.waitIdle();
     if (importRequested_) {
@@ -1413,6 +1413,12 @@ bool VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
     if (cutThreeColumnsRequested_) {
       scene.cutThreeColumns(gfx_);
     }
+    if (spawnFreePlankRequested_) {
+      scene.spawnFreePlank(gfx_);
+    }
+    if (spawnFloatingPartRequested_) {
+      scene.spawnBlockWithFloatingPart(gfx_);
+    }
     if (liftStructureRedropRequested_) {
       if (!scene.liftStructureForRedrop()) {
         std::cerr << "Lift structure for redrop: no dynamic pieces (spawn frame + Fail first)\n";
@@ -1432,6 +1438,7 @@ bool VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
     fineProbesRequested_ = false;
     spawnCylinderRequested_ = resetCylinderRequested_ = cutCylinderRequested_ = false;
     spawnFrameRequested_ = cutThreeColumnsRequested_ = liftStructureRedropRequested_ = false;
+    spawnFreePlankRequested_ = spawnFloatingPartRequested_ = false;
     cylinderDensityRequested_ = cylinderItersRequested_ = cylinderDisplayRequested_ = false;
     boundCoarsePoolBuffer_ = VK_NULL_HANDLE;
   }
@@ -2152,6 +2159,23 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
     if (ImGui::IsItemHovered()) {
       ImGui::SetTooltip(
           "Raise fallen dynamic pieces to the frame spawn height, zero velocity, and let them fall again.");
+    }
+    if (ImGui::Button("Spawn free plank (E5.3)")) {
+      spawnFreePlankRequested_ = true;
+    }
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip(
+          "Dynamic 4 m wooden plank mounted as a free body (no world bonds) and dropped from 4 m.\n"
+          "Lift & drop again re-drops its pieces.");
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Spawn pillar + floating block (E5.3)")) {
+      spawnFloatingPartRequested_ = true;
+    }
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip(
+          "One static object: a pillar on the ground plus a block that touches nothing.\n"
+          "The pillar anchors on the ground; the floating block splits off and falls.");
     }
     if (ImGui::Button("Spawn cylinder (legacy)")) {
       spawnCylinderRequested_ = true;

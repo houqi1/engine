@@ -23,6 +23,9 @@ public:
 
 struct OccupancySampleOpts {
   int agg = 2;
+  // E5.3: accept graphs without world bonds (free bodies) and nodes that cannot reach
+  // an anchor (floating islands, split off right after mounting).
+  bool allowFloating = false;
 };
 
 struct OccupancySample {
@@ -37,7 +40,9 @@ struct OccupancySample {
 
 OccupancySample sampleOccupancy(const OccupancyView& view, const OccupancySampleOpts& opts);
 BlastError attachWorldBonds(const VoxelGrid& grid, VoxelStructureGraph& graph);
-BlastError validateStructureGraph(const VoxelGrid& grid, const VoxelStructureGraph& graph);
+// requireAnchored: at least one world bond and every node reaches one.
+BlastError validateStructureGraph(const VoxelGrid& grid, const VoxelStructureGraph& graph,
+                                  bool requireAnchored = true);
 bool nodeReachesAnchor(const VoxelStructureGraph& graph, uint32_t startId);
 
 }  // namespace blast

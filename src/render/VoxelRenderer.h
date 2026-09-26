@@ -242,6 +242,8 @@ private:
   float pendingFrameHeightMeters_ = 4.0f;
   bool cutThreeColumnsRequested_ = false;
   bool liftStructureRedropRequested_ = false;
+  bool spawnFreePlankRequested_ = false;
+  bool spawnFloatingPartRequested_ = false;
   bool cylinderDensityRequested_ = false;
   bool cylinderItersRequested_ = false;
   bool cylinderDisplayRequested_ = false;

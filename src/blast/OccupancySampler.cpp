@@ -110,7 +110,7 @@ bool nodeReachesAnchor(const VoxelStructureGraph& graph, uint32_t startId) {
   return false;
 }
 
-BlastError validateStructureGraph(const VoxelGrid& grid, const VoxelStructureGraph& graph) {
+BlastError validateStructureGraph(const VoxelGrid& grid, const VoxelStructureGraph& graph, bool requireAnchored) {
   if (graph.nodes.empty()) {
     return BlastError::EmptyGraph;
   }
@@ -155,13 +155,41 @@ BlastError validateStructureGraph(const VoxelGrid& grid, const VoxelStructureGra
       }
     }
   }
+  if (!requireAnchored) {
+    return BlastError::Ok;
+  }
   if (worldBonds == 0) {
     return BlastError::NotAnchored;
   }
-  for (const GraphNode& n : graph.nodes) {
-    if (!nodeReachesAnchor(graph, n.stableId)) {
-      return BlastError::DisconnectedFromAnchor;
+  // One multi-source search from every anchored node instead of one search per node.
+  std::unordered_map<uint32_t, std::vector<uint32_t>> adj;
+  std::unordered_set<uint32_t> reached;
+  std::queue<uint32_t> q;
+  for (const GraphBond& b : graph.bonds) {
+    if (b.world) {
+      if (reached.insert(b.nodeA).second) {
+        q.push(b.nodeA);
+      }
+      continue;
     }
+    adj[b.nodeA].push_back(b.nodeB);
+    adj[b.nodeB].push_back(b.nodeA);
+  }
+  while (!q.empty()) {
+    const uint32_t u = q.front();
+    q.pop();
+    const auto it = adj.find(u);
+    if (it == adj.end()) {
+      continue;
+    }
+    for (uint32_t v : it->second) {
+      if (reached.insert(v).second) {
+        q.push(v);
+      }
+    }
+  }
+  if (reached.size() != graph.nodes.size()) {
+    return BlastError::DisconnectedFromAnchor;
   }
   return BlastError::Ok;
 }
@@ -198,11 +226,14 @@ OccupancySample sampleOccupancy(const OccupancyView& view, const OccupancySample
     return out;
   }
   out.error = attachWorldBonds(out.grid, out.graph);
+  if (out.error == BlastError::NotAnchored && opts.allowFloating) {
+    out.error = BlastError::Ok;
+  }
   if (out.error != BlastError::Ok) {
     out.message = blastErrorMessage(out.error);
     return out;
   }
-  out.error = validateStructureGraph(out.grid, out.graph);
+  out.error = validateStructureGraph(out.grid, out.graph, !opts.allowFloating);
   out.message = blastErrorMessage(out.error);
   out.worldBonds = 0;
   for (const GraphBond& b : out.graph.bonds) {
