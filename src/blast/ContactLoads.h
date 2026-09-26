@@ -90,6 +90,9 @@ struct BodyKinematics {
   VoxelObjectId objectId{};
   glm::quat worldQ{1.0f, 0.0f, 0.0f, 0.0f};
   glm::vec3 worldW{0.0f};
+  // Sleeping or static. Physics skips pairs whose bodies all sleep (or sleep against
+  // the static environment), so their contact loads must be held, not decayed.
+  bool awake = true;
 };
 
 inline uint64_t contactPairKey(VoxelObjectId a, VoxelObjectId b) {

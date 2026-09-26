@@ -154,6 +154,18 @@ public:
   bool importSurfaceMesh(GfxDevice& gfx, const std::string& path, const MeshVoxelizeConfig& cfg);
   void removeImportedMesh(GfxDevice& gfx);
   const std::string& importStatus() const { return importStatus_; }
+  // E5.5: voxelize a mesh into its own static object standing on the ground (lowest
+  // occupied layer on the ground top, centred in x/z). With importMount() it is mounted
+  // as a stress structure anchored where it touches the ground.
+  bool importMeshAsObject(GfxDevice& gfx, const std::string& path, const MeshVoxelizeConfig& cfg);
+  bool& importAsObject() { return importAsObject_; }
+  bool& importMount() { return importMount_; }
+  float& importDensity() { return importDensity_; }
+  float& importStrengthMPa() { return importStrengthMPa_; }  // the import's own strength
+  int& importAgg() { return importAgg_; }  // 0 = auto (2, or 4 when over the node budget)
+  VoxelObjectId importedObjectId() const { return importedObjectId_; }
+  // Structure shown by the panel and stress / anchor colors: the last spawned demo or import.
+  VoxelObjectId structureFocusId() const;
   std::string& importPath() { return importPath_; }
   int& importGridN() { return importGridN_; }
   int& importPadding() { return importPadding_; }
@@ -256,9 +268,9 @@ public:
   blast::StructureWorld& structures() { return structures_; }
   const blast::StructureWorld& structures() const { return structures_; }
   VoxelObjectId stressCylinderId() const { return stressCylinderId_; }
-  // Structure mounted for the stress demo object (cylinder or four-column frame).
-  blast::StructureInstance* stressStructure() { return structures_.find(stressCylinderId_); }
-  const blast::StructureInstance* stressStructure() const { return structures_.find(stressCylinderId_); }
+  // Structure mounted for the focused object (stress demo or imported mesh).
+  blast::StructureInstance* stressStructure() { return structures_.find(structureFocusId()); }
+  const blast::StructureInstance* stressStructure() const { return structures_.find(structureFocusId()); }
   // Mounts one voxel object's whole fine grid as a stress structure, replacing any
   // structure already mounted for it. Density is the object's; anchors come from
   // anchorFine (object-local fine coordinates). Returns nullptr on failure.
@@ -275,6 +287,17 @@ public:
   // E5.3 demos on the stress demo slot (replace the cylinder / frame).
   bool spawnFreePlank(GfxDevice& gfx);
   bool spawnBlockWithFloatingPart(GfxDevice& gfx);
+  // E5.4 contact-load demos. The beam rests on two static piers 3.2 m apart; with
+  // anchoredReference it is a static beam anchored on the pier tops instead (T06 reference).
+  bool spawnBeamOnPiers(GfxDevice& gfx, bool anchoredReference, float dropHeight = 0.01f);
+  // Cuts the top half of the beam at mid-span, as digging would (structure rebuild).
+  bool notchDemoBeam(GfxDevice& gfx);
+  // A dynamic 0.4 m cube (not a structure) dropped on a four-column roof beam, and its removal.
+  bool dropWeightOnRoof(GfxDevice& gfx, float density);
+  void removeDemoWeight(GfxDevice& gfx);
+  VoxelObjectId demoWeightId() const { return demoWeightId_; }
+  // Resting beam peaks near 0.096 MPa, notched near 0.153 MPa: holds intact, breaks notched.
+  static constexpr float kBeamDemoStrengthPa = 1.2e5f;
   // E5.2: fines whose exposed faces rest on unmounted static objects (the ground).
   // Faces against another mounted structure are counted as blocked.
   blast::GroundAnchorResult findGroundContactAnchors(VoxelObjectId id) const;
@@ -395,6 +418,11 @@ private:
                                      const std::function<bool(int, int, int)>& fill);
   // Upload, physics rebuild and color refresh after a demo structure mount.
   void finishDemoMount(GfxDevice& gfx);
+  // Allocates and fills an object without touching the stress demo slot.
+  uint32_t allocDemoSlot(int gridSize, MotionType motion, float density, const glm::vec3& position,
+                         const glm::quat& rotation, const std::function<bool(int, int, int)>& fill);
+  std::vector<VoxelObjectId> demoAuxIds_;  // piers, weights: freed with the demo structure
+  VoxelObjectId demoWeightId_{};
   // Writes the anchor color over world-anchored fines of every object bound to inst.
   void overlayAnchorFines(const blast::StructureInstance& inst);
   void destroyStressCylinderObject();
@@ -488,6 +516,31 @@ private:
   int importPadding_ = 1;
   bool importSampleColor_ = false;
   bool importConservative_ = true;
+  bool importAsObject_ = true;
+  bool importMount_ = true;
+  float importDensity_ = 600.0f;
+  // The hut peaks near 2.4 MPa under its own weight: 4 MPa stands, loses its supports.
+  float importStrengthMPa_ = 4.0f;
+  int importAgg_ = 0;
+  VoxelObjectId importedObjectId_{};
+  VoxelObjectId structureFocusId_{};
+  bool lastImportAsObject_ = false;
+  // Nodes a mounted import may have before auto agg retries at 4 (and then refuses).
+  static constexpr size_t kImportMaxNodes = 32768;
+  bool voxelizeImport(GfxDevice& gfx, const std::string& path, const MeshVoxelizeConfig& cfg,
+                      MeshVoxelizeResult& r);
+  // Rebuilds the ground slab, dropping a mesh stamped into it by an earlier import.
+  void clearGroundStamp();
+  void releaseImportedObject();
+  // Ground slab thickness in coarse cells; its top is where objects stand.
+  static constexpr int kGroundThicknessCells = 2;
+  float groundTopY() const;
+  // Resamples the import's fine occupancy onto a destination fine grid, marking every
+  // destination fine an occupied import fine overlaps. place() returns whether it set
+  // a fine; the count of those is returned. Shared by the ground stamp and object import.
+  uint32_t forEachImportWorldFine(const MeshVoxelizeResult& r, bool sampleColor, const glm::vec3& srcOrigin,
+                                  const glm::vec3& dstOrigin, float dstFineVs, int dstFineN,
+                                  const std::function<bool(int, int, int, bool, uint32_t)>& place) const;
 
   std::vector<VoxelObject> objects_;
   std::vector<uint32_t> objectGenerations_;

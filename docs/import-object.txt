@@ -1,0 +1,40 @@
+agg=2 grid=6 bottomY=3.200 anchorFines=89 faces=89 blocked=0 importMs=1996
+  status: Imported as object  grid=6  fines=39564  size=8.90x8.20x8.70 m  resample 279 ms
+Mounted: 9028 nodes, 19378 bonds, extract 52 ms; ground anchors: 89 fines, 89 faces
+  t= 1s nodes=9028 bonds=19378 worldBonds=44 mass=23739 conv=0 linErr=54.2 angErr=48.9 maxT=1.26e+06 maxC=2.22e+06 maxS=7.78e+05 S=4e+06 fractured=0 actors=1 solveMs=57.21
+  t= 2s nodes=9028 bonds=19378 worldBonds=44 mass=23739 conv=0 linErr=24.8 angErr=26.7 maxT=1.45e+06 maxC=2.32e+06 maxS=8.45e+05 S=4e+06 fractured=0 actors=1 solveMs=54.46
+  t= 3s nodes=9028 bonds=19378 worldBonds=44 mass=23739 conv=0 linErr=8.49 angErr=8.76 maxT=1.52e+06 maxC=2.43e+06 maxS=8.87e+05 S=4e+06 fractured=0 actors=1 solveMs=45.61
+  t= 4s nodes=9028 bonds=19378 worldBonds=44 mass=23739 conv=1 linErr=6.19 angErr=5.83 maxT=1.52e+06 maxC=2.44e+06 maxS=8.91e+05 S=4e+06 fractured=0 actors=1 solveMs=0.79
+  t= 5s nodes=9028 bonds=19378 worldBonds=44 mass=23739 conv=1 linErr=6.19 angErr=5.83 maxT=1.52e+06 maxC=2.44e+06 maxS=8.91e+05 S=4e+06 fractured=0 actors=1 solveMs=1.21
+  t= 6s nodes=9028 bonds=19378 worldBonds=44 mass=23739 conv=1 linErr=6.19 angErr=5.83 maxT=1.52e+06 maxC=2.44e+06 maxS=8.91e+05 S=4e+06 fractured=0 actors=1 solveMs=0.79
+  t= 7s nodes=9028 bonds=19378 worldBonds=44 mass=23739 conv=1 linErr=6.19 angErr=5.83 maxT=1.52e+06 maxC=2.44e+06 maxS=8.91e+05 S=4e+06 fractured=0 actors=1 solveMs=0.61
+  t= 8s nodes=9028 bonds=19378 worldBonds=44 mass=23739 conv=1 linErr=6.19 angErr=5.83 maxT=1.52e+06 maxC=2.44e+06 maxS=8.91e+05 S=4e+06 fractured=0 actors=1 solveMs=1.23
+  t= 9s nodes=9028 bonds=19378 worldBonds=44 mass=23739 conv=1 linErr=6.19 angErr=5.83 maxT=1.52e+06 maxC=2.44e+06 maxS=8.91e+05 S=4e+06 fractured=0 actors=1 solveMs=0.73
+  t=10s nodes=9028 bonds=19378 worldBonds=44 mass=23739 conv=1 linErr=6.19 angErr=5.83 maxT=1.52e+06 maxC=2.44e+06 maxS=8.91e+05 S=4e+06 fractured=0 actors=1 solveMs=1.28
+agg=4 grid=6 bottomY=3.200 anchorFines=89 faces=89 blocked=0 importMs=1759
+  status: Imported as object  grid=6  fines=39564  size=8.90x8.20x8.70 m  resample 294 ms
+Mounted: 2041 nodes, 4260 bonds, extract 39 ms; ground anchors: 89 fines, 89 faces
+  t= 1s nodes=2041 bonds=4260 worldBonds=22 mass=23738 conv=0 linErr=124 angErr=152 maxT=4.96e+05 maxC=2.03e+06 maxS=1e+06 S=4e+06 fractured=0 actors=1 solveMs=13.39
+  t= 2s nodes=2041 bonds=4260 worldBonds=22 mass=23738 conv=0 linErr=41.9 angErr=52.6 maxT=6.43e+05 maxC=2.46e+06 maxS=1.22e+06 S=4e+06 fractured=0 actors=1 solveMs=9.25
+  t= 3s nodes=2041 bonds=4260 worldBonds=22 mass=23738 conv=0 linErr=21.8 angErr=26.4 maxT=7.13e+05 maxC=2.66e+06 maxS=1.29e+06 S=4e+06 fractured=0 actors=1 solveMs=5.59
+  t= 4s nodes=2041 bonds=4260 worldBonds=22 mass=23738 conv=0 linErr=15.9 angErr=18.9 maxT=7.51e+05 maxC=2.78e+06 maxS=1.32e+06 S=4e+06 fractured=0 actors=1 solveMs=9.95
+  t= 5s nodes=2041 bonds=4260 worldBonds=22 mass=23738 conv=0 linErr=9.31 angErr=12.4 maxT=7.75e+05 maxC=2.85e+06 maxS=1.34e+06 S=4e+06 fractured=0 actors=1 solveMs=10.33
+  t= 6s nodes=2041 bonds=4260 worldBonds=22 mass=23738 conv=0 linErr=5.94 angErr=7.25 maxT=7.9e+05 maxC=2.9e+06 maxS=1.35e+06 S=4e+06 fractured=0 actors=1 solveMs=8.93
+  t= 7s nodes=2041 bonds=4260 worldBonds=22 mass=23738 conv=0 linErr=3.7 angErr=4.44 maxT=8e+05 maxC=2.93e+06 maxS=1.35e+06 S=4e+06 fractured=0 actors=1 solveMs=6.45
+  t= 8s nodes=2041 bonds=4260 worldBonds=22 mass=23738 conv=0 linErr=2.73 angErr=3.87 maxT=8.06e+05 maxC=2.95e+06 maxS=1.36e+06 S=4e+06 fractured=0 actors=1 solveMs=10.80
+  t= 9s nodes=2041 bonds=4260 worldBonds=22 mass=23738 conv=1 linErr=1.67 angErr=1.99 maxT=8.09e+05 maxC=2.95e+06 maxS=1.36e+06 S=4e+06 fractured=0 actors=1 solveMs=0.34
+  t=10s nodes=2041 bonds=4260 worldBonds=22 mass=23738 conv=1 linErr=1.67 angErr=1.99 maxT=8.09e+05 maxC=2.95e+06 maxS=1.36e+06 S=4e+06 fractured=0 actors=1 solveMs=0.13
+agg=auto grid=6 bottomY=3.200 anchorFines=89 faces=89 blocked=0 importMs=2405
+  status: Imported as object  grid=6  fines=39564  size=8.90x8.20x8.70 m  resample 323 ms
+Mounted: 9028 nodes, 19378 bonds, extract 68 ms; ground anchors: 89 fines, 89 faces
+  t= 1s nodes=9028 bonds=19378 worldBonds=44 mass=23739 conv=0 linErr=54.2 angErr=48.9 maxT=1.26e+06 maxC=2.22e+06 maxS=7.78e+05 S=4e+06 fractured=0 actors=1 solveMs=41.21
+  t= 2s nodes=9028 bonds=19378 worldBonds=44 mass=23739 conv=0 linErr=24.8 angErr=26.7 maxT=1.45e+06 maxC=2.32e+06 maxS=8.45e+05 S=4e+06 fractured=0 actors=1 solveMs=55.67
+  t= 3s nodes=9028 bonds=19378 worldBonds=44 mass=23739 conv=0 linErr=8.49 angErr=8.76 maxT=1.52e+06 maxC=2.43e+06 maxS=8.87e+05 S=4e+06 fractured=0 actors=1 solveMs=46.02
+  t= 4s nodes=9028 bonds=19378 worldBonds=44 mass=23739 conv=1 linErr=6.19 angErr=5.83 maxT=1.52e+06 maxC=2.44e+06 maxS=8.91e+05 S=4e+06 fractured=0 actors=1 solveMs=1.47
+  t= 5s nodes=9028 bonds=19378 worldBonds=44 mass=23739 conv=1 linErr=6.19 angErr=5.83 maxT=1.52e+06 maxC=2.44e+06 maxS=8.91e+05 S=4e+06 fractured=0 actors=1 solveMs=0.84
+  t= 6s nodes=9028 bonds=19378 worldBonds=44 mass=23739 conv=1 linErr=6.19 angErr=5.83 maxT=1.52e+06 maxC=2.44e+06 maxS=8.91e+05 S=4e+06 fractured=0 actors=1 solveMs=0.94
+  t= 7s nodes=9028 bonds=19378 worldBonds=44 mass=23739 conv=1 linErr=6.19 angErr=5.83 maxT=1.52e+06 maxC=2.44e+06 maxS=8.91e+05 S=4e+06 fractured=0 actors=1 solveMs=1.29
+  t= 8s nodes=9028 bonds=19378 worldBonds=44 mass=23739 conv=1 linErr=6.19 angErr=5.83 maxT=1.52e+06 maxC=2.44e+06 maxS=8.91e+05 S=4e+06 fractured=0 actors=1 solveMs=1.49
+  t= 9s nodes=9028 bonds=19378 worldBonds=44 mass=23739 conv=1 linErr=6.19 angErr=5.83 maxT=1.52e+06 maxC=2.44e+06 maxS=8.91e+05 S=4e+06 fractured=0 actors=1 solveMs=1.23
+  t=10s nodes=9028 bonds=19378 worldBonds=44 mass=23739 conv=1 linErr=6.19 angErr=5.83 maxT=1.52e+06 maxC=2.44e+06 maxS=8.91e+05 S=4e+06 fractured=0 actors=1 solveMs=1.21
+OK import-object: hut mounted and stood under self-weight at every agg

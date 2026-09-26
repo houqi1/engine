@@ -1365,6 +1365,7 @@ bool VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
       spawnCylinderRequested_ ||
       spawnFrameRequested_ || resetCylinderRequested_ || cutCylinderRequested_ || cutThreeColumnsRequested_ ||
       liftStructureRedropRequested_ || spawnFreePlankRequested_ || spawnFloatingPartRequested_ ||
+      contactDemoRequest_ != 0 ||
       cylinderDensityRequested_ || cylinderItersRequested_ || cylinderDisplayRequested_) {
     gfx_.waitIdle();
     if (importRequested_) {
@@ -1375,7 +1376,11 @@ bool VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
       const std::string path = scene.importPath().empty()
                                    ? std::string(VE_ASSETS_DIR) + "/meshes/cube.obj"
                                    : scene.importPath();
-      scene.importSurfaceMesh(gfx_, path, cfg);
+      if (scene.importAsObject()) {
+        scene.importMeshAsObject(gfx_, path, cfg);
+      } else {
+        scene.importSurfaceMesh(gfx_, path, cfg);
+      }
     }
     if (removeImportRequested_) {
       scene.removeImportedMesh(gfx_);
@@ -1419,6 +1424,14 @@ bool VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
     if (spawnFloatingPartRequested_) {
       scene.spawnBlockWithFloatingPart(gfx_);
     }
+    switch (contactDemoRequest_) {
+      case 1: scene.spawnBeamOnPiers(gfx_, false); break;
+      case 2: scene.notchDemoBeam(gfx_); break;
+      case 3: scene.dropWeightOnRoof(gfx_, pendingWeightDensity_); break;
+      case 4: scene.removeDemoWeight(gfx_); break;
+      default: break;
+    }
+    contactDemoRequest_ = 0;
     if (liftStructureRedropRequested_) {
       if (!scene.liftStructureForRedrop()) {
         std::cerr << "Lift structure for redrop: no dynamic pieces (spawn frame + Fail first)\n";
@@ -1448,6 +1461,7 @@ bool VoxelRenderer::draw(VoxelScene& scene, float displayFps) {
   // Do NOT call setDensityScale / setSolverIters here — setNodeInfo dirties ExtStress and
   // forces a cold start every frame (strip stuck ~0.27 MPa, stress colors all blue).
   scene.structures().setFractureEnabled(pendingCylinderFracture_);
+  // Demos follow this switch; imports and the E5.4 beam keep their own strength.
   scene.structures().setStrengthPa(pendingCylinderFailStrength_ ? blast::kFrameStrengthFailPa
                                                                 : blast::kFrameStrengthHoldPa);
   scene.structures().setImpactDamageEnabled(pendingImpactDamage_);
@@ -2140,7 +2154,7 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
   }
   {
     const blast::StructureWorld& sw = scene.structures();
-    const blast::StructureDebugSnapshot& st = sw.debug(scene.stressCylinderId());
+    const blast::StructureDebugSnapshot& st = sw.debug(scene.structureFocusId());
     ImGui::Separator();
     ImGui::TextUnformatted("Structure (four-column roof)");
     ImGui::SliderFloat("Column height", &pendingFrameHeightMeters_, 1.0f, 9.2f, "%.1f m");
@@ -2167,6 +2181,29 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
       ImGui::SetTooltip(
           "Dynamic 4 m wooden plank mounted as a free body (no world bonds) and dropped from 4 m.\n"
           "Lift & drop again re-drops its pieces.");
+    }
+    if (ImGui::Button("Spawn beam on piers (E5.4)")) {
+      contactDemoRequest_ = 1;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Notch beam")) {
+      contactDemoRequest_ = 2;
+    }
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip("Free 4 m beam (0.12 MPa) resting on two static piers: only contact loads stress it.\n"
+                        "Notch cuts its top half at mid-span; with Stress fracture on it should break there.");
+    }
+    if (ImGui::Button("Drop weight on roof")) {
+      contactDemoRequest_ = 3;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Remove weight")) {
+      contactDemoRequest_ = 4;
+    }
+    ImGui::DragFloat("Weight density", &pendingWeightDensity_, 100.0f, 100.0f, 200000.0f, "%.0f kg/m3");
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip("0.4 m dynamic cube onto a four-column roof beam (spawn it first). Column stress\n"
+                        "should rise with density and fall back when the weight is removed.");
     }
     ImGui::SameLine();
     if (ImGui::Button("Spawn pillar + floating block (E5.3)")) {
@@ -2239,6 +2276,21 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
           "On = Viewer Shear. Off = Viewer ImpactSpread. Stress routing replaces either shader.");
     }
     ImGui::EndDisabled();
+    bool contactLoads = scene.structures().contactLoadsEnabled();
+    if (ImGui::Checkbox("Contact loads (E5.4)", &contactLoads)) {
+      scene.structures().setContactLoadsEnabled(contactLoads);
+    }
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip(
+          "On: resting contact (ground support, a weight on top) loads the stress solver,\n"
+          "so fallen pieces carry their weight and can break again. First touch stays an impact.\n"
+          "Off: pre-E5.4, free pieces only feel spin and impacts.");
+    }
+    {
+      const blast::StructureDebugSnapshot& cst = scene.structures().debug(scene.structureFocusId());
+      ImGui::TextDisabled("Contact: pairs=%u held=%u nodes=%u |F|=%.0f N", cst.contactPairs, cst.frozenPairs,
+                          cst.contactLoadNodes, cst.contactForceN);
+    }
     bool impact = pendingStressImpactImpulses_;
     if (ImGui::Checkbox("Pass impact to stress (replaces shader)", &impact)) {
       pendingStressImpactImpulses_ = impact;
@@ -2327,7 +2379,7 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
     ImGui::TextUnformatted("Hit: none");
   }
   ImGui::Separator();
-  ImGui::TextUnformatted("Import Mesh (stamp into world grid, one DDA)");
+  ImGui::TextUnformatted("Import Mesh");
   char pathBuf[512]{};
   const std::string defaultObj = std::string(VE_ASSETS_DIR) + "/meshes/cube.obj";
   const std::string& srcPath = scene.importPath().empty() ? defaultObj : scene.importPath();
@@ -2340,6 +2392,24 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
   ImGui::Checkbox("Sample Mesh Color", &scene.importSampleColor());
   ImGui::TextDisabled(
       "Sample Color: each fine stores RGBA; alpha means this voxel has a sampled color.");
+  ImGui::Checkbox("As Separate Object", &scene.importAsObject());
+  if (scene.importAsObject()) {
+    ImGui::Checkbox("Mount As Structure", &scene.importMount());
+    ImGui::DragFloat("Import Density", &scene.importDensity(), 10.0f, 50.0f, 8000.0f, "%.0f kg/m3");
+    ImGui::DragFloat("Import Strength", &scene.importStrengthMPa(), 0.1f, 0.1f, 50.0f, "%.1f MPa");
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip("Applies on import. The hut peaks near 2.4 MPa under its own weight.\n"
+                        "Fail strength (1 MPa) does not apply to imports; lower this instead.");
+    }
+    const char* aggNames[] = {"Auto (2, 4 if over budget)", "2", "4"};
+    int aggIndex = scene.importAgg() == 4 ? 2 : (scene.importAgg() == 2 ? 1 : 0);
+    if (ImGui::Combo("Import Agg", &aggIndex, aggNames, 3)) {
+      scene.importAgg() = aggIndex == 2 ? 4 : (aggIndex == 1 ? 2 : 0);
+    }
+    ImGui::TextDisabled("Stands on the ground; mounted imports anchor where they touch it.");
+  } else {
+    ImGui::TextDisabled("Stamped into the ground grid (decoration only, no stress).");
+  }
   if (ImGui::Button("Import Surface OBJ")) {
     importRequested_ = true;
   }

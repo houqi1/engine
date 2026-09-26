@@ -381,6 +381,7 @@ BlastError StructureWorld::mount(const StructureMountDesc& desc, OccupancySample
     if (const StructureInstance* old = find(desc.objectId)) {
       inst.material.fractureEnabled = old->material.fractureEnabled;
       inst.material.strengthPa = old->material.strengthPa;
+      inst.material.ownStrengthPa = old->material.ownStrengthPa;
       inst.strengthEpoch = old->strengthEpoch == 0 ? 1 : old->strengthEpoch;
     }
   }
@@ -614,9 +615,11 @@ void StructureWorld::setImpactDamageEnabled(bool on) { impactDamageEnabled_ = on
 
 void StructureWorld::setImpactSettings(const ImpactSettings& settings) { impactSettings_ = settings; }
 
-void StructureWorld::setStrengthPa(float strengthPa) {
+void StructureWorld::setStrengthPa(float globalStrengthPa) {
   for (auto& p : instances_) {
     StructureInstance& inst = *p;
+    const float strengthPa =
+        inst.material.ownStrengthPa > 0.0f ? inst.material.ownStrengthPa : globalStrengthPa;
     const bool changed = inst.material.strengthPa != strengthPa || inst.debug.strengthPa != strengthPa;
     inst.material.strengthPa = strengthPa;
     inst.debug.strengthPa = strengthPa;
@@ -1118,6 +1121,11 @@ void StructureWorld::applyViewerImpact(StructureInstance& inst, const WorldConta
   std::map<PairKey, PairAccum> pairs;
   for (uint32_t i = 0; i < nImpulses; ++i) {
     WorldContactImpulse imp = impulses[i];
+    if (contactLoadsEnabled_ && imp.persistent) {
+      // E5.4: resting contact is a load (addLoad), not an impact; one channel per contact.
+      ++inst.debug.impactSkippedPersistent;
+      continue;
+    }
     if (std::tie(imp.idB.slot, imp.idB.generation) < std::tie(imp.idA.slot, imp.idA.generation)) {
       std::swap(imp.idA, imp.idB);
       std::swap(imp.massA, imp.massB);
@@ -1283,7 +1291,13 @@ void StructureWorld::solveInstance(StructureInstance& inst, const WorldContactIm
     rebuildBindingsFromFamily(inst);
     inst.lastBoundTopologyEpoch = topo;
   }
-  buildLoadSnapshots(inst, impulses, nImpulses, lastTickId_, lastDt_ > 0.0f ? lastDt_ : (1.0f / 60.0f));
+  const float tickDt = lastDt_ > 0.0f ? lastDt_ : (1.0f / 60.0f);
+  inst.debug.impactSkippedPersistent = 0;
+  if (contactLoadsEnabled_) {
+    updateContactLoads(inst, impulses, nImpulses, kinematics, nKinematics, lastTickId_, tickDt);
+  } else {
+    buildLoadSnapshots(inst, impulses, nImpulses, lastTickId_, tickDt);
+  }
   for (ActorLoadSnapshot& snap : inst.loadSnapshots) {
     snap.evaluated = true;
   }
@@ -1305,6 +1319,9 @@ void StructureWorld::solveInstance(StructureInstance& inst, const WorldContactIm
           NvcVec3{localW.x, localW.y, localW.z});
       ++inst.debug.centrifugalActors;
     }
+  }
+  if (contactLoadsEnabled_) {
+    applyContactLoads(inst);
   }
   applyViewerImpact(inst, impulses, nImpulses);
   // Keep bond-damage paint/HUD in sync even on ticks with no new Impact events.
@@ -1368,6 +1385,7 @@ const StructureDebugSnapshot& StructureWorld::debug(const StructureInstance* tar
 
 void StructureWorld::fillBindingKinematics(StructureInstance& inst, ActorBinding& b) {
   b.nodeRefs.clear();
+  b.nodeRefIndex.clear();
   if (b.actor == nullptr) {
     b.graphNodeCount = 0;
     b.mass = 0.0f;
@@ -1380,6 +1398,10 @@ void StructureWorld::fillBindingKinematics(StructureInstance& inst, ActorBinding
   b.anchored = NvBlastActorHasExternalBonds(b.actor, blastLog);
   b.stressSolve = b.graphNodeCount > 1;
   b.nodeRefs = actorNodeRefs(inst, b);
+  b.nodeRefIndex.reserve(b.nodeRefs.size() * 2 + 1);
+  for (uint32_t i = 0; i < b.nodeRefs.size(); ++i) {
+    b.nodeRefIndex.emplace(b.nodeRefs[i].graphNode, i);
+  }
   float mass = 0.0f;
   glm::vec3 com(0.0f);
   std::vector<uint8_t> mine;
@@ -1475,9 +1497,11 @@ void StructureWorld::rebuildBindingsFromFamily(StructureInstance& inst) {
       b.objectId = it->second.objectId;
       b.fineOrigin = it->second.fineOrigin;
       b.fineN = it->second.fineN;
+      // Same actor, same graph nodes: its held contact loads stay valid.
+      b.contactLoads = std::move(it->second.contactLoads);
     }
     fillBindingKinematics(inst, b);
-    inst.bindings.push_back(b);
+    inst.bindings.push_back(std::move(b));
   }
 }
 
@@ -1525,11 +1549,10 @@ bool StructureWorld::pickContactNode(const StructureInstance& inst, const ActorB
     if (it != inst.graph.voxelNode.end()) {
       const auto gIt = inst.blast.graphFromStable.find(it->second);
       if (gIt != inst.blast.graphFromStable.end()) {
-        for (const NodeRef& n : nodes) {
-          if (n.graphNode == gIt->second) {
-            out = n;
-            return true;
-          }
+        const auto nIt = b.nodeRefIndex.find(gIt->second);
+        if (nIt != b.nodeRefIndex.end()) {
+          out = nodes[nIt->second];
+          return true;
         }
       }
     }
@@ -1627,6 +1650,151 @@ void StructureWorld::buildLoadSnapshots(StructureInstance& inst, const WorldCont
     inst.debug.contactContrib += folded.contactContrib;
     inst.debug.mappedNodes += folded.mappedNodes;
     inst.loadSnapshots.push_back(std::move(snap));
+  }
+}
+
+namespace {
+
+// dst = dst * (1 - a) + now * a, matched by graph node.
+void blendLoads(std::vector<MappedLoad>& dst, const std::vector<MappedLoad>& now, float a) {
+  std::unordered_map<uint32_t, size_t> at;
+  at.reserve(dst.size() + now.size());
+  for (size_t i = 0; i < dst.size(); ++i) {
+    dst[i].F *= 1.0f - a;
+    dst[i].tau *= 1.0f - a;
+    at.emplace(dst[i].graphNode, i);
+  }
+  for (const MappedLoad& L : now) {
+    const auto it = at.find(L.graphNode);
+    if (it != at.end()) {
+      dst[it->second].F += a * L.F;
+      dst[it->second].tau += a * L.tau;
+    } else {
+      MappedLoad s = L;
+      s.F *= a;
+      s.tau *= a;
+      at.emplace(s.graphNode, dst.size());
+      dst.push_back(s);
+    }
+  }
+}
+
+}  // namespace
+
+void StructureWorld::updateContactLoads(StructureInstance& inst, const WorldContactImpulse* impulses,
+                                        uint32_t nImpulses, const BodyKinematics* kinematics, uint32_t nKinematics,
+                                        uint64_t tickId, float dt) {
+  inst.loadSnapshots.clear();
+  inst.debug.contactContrib = 0;
+  inst.debug.mappedNodes = 0;
+  inst.debug.invalidSnapshots = 0;
+  inst.debug.frozenPairs = 0;
+  inst.debug.persistentContacts = 0;
+  // Solver impulses jitter from tick to tick; a short exponential average keeps the
+  // stress from chattering while still following a load within a few tenths of a second.
+  const float a = 1.0f - std::exp(-dt / std::max(contactLoadTau_, 1e-4f));
+  const uint64_t dropTicks =
+      static_cast<uint64_t>(std::max(1.0f, std::ceil(5.0f * contactLoadTau_ / std::max(dt, 1e-6f))));
+  // 1 awake, 0 sleeping or static, -1 no body (removed).
+  auto awakeState = [&](VoxelObjectId id) {
+    const BodyKinematics* k = findKinematics(id, kinematics, nKinematics);
+    return k == nullptr ? -1 : (k->awake ? 1 : 0);
+  };
+  for (ActorBinding& b : inst.bindings) {
+    if (b.actor == nullptr || !b.stressSolve || !b.objectId.valid()) {
+      b.contactLoads.clear();
+      continue;
+    }
+    std::vector<std::pair<VoxelObjectId, std::vector<PickedImpulse>>> groups;
+    for (uint32_t i = 0; impulses != nullptr && i < nImpulses; ++i) {
+      const WorldContactImpulse& imp = impulses[i];
+      if (!imp.persistent) {
+        continue;  // first touch is an impact: Viewer route only
+      }
+      const bool sideA = imp.idA == b.objectId;
+      if (!sideA && imp.idB != b.objectId) {
+        continue;
+      }
+      BodyAssetFrame frame;
+      frame.objectId = b.objectId;
+      frame.assetCom = b.comAsset;
+      frame.worldCom = sideA ? imp.xA : imp.xB;
+      frame.worldQ = sideA ? imp.qA : imp.qB;
+      PickedImpulse p;
+      if (!projectImpulseToActor(imp, b.objectId, frame, p) || !pickContactNode(inst, b, imp, sideA, p.node)) {
+        continue;
+      }
+      p.ok = true;
+      const VoxelObjectId other = sideA ? imp.idB : imp.idA;
+      auto g = std::find_if(groups.begin(), groups.end(), [&](const auto& e) { return e.first == other; });
+      if (g == groups.end()) {
+        groups.emplace_back(other, std::vector<PickedImpulse>{});
+        g = groups.end() - 1;
+      }
+      g->second.push_back(p);
+      ++inst.debug.persistentContacts;
+    }
+    for (auto& [other, picked] : groups) {
+      const TickLoadResult now =
+          foldPickedImpulses(picked.data(), static_cast<uint32_t>(picked.size()), dt, glm::vec3(0.0f));
+      inst.debug.contactContrib += now.contactContrib;
+      inst.debug.mappedNodes += now.mappedNodes;
+      auto pair = std::find_if(b.contactLoads.begin(), b.contactLoads.end(),
+                               [&](const PairContactLoad& c) { return c.other == other; });
+      if (pair == b.contactLoads.end()) {
+        b.contactLoads.push_back(PairContactLoad{other, {}, tickId});
+        pair = b.contactLoads.end() - 1;
+      }
+      blendLoads(pair->loads, now.loads, a);
+      pair->lastSeenTick = tickId;
+    }
+    const int selfAwake = awakeState(b.objectId);
+    for (auto it = b.contactLoads.begin(); it != b.contactLoads.end();) {
+      if (it->lastSeenTick == tickId) {
+        ++it;
+        continue;
+      }
+      const int otherAwake = awakeState(it->other);
+      if (otherAwake < 0) {
+        it = b.contactLoads.erase(it);  // the other body is gone
+        continue;
+      }
+      if (selfAwake != 1 && otherAwake != 1) {
+        ++inst.debug.frozenPairs;  // physics does not solve sleeping pairs: hold the load
+        ++it;
+        continue;
+      }
+      // Contact ended (or skipped one tick): fade out, then forget the pair.
+      blendLoads(it->loads, {}, a);
+      if (tickId - it->lastSeenTick > dropTicks) {
+        it = b.contactLoads.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+}
+
+void StructureWorld::applyContactLoads(StructureInstance& inst) {
+  inst.debug.contactPairs = 0;
+  inst.debug.contactLoadNodes = 0;
+  inst.debug.contactForceN = 0.0f;
+  for (ActorBinding& b : inst.bindings) {
+    if (b.actor == nullptr || !b.stressSolve) {
+      continue;
+    }
+    for (const PairContactLoad& pair : b.contactLoads) {
+      ++inst.debug.contactPairs;
+      for (const MappedLoad& L : pair.loads) {
+        if (b.nodeRefIndex.count(L.graphNode) == 0) {
+          continue;
+        }
+        inst.blast.solver->addLoad(L.graphNode, NvcVec3{L.F.x, L.F.y, L.F.z}, NvcVec3{L.tau.x, L.tau.y, L.tau.z},
+                                   Nv::Blast::ExtForceMode::FORCE);
+        ++inst.debug.contactLoadNodes;
+        inst.debug.contactForceN += glm::length(L.F);
+      }
+    }
   }
 }
 

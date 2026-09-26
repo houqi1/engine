@@ -231,6 +231,7 @@ StructureHandle StructureWorld::mount(const StructureMountDesc&, const Occupancy
 | 单次撞击 | `eventId` 接触 | 现有 Viewer 路由：着色器伤害或 `stressImpactImpulses` |
 
 - 持续接触用已经构建好的 `loadSnapshots`，补上 `addLoad` 调用。力矩按集成文档 §6 在 asset-local 下计算，不退回最近节点 `addForce`。
+- （E5.4 实施时核实）无锚 actor 不需要另加惯性平衡项：ExtStress 把节点载荷当速度增量，求让相邻节点无相对运动的键冲量，均匀平移和刚体转动都不产生应力，内冲量也不改变总动量，结果即扣除整体加速度后的内应力（`NvBlastExtStressSolver.cpp` `addNodeForce`）。实测自由下落应力为 0。
 - **防重复**：同一接触点在一个 tick 内只进一个通道。persistent 进 `addLoad`；event 走 Viewer 路由；`stressImpactImpulses` 开时 event 不再进 `addLoad`。
 - 有锚 actor 自身落在锚源上的接触不存在（Static–Static 被跳过），不会和 world bond 反力重复。
 - Dynamic 物体放在 Static 结构上：结构侧得到对侧 `-J`，这正是集成文档 §6「只映射动态侧是错的」。
@@ -337,6 +338,60 @@ E5.0 和 E5.1 是纯重构，不改行为，适合先单独提交。
 - `mountObjectFree`：只接受 Dynamic 物体，无 world bond、无假锚点，只受离心力与撞击载荷。`mountObjectAuto`：Static 走贴地锚点，Dynamic 走自由体，Kinematic 拒绝。
 - 演示：「Spawn free plank (E5.3)」（4 m 木板，ρ=600，倾斜，从约 4 m 高落下；Lift & drop again 可重复）、「Spawn pillar + floating block (E5.3)」（同一物体内的立柱与浮空方块）。
 - 回归：19 个已有测试通过；`--frame-fail` 手写锚点与 E5 前基线、自动锚点与 E5.2 结果均逐行一致。
+
+**E5.5 完成（2026-09-26，先于 E5.4 实施；按用户要求未新增自动测试）**
+
+决定：界面默认用新导入方式（「As Separate Object」，可切回压进地面）；默认挂载；聚合尺寸 Auto；网格不裁剪（§3.2 裁剪继续推迟）。
+
+- `importMeshAsObject(gfx, path, cfg)`：体素化结果先重采样成世界 fine（0.1 m）放进临时集合，按实际落点的紧包围盒定 `gridSize`（立方 coarse，上限 64），再平移写入新的 Static 物体：最低一层贴地面顶（`groundTopY()` = 地面原点 + 2 coarse），x/z 居中并与地面 fine 网格对齐。密度取 `importDensity()`（默认 600 kg/m³），不再压进地面。
+- 与旧入口共用 `forEachImportWorldFine`（从 `stampMeshIntoWorld` 抽出的重采样）、`voxelizeImport`、`clearGroundStamp`。重新导入会释放上一个导入物体；从旧方式切到新方式时清掉地面里的旧印章。`rebuildVoxels` 按上次的方式重新导入。
+- 挂载走 `mountObjectOnGround`（E5.2 贴地锚点，E5.3 浮空块分裂）。Auto 聚合：先 agg 2；节点数 > `kImportMaxNodes`（32768）时改 agg 4；仍超出则卸载并在状态里给出节点数。
+- 结构面板、应力/锚点着色改为跟随「焦点结构」`structureFocusId()`：导入后指向导入物体，生成任一演示后回到演示物体。
+- 引擎：`--import-object` 以 agg 2 / 4 / Auto 各导入一次 hut 并挂载，打开断裂跑 10 s，报告写入 `docs/import-object.txt`。
+
+**验收**
+
+- 落地对齐：网格底 `y = 3.200 m` = 地面顶，贴地锚点 89 fine / 89 面，无 blocked。§1.5 的 0.8 m 悬空已修正（旧入口仍在 4.0 m，未改）。
+- hut：8.90 × 8.20 × 8.70 m，`gridSize = 6`，39564 fine，ρ=600 时 23739 kg；重采样 ≈ 0.22 s，体素化加挂载整体 ≈ 1.8 s。
+
+  | agg | 节点 | 键 | world bond | 挂载提取 | 收敛前 solveMs/tick | 收敛时刻 | 收敛后 solveMs | 最大拉/压/剪 (MPa) |
+  |---|---:|---:|---:|---:|---:|---:|---:|---|
+  | 2 | 9028 | 19378 | 44 | 45 ms | 37–44 | 4 s | ≈ 0.8 | 1.52 / 2.44 / 0.89 |
+  | 4 | 2041 | 4260 | 22 | 34 ms | 5–13 | 9 s | ≈ 0.3 | 0.81 / 2.95 / 1.36 |
+
+  Auto 选 agg 2（未超预算），结果与 agg 2 相同。断裂开、强度 50 MPa 下三次均 0 断键、1 个 actor：自重下站立，最大应力约为强度的 1/17，不是未收敛造成的假象。
+- 旧入口（`--benchmark --stage 5`）：占用 coarse/micro/fine/brick 数与改动前相同，截图逐字节相同。
+- `--frame-fail`（手写锚点）：屏蔽计时后 730 行与改动前一致。19 个测试全部通过。
+- 未做：挖掉承重部分后坍塌、落地二次断裂、30/60 Hz 一致性（E5-T10 其余项）留待手动验收。
+
+**E5.4 完成（2026-09-26，在 E5.5 之后实施；按用户要求未新增单元测试）**
+
+起因：用户发现第一次断裂后的碎块怎么挖都不再应力断裂。原因是无锚 actor 只受离心力，躺在地上时托住它的接触力从未进入求解器（`buildLoadSnapshots` 每 tick 都算，但没有任何 `addLoad` 调用）。
+
+决定（用户确认）：已锚结构也接收压在其上物体的接触力；平滑时间常数 0.1 s，休眠时冻结；导入物体自带强度（默认 4 MPa）；`--frame-fail` 分裂后的输出接受新基线；验收用报告模式加手动。
+
+- `StructureWorld::setContactLoadsEnabled`（库默认关，场景默认开）。开启时：
+  - `updateContactLoads`：只取 `persistent` 冲量，按「对方物体」分组折算为节点力/力矩，每对做指数平滑（τ = 0.1 s）。本 tick 没出现的对：双方都在休眠（或静态）则**冻结**（物理不求解休眠对，冲量会消失）；对方物体已删除则丢弃；否则按同一时间常数衰减，5τ 后丢弃。状态存在 `ActorBinding::contactLoads`，同一 actor 重新绑定时保留，分裂出的新 actor 从零开始（它们刚被唤醒，很快重建）。
+  - `applyContactLoads`：`addLoad(node, F, τ)`，有锚、无锚 actor 都加。
+  - Impact 通道跳过 `persistent` 接触，一个接触只进一个通道；首次接触仍走 Viewer 路由。原先 `impactEvents` 集合只增不减的问题随之消失（快照不再收非持续接触）。
+- `BodyKinematics::awake`；场景每 tick 为已绑定物体、它们保存的接触对方、本 tick 接触双方提供运动学，改用不复制的 `forEachBinding`。`pickContactNode` 改为按节点下标查表（原为线性扫描 actor 全部节点）。
+- `StructureMaterial::ownStrengthPa`：> 0 时全局 `setStrengthPa`（UI Hold / Fail strength，只管演示结构）不覆盖。分裂继承，`keepMaterialOfReplaced` 也继承。导入面板「Import Strength」（默认 4 MPa）。初版让 Fail strength 强制覆盖，而它在 UI 里默认勾选：界面中缺口梁实为 1 MPa 不断、hut 实为 1 MPa（自重 2.4 MPa 即塌），报告模式不经 UI 未暴露；已改为不覆盖。
+- 演示：「Spawn beam on piers (E5.4)」（4.0 × 0.2 × 0.4 m 木梁，自由体，净跨 3.2 m，自带强度 0.12 MPa）、「Notch beam」（跨中挖掉上半截）、「Drop weight on roof」/「Remove weight」（0.4 m 立方体落在四柱一根屋顶梁跨中，密度可调；屋顶中间是空的）。UI「Contact loads (E5.4)」开关与接触统计行。
+- 引擎：`--e5-contact` 报告写入 `docs/e5-contact.txt`；`--no-contact-loads` 用于回归对比。
+
+**验收（`--e5-contact`，全部 PASS）**
+
+- T06 自由梁：搁置时接触力 1994 N，梁重 1884 N（多出的 6% 是落定冲击，休眠时被冻结）。与两端锚固参照相比 maxT/maxC/maxS 比值 2.12 / 1.99 / 1.18：简支对固支，跨中弯矩理论上就大 1.5 倍，另有支撑集中在 8 个接触节点上；同量级。休眠后接触对冻结，应力不变，solveMs ≈ 0。
+- T06 自由落体 0.6 s：峰值应力 0（< 参照 0.1%）。
+- T06b/c/d 每 tick 按 UI 默认值重设结构参数（含默认勾选的 Fail strength），每个场景前清掉上一场景的碎块。
+  - T06b（接触载荷开）：完整梁 0.096 MPa < 0.12 MPa 不断；挖缺口后在跨中断开：两半各 19 节点（质心 x = ±1.06 m），另有缺口两侧 2 个单节点。
+  - T06c（接触载荷关、冲击伤害关）：应力 ~1e-15，缺口后不断——只差接触载荷一个变量。
+  - T06d（E5.4 前默认：接触载荷关、冲击伤害开，仅记录）：同 T06c，应力为 0，缺口后不断，即用户报告的现象。
+  - 强度 0.12 MPa 是取在实测 0.096 与 0.153 MPa 之间的演示值，断开本身是按设计必然的；证据在于 T06c/d 的对照与断开位置，数量关系见上两条。
+- T07 压重：重物 512 / 2048 / 8192 kg，接触力为重量的 1.04–1.05 倍；最大压应力 0.0693（无重物）→ 0.0870 → 0.184 → 0.573 MPa 单调上升；移走后 0.0710 MPa（差 2.4%）。128 kg 一档（1.3 kN，对 87 kN 自重）淹没在噪声里，已去掉。弱材/强材断与不断未测。
+- T08：持续接触进 `addLoad` 15916 次，Impact 通道跳过 16216 次（后者按每个接触点每子步计）。
+- `--frame-fail`：`--no-contact-loads` 下 730 行与改动前一致（屏蔽计时）。默认开启时分裂前 23 行一致；分裂后残留柱承受碎块接触力，strip 应力从 fail-tick-5 起不同；塌落结果由 `single-node=20 multi-node=6 largestNodes=66` 变为 `single-node=11 multi-node=10 largestNodes=64`（持续接触不再每 tick 计入冲击伤害，碎得较少），`OK frame-fail`。已接受为新基线。
+- `--import-object`（4 MPa 自带强度，接触载荷开）：三种 agg 自重下均不破。19 个测试全部通过；旧入口 benchmark 占用数不变。
 
 ---
 

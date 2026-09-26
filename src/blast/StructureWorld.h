@@ -16,6 +16,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <unordered_map>
 #include <vector>
 
 namespace blast {
@@ -61,6 +62,13 @@ struct StructureDebugSnapshot {
   uint32_t invalidSnapshots = 0;
   uint32_t bindingCount = 0;
   float contactLoadMs = 0.0f;
+  // E5.4 contact loads, per tick.
+  uint32_t contactPairs = 0;       // smoothed pairs applied
+  uint32_t frozenPairs = 0;        // held because every body in the pair sleeps
+  uint32_t contactLoadNodes = 0;   // addLoad calls
+  uint32_t persistentContacts = 0; // persistent impulses routed to addLoad
+  uint32_t impactSkippedPersistent = 0;
+  float contactForceN = 0.0f;      // sum of |F| applied
   bool stressImpactImpulses = false;
   float stressImpactScale = 0.01f;
   uint32_t gravityActors = 0;
@@ -110,6 +118,13 @@ struct BondMeta {
   uint8_t inNeck = 0;
 };
 
+// E5.4: smoothed persistent contact load from one other body, in asset space.
+struct PairContactLoad {
+  VoxelObjectId other{};
+  std::vector<MappedLoad> loads;
+  uint64_t lastSeenTick = 0;
+};
+
 struct ActorBinding {
   NvBlastActor* actor = nullptr;
   VoxelObjectId objectId{};
@@ -121,6 +136,8 @@ struct ActorBinding {
   glm::ivec3 fineOrigin{0};
   int fineN = 0;
   std::vector<NodeRef> nodeRefs;
+  std::unordered_map<uint32_t, uint32_t> nodeRefIndex;  // Blast graph node -> nodeRefs index
+  std::vector<PairContactLoad> contactLoads;            // kept while the actor survives
 };
 
 struct ActorObjectLink {
@@ -157,6 +174,9 @@ struct StructureMaterial {
   float strengthPa = 5.0e7f;
   uint32_t solverIters = 200;
   bool fractureEnabled = false;
+  // > 0: this structure keeps its own strength; the global setStrengthPa (UI hold /
+  // fail switch for the demos) leaves it alone.
+  float ownStrengthPa = 0.0f;
 };
 
 // Cylinder / four-column regression diagnostics: which bonds form the surviving
@@ -236,6 +256,15 @@ public:
                      const BodyKinematics* kinematics, uint32_t nKinematics);
   void bindVisibleActors(const std::vector<ActorObjectLink>& links, StructureInstance* target = nullptr);
   const std::vector<ActorBinding>& bindings() const;
+  // Visits every instance's bindings without copying them (per-tick callers).
+  template <typename Fn>
+  void forEachBinding(Fn&& fn) const {
+    for (const auto& inst : instances_) {
+      for (const ActorBinding& b : inst->bindings) {
+        fn(b);
+      }
+    }
+  }
 
   // Replaces any instance already mounted for desc.objectId.
   BlastError mount(const StructureMountDesc& desc, OccupancySample sample, StructureHandle* outHandle = nullptr);
@@ -258,6 +287,10 @@ public:
   uint32_t warmupGravity(uint32_t maxPasses, StructureInstance* target = nullptr);
   void setFractureEnabled(bool on);
   void setStrengthPa(float strengthPa);
+  // E5.4: persistent contacts load the stress solver (addLoad); one-shot impacts keep
+  // the Viewer route. Off keeps the pre-E5.4 behavior.
+  void setContactLoadsEnabled(bool on) { contactLoadsEnabled_ = on; }
+  bool contactLoadsEnabled() const { return contactLoadsEnabled_; }
   // SampleAssetViewer: pass impact to stress instead of the damage shader.
   // addForce(contact, ViewerForce * 0.01). Default off.
   void setStressImpactImpulses(bool on);
@@ -320,6 +353,10 @@ private:
   void fillNodeOwners(StructureInstance& inst, const NvBlastSupportGraph& graph);
   void rebuildBindingsFromFamily(StructureInstance& inst);
   void fillBindingKinematics(StructureInstance& inst, ActorBinding& b);
+  // E5.4: fold this tick's persistent contacts into each binding's smoothed pair loads.
+  void updateContactLoads(StructureInstance& inst, const WorldContactImpulse* impulses, uint32_t nImpulses,
+                          const BodyKinematics* kinematics, uint32_t nKinematics, uint64_t tickId, float dt);
+  void applyContactLoads(StructureInstance& inst);
   std::vector<NodeRef> actorNodeRefs(const StructureInstance& inst, const ActorBinding& b) const;
   bool pickContactNode(const StructureInstance& inst, const ActorBinding& b, const WorldContactImpulse& imp,
                        bool sideA, NodeRef& out) const;
@@ -346,6 +383,8 @@ private:
   PendingFracture idlePending_{};
   const char* lastError_ = "ok";
   bool stressImpactImpulses_ = false;
+  bool contactLoadsEnabled_ = false;
+  float contactLoadTau_ = 0.1f;  // s, smoothing of solver contact impulses
   float stressImpactScale_ = 0.01f;
   bool impactDamageEnabled_ = true;
   ImpactSettings impactSettings_{};

@@ -244,6 +244,9 @@ private:
   bool liftStructureRedropRequested_ = false;
   bool spawnFreePlankRequested_ = false;
   bool spawnFloatingPartRequested_ = false;
+  // E5.4 demo actions: 1 beam on piers, 2 notch beam, 3 drop weight, 4 remove weight.
+  int contactDemoRequest_ = 0;
+  float pendingWeightDensity_ = 4000.0f;
   bool cylinderDensityRequested_ = false;
   bool cylinderItersRequested_ = false;
   bool cylinderDisplayRequested_ = false;

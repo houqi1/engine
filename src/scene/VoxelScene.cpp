@@ -132,6 +132,10 @@ void VoxelScene::resetObjectTable(uint32_t reservedSlots) {
   freeObjectSlots_.clear();
   groundObjectId_ = {};
   testObjectId_ = {};
+  importedObjectId_ = {};
+  structureFocusId_ = {};
+  demoAuxIds_.clear();
+  demoWeightId_ = {};
   objects_.resize(reservedSlots);
   objectGenerations_.assign(reservedSlots, 1u);
   for (uint32_t i = 0; i < reservedSlots; ++i) {
@@ -190,6 +194,15 @@ void VoxelScene::freeObjectSlot(uint32_t slot) {
   if (stressCylinderId_.slot == slot) {
     stressCylinderId_ = {};
   }
+  if (importedObjectId_.slot == slot) {
+    importedObjectId_ = {};
+  }
+  if (structureFocusId_.slot == slot) {
+    structureFocusId_ = {};
+  }
+  if (demoWeightId_.slot == slot) {
+    demoWeightId_ = {};
+  }
 }
 
 VoxelScene::~VoxelScene() { stopStructureTicks(); }
@@ -201,21 +214,34 @@ void VoxelScene::bindStructureTicks(GfxDevice& gfx) {
         auto* scene = static_cast<VoxelScene*>(user);
         const auto& imps = scene->physics_.tickImpulses();
         std::vector<blast::BodyKinematics> kin;
-        const std::vector<blast::ActorBinding>& binds = scene->structures_.bindings();
-        kin.reserve(binds.size());
-        for (const blast::ActorBinding& b : binds) {
-          if (!b.objectId.valid()) {
-            continue;
+        kin.reserve(16);
+        // Bound bodies plus everything they touch: contact loads need both sides' sleep state.
+        auto addKin = [&](VoxelObjectId id) {
+          if (!id.valid() || std::any_of(kin.begin(), kin.end(), [&](const blast::BodyKinematics& k) {
+                return k.objectId == id;
+              })) {
+            return;
           }
           physics::BodyState st;
-          if (!scene->physics_.getBodyState(b.objectId, st)) {
-            continue;
+          if (!scene->physics_.getBodyState(id, st)) {
+            return;
           }
           blast::BodyKinematics k;
-          k.objectId = b.objectId;
+          k.objectId = id;
           k.worldQ = st.q;
           k.worldW = st.w;
+          k.awake = st.awake;
           kin.push_back(k);
+        };
+        scene->structures_.forEachBinding([&](const blast::ActorBinding& b) {
+          addKin(b.objectId);
+          for (const blast::PairContactLoad& c : b.contactLoads) {
+            addKin(c.other);  // held pairs produce no impulses while both sides sleep
+          }
+        });
+        for (const blast::WorldContactImpulse& imp : imps) {
+          addKin(imp.idA);
+          addKin(imp.idB);
         }
         scene->structures_.onPhysicsTick(tickId, dt, imps.data(), static_cast<uint32_t>(imps.size()), kin.data(),
                                          static_cast<uint32_t>(kin.size()));
@@ -263,6 +289,7 @@ void VoxelScene::init(GfxDevice& gfx, blast::BlastRuntime& runtime) {
   if (!structures_.init(runtime)) {
     throw std::runtime_error("StructureWorld init failed: Blast runtime is not initialized");
   }
+  structures_.setContactLoadsEnabled(true);  // E5.4; headless StructureWorld tests keep it off
   bindStructureTicks(gfx);
 
   const std::string pirateObj =
@@ -412,6 +439,14 @@ glm::vec3 VoxelScene::gridOrigin() const {
   }
   const float half = 0.5f * static_cast<float>(gridSize_);
   return glm::vec3(-half, 0.0f, -half) * voxelSize_;
+}
+
+float VoxelScene::groundTopY() const {
+  return gridOrigin().y + static_cast<float>(kGroundThicknessCells) * voxelSize_;
+}
+
+VoxelObjectId VoxelScene::structureFocusId() const {
+  return tryGetObject(structureFocusId_) != nullptr ? structureFocusId_ : stressCylinderId_;
 }
 
 bool VoxelScene::inBounds(const VoxelObject& o, const glm::ivec3& p) const {
@@ -1288,7 +1323,7 @@ void VoxelScene::buildGroundObject(VoxelObject& o) {
   o.cells.assign(count, CoarseCell{});
 
   constexpr uint32_t kGroundMat = 1u;
-  const int groundThickness = 2;
+  const int groundThickness = kGroundThicknessCells;
   for (int z = 0; z < n; ++z) {
     for (int x = 0; x < n; ++x) {
       for (int y = 0; y < groundThickness; ++y) {
@@ -1778,7 +1813,12 @@ void VoxelScene::rebuildVoxels(GfxDevice& gfx) {
     cfg.padding = importPadding_;
     cfg.sampleColor = importSampleColor_;
     cfg.conservative = importConservative_;
-    importSurfaceMesh(gfx, lastImportedPath_, cfg);
+    const std::string path = lastImportedPath_;
+    if (lastImportAsObject_) {
+      importMeshAsObject(gfx, path, cfg);
+    } else {
+      importSurfaceMesh(gfx, path, cfg);
+    }
   }
 }
 
@@ -1794,6 +1834,13 @@ void VoxelScene::splitFineIndex(int fx, int fy, int fz, glm::ivec3& coarse, glm:
 }
 
 void VoxelScene::destroyStressCylinderObject() {
+  structureFocusId_ = {};  // every demo spawn starts here and takes over the structure panel
+  for (const VoxelObjectId aux : demoAuxIds_) {
+    if (tryGetObject(aux) != nullptr) {
+      freeObjectSlot(aux.slot);
+    }
+  }
+  demoAuxIds_.clear();
   if (!stressCylinderId_.valid()) {
     return;
   }
@@ -2110,9 +2157,10 @@ void VoxelScene::paintCylinderStress(GfxDevice& gfx) {
       }
     }
   };
-  paintObject(stressCylinderId_);
+  const VoxelObjectId focus = structureFocusId();
+  paintObject(focus);
   for (const blast::ActorBinding& b : inst->bindings) {
-    if (b.objectId.valid() && b.objectId != stressCylinderId_) {
+    if (b.objectId.valid() && b.objectId != focus) {
       paintObject(b.objectId);
     }
   }
@@ -2181,9 +2229,10 @@ void VoxelScene::paintBondDamage(GfxDevice& gfx) {
       }
     }
   };
-  paintObject(stressCylinderId_);
+  const VoxelObjectId focus = structureFocusId();
+  paintObject(focus);
   for (const blast::ActorBinding& b : inst->bindings) {
-    if (b.objectId.valid() && b.objectId != stressCylinderId_) {
+    if (b.objectId.valid() && b.objectId != focus) {
       paintObject(b.objectId);
     }
   }
@@ -2323,7 +2372,7 @@ void VoxelScene::setBondDamageDisplay(GfxDevice& gfx, bool on) {
 
 void VoxelScene::refreshStressColors(GfxDevice& gfx) {
   const blast::StructureInstance* inst = stressStructure();
-  if (inst == nullptr || !stressCylinderId_.valid()) {
+  if (inst == nullptr || !structureFocusId().valid()) {
     return;
   }
   if (bondDamageDisplay_) {
@@ -2589,6 +2638,14 @@ VoxelObject* VoxelScene::allocStressDemoObject(GfxDevice& gfx, int gridSize, Mot
     physics_.removeBody(testObjectId_);
   }
   destroyStressCylinderObject();
+  const uint32_t slot = allocDemoSlot(gridSize, motion, density, position, rotation, fill);
+  stressCylinderId_ = makeObjectId(slot);
+  stressCylinderCut_ = false;
+  return &objects_[slot];
+}
+
+uint32_t VoxelScene::allocDemoSlot(int gridSize, MotionType motion, float density, const glm::vec3& position,
+                                   const glm::quat& rotation, const std::function<bool(int, int, int)>& fill) {
   const uint32_t slot = allocObjectSlot();
   VoxelObject& o = objects_[slot];
   o.gridSize = gridSize;
@@ -2619,9 +2676,7 @@ VoxelObject* VoxelScene::allocStressDemoObject(GfxDevice& gfx, int gridSize, Mot
       }
     }
   }
-  stressCylinderId_ = makeObjectId(slot);
-  stressCylinderCut_ = false;
-  return &o;
+  return slot;
 }
 
 void VoxelScene::finishDemoMount(GfxDevice& gfx) {
@@ -2700,6 +2755,122 @@ bool VoxelScene::spawnBlockWithFloatingPart(GfxDevice& gfx) {
   finishDemoMount(gfx);
   structures_.warmupGravity(8u, structures_.find(stressCylinderId_));
   return true;
+}
+
+namespace {
+
+// Beam demo layout on a 4-cell (64-fine) grid whose bottom sits on the ground top.
+constexpr int kBeamGrid = 4;
+bool inPier(int x, int y, int z) { return y < 10 && z >= 26 && z < 38 && ((x >= 10 && x < 16) || (x >= 48 && x < 54)); }
+bool inBeam(int x, int y, int z) { return y < 2 && z >= 30 && z < 34 && x >= 12 && x < 52; }
+bool onPierTop(int x, int y) { return y == 0 && ((x >= 12 && x < 16) || (x >= 48 && x < 52)); }
+
+}  // namespace
+
+bool VoxelScene::spawnBeamOnPiers(GfxDevice& gfx, bool anchoredReference, float dropHeight) {
+  // 4.0 x 0.2 x 0.4 m wooden beam across two 1.0 m piers, 3.2 m clear span.
+  const float half = 0.5f * static_cast<float>(kBeamGrid) * voxelSize_;
+  const glm::quat identity(1.0f, 0.0f, 0.0f, 0.0f);
+  const glm::vec3 beamPos(0.0f, groundTopY() + 1.0f + (anchoredReference ? 0.0f : dropHeight) + half, 0.0f);
+  allocStressDemoObject(gfx, kBeamGrid, anchoredReference ? MotionType::Static : MotionType::Dynamic,
+                        physics::kDensityWood, beamPos, identity, inBeam);
+  const uint32_t piers = allocDemoSlot(kBeamGrid, MotionType::Static, physics::kDensityWood,
+                                       glm::vec3(0.0f, groundTopY() + half, 0.0f), identity, inPier);
+  demoAuxIds_.push_back(makeObjectId(piers));
+  frameSpawnPosValid_ = false;
+  camera_.setOrbitTarget(glm::vec3(0.0f, groundTopY() + 1.0f, 0.0f));
+  camera_.setOrbitDistance(9.0f);
+  blast::StructureMountDesc desc;
+  desc.material.strengthPa = kBeamDemoStrengthPa;
+  desc.material.ownStrengthPa = kBeamDemoStrengthPa;
+  desc.material.solverIters = 200;
+  blast::StructureInstance* inst =
+      anchoredReference
+          ? mountObjectStructure(stressCylinderId_, 2, [](int x, int y, int z) { return inBeam(x, y, z) && onPierTop(x, y); },
+                                 desc, /*allowFloating=*/false)
+          : mountObjectFree(stressCylinderId_, 2, desc);
+  if (inst == nullptr) {
+    destroyStressCylinderObject();
+    packObjectPool();
+    fillGpuObjectRecords();
+    ensureGpuBuffers(gfx);
+    uploadWorldAndObjects(gfx);
+    physics_.rebuildFromScene();
+    return false;
+  }
+  structureMountStatus_ = anchoredReference ? "beam: anchored on the pier tops (reference)"
+                                            : "beam: free body resting on the piers";
+  finishDemoMount(gfx);
+  return true;
+}
+
+bool VoxelScene::notchDemoBeam(GfxDevice& gfx) {
+  VoxelObject* o = tryGetObject(stressCylinderId_);
+  if (o == nullptr || o->gridSize != kBeamGrid || !structures_.ownsObject(stressCylinderId_)) {
+    return false;
+  }
+  std::vector<voxel::FineCoord> removed;
+  for (int z = 30; z < 34; ++z) {
+    for (int x = 31; x < 33; ++x) {
+      glm::ivec3 c, m, f;
+      splitFineIndex(x, 1, z, c, m, f);
+      if (setFineCpu(*o, c, m, f, false)) {
+        removed.push_back(voxel::FineCoord{x, 1, z});
+      }
+    }
+  }
+  if (removed.empty()) {
+    return false;
+  }
+  const int slot = static_cast<int>(stressCylinderId_.slot);
+  o->topologyRevision += 1;
+  recountOccupiedMicro();
+  recountOccupiedFine();
+  flushObject(gfx, slot);
+  notifyOccupancyChanged(slot);
+  queueStructureRemoval(stressCylinderId_, removed);
+  return true;
+}
+
+bool VoxelScene::dropWeightOnRoof(GfxDevice& gfx, float density) {
+  const blast::StructureInstance* frame = structures_.find(stressCylinderId_);
+  if (frame == nullptr || frame->diag.kind != blast::DiagnosticProfile::Kind::ColumnBox || frameExtentY_ <= 0.0f) {
+    structureMountStatus_ = "weight: spawn the four-column roof first";
+    return false;
+  }
+  removeDemoWeight(gfx);
+  // 0.4 m cube in a one-cell grid, released 5 cm above mid-span of the -z roof beam
+  // (the roof is a ring of 0.6 m beams, open in the middle).
+  const float roofTop = groundTopY() + frameExtentY_;
+  const float beamZ = (static_cast<float>(blast::kFrameInset) + 0.5f * blast::kFrameColW -
+                       0.5f * blast::kFrameGridFines) * blast::kE1FineMeters;
+  const glm::vec3 pos(0.0f, roofTop + 0.05f - 0.6f + 0.5f * voxelSize_, beamZ);
+  const uint32_t slot = allocDemoSlot(1, MotionType::Dynamic, density, pos, glm::quat(1.0f, 0.0f, 0.0f, 0.0f),
+                                      [](int x, int y, int z) {
+                                        return x >= 6 && x < 10 && y >= 6 && y < 10 && z >= 6 && z < 10;
+                                      });
+  demoWeightId_ = makeObjectId(slot);
+  demoAuxIds_.push_back(demoWeightId_);
+  packObjectPool();
+  flushObject(gfx, static_cast<int>(slot));
+  notifyOccupancyChanged(static_cast<int>(slot));
+  physics_.rebuildFromScene();
+  return true;
+}
+
+void VoxelScene::removeDemoWeight(GfxDevice& gfx) {
+  if (tryGetObject(demoWeightId_) == nullptr) {
+    demoWeightId_ = {};
+    return;
+  }
+  const VoxelObjectId id = demoWeightId_;
+  demoAuxIds_.erase(std::remove(demoAuxIds_.begin(), demoAuxIds_.end(), id), demoAuxIds_.end());
+  freeObjectSlot(id.slot);
+  packObjectPool();
+  fillGpuObjectRecords();
+  ensureGpuBuffers(gfx);
+  uploadWorldAndObjects(gfx);
+  physics_.rebuildFromScene();
 }
 
 bool VoxelScene::liftStructureForRedrop() {
@@ -2793,7 +2964,7 @@ void VoxelScene::setStressCylinderSolverIters(uint32_t iters) {
 
 void VoxelScene::setStressCylinderDisplay(GfxDevice& gfx, bool on) {
   stressCylinderDisplay_ = on;
-  VoxelObject* o = tryGetObject(stressCylinderId_);
+  VoxelObject* o = tryGetObject(structureFocusId());
   if (o == nullptr) {
     return;
   }
@@ -2817,53 +2988,13 @@ void VoxelScene::uploadWorldAndObjects(GfxDevice& gfx) {
   }
 }
 
-uint32_t VoxelScene::stampMeshIntoWorld(const MeshVoxelizeResult& r, bool sampleColor) {
-  VoxelObject* worldPtr = tryGetObject(groundObjectId_);
-  if (!worldPtr || r.n <= 0 || r.material.empty()) {
-    return 0;
-  }
-  VoxelObject& world = *worldPtr;
-  const int wn = world.gridSize;
-  const float wvs = world.voxelSize;
-  if (wn <= 0 || wvs <= 0.0f) {
-    return 0;
-  }
-
+uint32_t VoxelScene::forEachImportWorldFine(const MeshVoxelizeResult& r, bool sampleColor, const glm::vec3& srcOrigin,
+                                            const glm::vec3& dstOrigin, float dstFineVs, int dstFineN,
+                                            const std::function<bool(int, int, int, bool, uint32_t)>& place) const {
   const int subdiv = std::max(1, r.subdiv);
   const int fineN = r.fineN > 0 ? r.fineN : r.n * subdiv;
-  const float hutExtent = static_cast<float>(r.n) * r.voxelSize;
   const float importFineVs = r.voxelSize / static_cast<float>(subdiv);
-  const float worldFineVs = wvs / static_cast<float>(kFinePerCoarse);
-  const glm::vec3 hutPos(0.0f, 0.5f * hutExtent + 2.5f * voxelSize_, 0.0f);
-  const glm::vec3 hutOrigin = hutPos - glm::vec3(0.5f * hutExtent);
-  const glm::vec3 worldOrigin =
-      world.position - glm::vec3(0.5f * static_cast<float>(wn) * wvs);
-  const int worldFineN = wn * kFinePerCoarse;
-
-  world.useImportPalette = sampleColor;
-  world.nestedMicro = true;
-  if (sampleColor) {
-    nestedMicroVoxels_ = true;
-    nestedFineVoxels_ = true;
-  }
-  importPalette_.fill(glm::vec4(0.62f, 0.64f, 0.68f, 1.0f));
-  importPalette_[0] = glm::vec4(0.0f, 0.0f, 0.0f, 1.0f);
-
-  auto placeWorldFine = [&](int wx, int wy, int wz, bool hasColor, uint32_t rgb888) {
-    if (wx < 0 || wy < 0 || wz < 0 || wx >= worldFineN || wy >= worldFineN || wz >= worldFineN) {
-      return false;
-    }
-    const glm::ivec3 absFine(wx, wy, wz);
-    const glm::ivec3 c(absFine.x / kFinePerCoarse, absFine.y / kFinePerCoarse,
-                       absFine.z / kFinePerCoarse);
-    const glm::ivec3 rem = absFine - c * kFinePerCoarse;
-    const glm::ivec3 m(rem.x / kFineRes, rem.y / kFineRes, rem.z / kFineRes);
-    const glm::ivec3 f = rem - m * kFineRes;
-    ensureCoarseBrick(world, c, 1u);
-    return setFineCpu(world, c, m, f, true, hasColor, rgb888);
-  };
-
-  uint32_t stamped = 0;
+  uint32_t placed = 0;
   if (r.fineBits.empty() || fineN <= 0) {
     return 0;
   }
@@ -2908,45 +3039,89 @@ uint32_t VoxelScene::stampMeshIntoWorld(const MeshVoxelizeResult& r, bool sample
           rgb888 = r.fineRgb[colorCursor];
         }
       }
-      const glm::vec3 hutMin = hutOrigin + glm::vec3(fx, fy, fz) * importFineVs;
-      const glm::vec3 hutMax = hutMin + glm::vec3(importFineVs);
-      const glm::vec3 gmin = (hutMin - worldOrigin) / worldFineVs;
-      const glm::vec3 gmax = (hutMax - worldOrigin) / worldFineVs;
+      const glm::vec3 srcMin = srcOrigin + glm::vec3(fx, fy, fz) * importFineVs;
+      const glm::vec3 srcMax = srcMin + glm::vec3(importFineVs);
+      const glm::vec3 gmin = (srcMin - dstOrigin) / dstFineVs;
+      const glm::vec3 gmax = (srcMax - dstOrigin) / dstFineVs;
       const int x0 = std::max(0, static_cast<int>(std::floor(gmin.x)));
       const int y0 = std::max(0, static_cast<int>(std::floor(gmin.y)));
       const int z0 = std::max(0, static_cast<int>(std::floor(gmin.z)));
-      const int x1 = std::min(worldFineN - 1, static_cast<int>(std::ceil(gmax.x) - 1.0f));
-      const int y1 = std::min(worldFineN - 1, static_cast<int>(std::ceil(gmax.y) - 1.0f));
-      const int z1 = std::min(worldFineN - 1, static_cast<int>(std::ceil(gmax.z) - 1.0f));
+      const int x1 = std::min(dstFineN - 1, static_cast<int>(std::ceil(gmax.x) - 1.0f));
+      const int y1 = std::min(dstFineN - 1, static_cast<int>(std::ceil(gmax.y) - 1.0f));
+      const int z1 = std::min(dstFineN - 1, static_cast<int>(std::ceil(gmax.z) - 1.0f));
       if (x0 > x1 || y0 > y1 || z0 > z1) {
         continue;
       }
       for (int wz = z0; wz <= z1; ++wz) {
         for (int wy = y0; wy <= y1; ++wy) {
           for (int wx = x0; wx <= x1; ++wx) {
-            if (placeWorldFine(wx, wy, wz, hasColor, rgb888)) {
-              ++stamped;
+            if (place(wx, wy, wz, hasColor, rgb888)) {
+              ++placed;
             }
           }
         }
       }
     }
   }
-  return stamped;
+  return placed;
 }
 
-bool VoxelScene::importSurfaceMesh(GfxDevice& gfx, const std::string& path,
-                                   const MeshVoxelizeConfig& cfg) {
+uint32_t VoxelScene::stampMeshIntoWorld(const MeshVoxelizeResult& r, bool sampleColor) {
+  VoxelObject* worldPtr = tryGetObject(groundObjectId_);
+  if (!worldPtr || r.n <= 0 || r.material.empty()) {
+    return 0;
+  }
+  VoxelObject& world = *worldPtr;
+  const int wn = world.gridSize;
+  const float wvs = world.voxelSize;
+  if (wn <= 0 || wvs <= 0.0f) {
+    return 0;
+  }
+
+  const float hutExtent = static_cast<float>(r.n) * r.voxelSize;
+  const float worldFineVs = wvs / static_cast<float>(kFinePerCoarse);
+  const glm::vec3 hutPos(0.0f, 0.5f * hutExtent + 2.5f * voxelSize_, 0.0f);
+  const glm::vec3 hutOrigin = hutPos - glm::vec3(0.5f * hutExtent);
+  const glm::vec3 worldOrigin =
+      world.position - glm::vec3(0.5f * static_cast<float>(wn) * wvs);
+  const int worldFineN = wn * kFinePerCoarse;
+
+  world.useImportPalette = sampleColor;
+  world.nestedMicro = true;
+  if (sampleColor) {
+    nestedMicroVoxels_ = true;
+    nestedFineVoxels_ = true;
+  }
+  importPalette_.fill(glm::vec4(0.62f, 0.64f, 0.68f, 1.0f));
+  importPalette_[0] = glm::vec4(0.0f, 0.0f, 0.0f, 1.0f);
+
+  auto placeWorldFine = [&](int wx, int wy, int wz, bool hasColor, uint32_t rgb888) {
+    if (wx < 0 || wy < 0 || wz < 0 || wx >= worldFineN || wy >= worldFineN || wz >= worldFineN) {
+      return false;
+    }
+    const glm::ivec3 absFine(wx, wy, wz);
+    const glm::ivec3 c(absFine.x / kFinePerCoarse, absFine.y / kFinePerCoarse,
+                       absFine.z / kFinePerCoarse);
+    const glm::ivec3 rem = absFine - c * kFinePerCoarse;
+    const glm::ivec3 m(rem.x / kFineRes, rem.y / kFineRes, rem.z / kFineRes);
+    const glm::ivec3 f = rem - m * kFineRes;
+    ensureCoarseBrick(world, c, 1u);
+    return setFineCpu(world, c, m, f, true, hasColor, rgb888);
+  };
+  return forEachImportWorldFine(r, sampleColor, hutOrigin, worldOrigin, worldFineVs, worldFineN, placeWorldFine);
+}
+
+bool VoxelScene::voxelizeImport(GfxDevice& gfx, const std::string& path, const MeshVoxelizeConfig& cfg,
+                                MeshVoxelizeResult& r) {
   if (objects_.empty()) {
     importStatus_ = "World grid is not ready";
     return false;
   }
-
   MeshVoxelizeConfig local = cfg;
   local.fineSubdiv = kFinePerCoarse;
   std::cout << "Import voxelize " << path << (local.sampleColor ? " (sample color)" : "") << std::endl;
   const auto t0 = std::chrono::steady_clock::now();
-  MeshVoxelizeResult r = voxelizeObjSurface(gfx, voxelizeGpu_, path, local);
+  r = voxelizeObjSurface(gfx, voxelizeGpu_, path, local);
   const auto t1 = std::chrono::steady_clock::now();
   if (!r.ok) {
     importStatus_ = r.error;
@@ -2955,26 +3130,49 @@ bool VoxelScene::importSurfaceMesh(GfxDevice& gfx, const std::string& path,
   std::cout << "Import voxelize done in "
             << std::chrono::duration<float>(t1 - t0).count() << "s  occupiedFine="
             << r.occupiedFine << "  colorSamples=" << r.colorSamples << std::endl;
+  return true;
+}
 
-  VoxelObject* worldPtr = tryGetObject(groundObjectId_);
-  if (!worldPtr) {
-    importStatus_ = "Ground object is not ready";
-    return false;
+void VoxelScene::clearGroundStamp() {
+  VoxelObject* world = tryGetObject(groundObjectId_);
+  if (world == nullptr) {
+    return;
   }
-  VoxelObject& world = *worldPtr;
-  for (CoarseCell& c : world.cells) {
+  for (CoarseCell& c : world->cells) {
     if (c.brickPage != kInvalidBrickPage) {
       freeBrickPage(c.brickPage);
     }
   }
-  buildGroundObject(world);
+  buildGroundObject(*world);
   groundObjectId_ = makeObjectId(groundObjectId_.slot);
+}
 
-  const uint32_t stamped = stampMeshIntoWorld(r, local.sampleColor);
+void VoxelScene::releaseImportedObject() {
+  if (tryGetObject(importedObjectId_) != nullptr) {
+    freeObjectSlot(importedObjectId_.slot);
+  }
+  importedObjectId_ = {};
+}
+
+bool VoxelScene::importSurfaceMesh(GfxDevice& gfx, const std::string& path,
+                                   const MeshVoxelizeConfig& cfg) {
+  MeshVoxelizeResult r;
+  if (!voxelizeImport(gfx, path, cfg, r)) {
+    return false;
+  }
+  if (tryGetObject(groundObjectId_) == nullptr) {
+    importStatus_ = "Ground object is not ready";
+    return false;
+  }
+  releaseImportedObject();
+  clearGroundStamp();
+
+  const uint32_t stamped = stampMeshIntoWorld(r, cfg.sampleColor);
   std::cout << "Import stamp done  worldFines=" << stamped << std::endl;
 
   importPath_ = path;
   lastImportedPath_ = path;
+  lastImportAsObject_ = false;
   importGridN_ = cfg.gridN;
   importPadding_ = cfg.padding;
   importSampleColor_ = cfg.sampleColor;
@@ -3009,6 +3207,178 @@ bool VoxelScene::importSurfaceMesh(GfxDevice& gfx, const std::string& path,
   }
   if (!r.warning.empty()) {
     importStatus_ += "  (" + r.warning + ")";
+  }
+  std::cout << importStatus_ << std::endl;
+  return true;
+}
+
+bool VoxelScene::importMeshAsObject(GfxDevice& gfx, const std::string& path, const MeshVoxelizeConfig& cfg) {
+  MeshVoxelizeResult r;
+  if (!voxelizeImport(gfx, path, cfg, r)) {
+    return false;
+  }
+  if (tryGetObject(groundObjectId_) == nullptr) {
+    importStatus_ = "Ground object is not ready";
+    return false;
+  }
+  const auto t0 = std::chrono::steady_clock::now();
+
+  // Resample onto world-sized fines in a scratch set first: the tight bounds of what
+  // actually lands decide the object grid and put the lowest layer exactly on the ground.
+  const int subdiv = std::max(1, r.subdiv);
+  const int srcFineN = r.fineN > 0 ? r.fineN : r.n * subdiv;
+  const float srcFineVs = r.voxelSize / static_cast<float>(subdiv);
+  const float fineVs = voxelSize_ / static_cast<float>(kFinePerCoarse);
+  const int scratchN = static_cast<int>(std::ceil(static_cast<float>(srcFineN) * srcFineVs / fineVs)) + 2;
+  struct Placed {
+    bool hasColor = false;
+    uint32_t rgb = 0;
+  };
+  std::unordered_map<uint64_t, Placed> placed;
+  auto key = [](int x, int y, int z) {
+    return static_cast<uint64_t>(x) | (static_cast<uint64_t>(y) << 21) | (static_cast<uint64_t>(z) << 42);
+  };
+  glm::ivec3 lo(std::numeric_limits<int>::max());
+  glm::ivec3 hi(std::numeric_limits<int>::min());
+  forEachImportWorldFine(r, cfg.sampleColor, glm::vec3(0.0f), glm::vec3(-fineVs), fineVs, scratchN,
+                         [&](int x, int y, int z, bool hasColor, uint32_t rgb) {
+                           Placed& p = placed[key(x, y, z)];
+                           p.hasColor = hasColor;
+                           p.rgb = rgb;
+                           lo = glm::min(lo, glm::ivec3(x, y, z));
+                           hi = glm::max(hi, glm::ivec3(x, y, z));
+                           return true;
+                         });
+  if (placed.empty()) {
+    importStatus_ = "Import produced no voxels";
+    return false;
+  }
+  const glm::ivec3 ext = hi - lo + glm::ivec3(1);
+  const int gridSize = (std::max({ext.x, ext.y, ext.z}) + kFinePerCoarse - 1) / kFinePerCoarse;
+  if (gridSize > 64) {
+    importStatus_ = "Import too large for one object: " + std::to_string(gridSize) + " coarse";
+    return false;
+  }
+
+  if (cfg.sampleColor || importMount_) {
+    nestedMicroVoxels_ = true;
+    nestedFineVoxels_ = true;
+  }
+  if (importMount_ && !simulate_) {
+    setSimulate(gfx, true);  // resets all structures, so it must run before mounting
+  }
+  if (importMount_) {
+    if (VoxelObject* test = tryGetObject(testObjectId_)) {
+      test->enabled = false;
+      physics_.removeBody(testObjectId_);
+    }
+  }
+  releaseImportedObject();
+  if (!lastImportedPath_.empty() && !lastImportAsObject_) {
+    clearGroundStamp();
+  }
+
+  // Fine-align the object grid with the ground grid, centred at x = z = 0, bottom on the ground top.
+  const glm::vec3 groundOrigin = gridOrigin();
+  const int gridFines = gridSize * kFinePerCoarse;
+  const float half = 0.5f * static_cast<float>(gridSize) * voxelSize_;
+  const glm::vec3 origin(groundOrigin.x + std::round((-half - groundOrigin.x) / fineVs) * fineVs, groundTopY(),
+                         groundOrigin.z + std::round((-half - groundOrigin.z) / fineVs) * fineVs);
+  const glm::ivec3 shift = glm::ivec3((gridFines - ext.x) / 2, 0, (gridFines - ext.z) / 2) - lo;
+
+  const uint32_t slot = allocObjectSlot();
+  VoxelObject& o = objects_[slot];
+  o.gridSize = gridSize;
+  o.voxelSize = voxelSize_;
+  o.nestedMicro = true;
+  o.editable = true;
+  o.enabled = true;
+  o.slotOccupied = true;
+  o.isScatter = false;
+  o.motionType = MotionType::Static;
+  o.density = std::max(1.0f, importDensity_);
+  o.topologyRevision = 1;
+  o.useImportPalette = cfg.sampleColor;
+  o.rotation = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+  o.position = origin + glm::vec3(half);
+  o.cells.assign(static_cast<size_t>(gridSize * gridSize * gridSize), CoarseCell{});
+  importPalette_.fill(glm::vec4(0.62f, 0.64f, 0.68f, 1.0f));
+  importPalette_[0] = glm::vec4(0.0f, 0.0f, 0.0f, 1.0f);
+  for (const auto& [k, p] : placed) {
+    const glm::ivec3 g = glm::ivec3(static_cast<int>(k & 0x1FFFFFu), static_cast<int>((k >> 21) & 0x1FFFFFu),
+                                    static_cast<int>(k >> 42)) +
+                         shift;
+    glm::ivec3 c, m, f;
+    splitFineIndex(g.x, g.y, g.z, c, m, f);
+    ensureCoarseBrick(o, c, 1u);
+    setFineCpu(o, c, m, f, true, p.hasColor, p.rgb);
+  }
+  importedObjectId_ = makeObjectId(slot);
+  structureFocusId_ = importedObjectId_;
+  const auto t1 = std::chrono::steady_clock::now();
+
+  importPath_ = path;
+  lastImportedPath_ = path;
+  lastImportAsObject_ = true;
+  importGridN_ = cfg.gridN;
+  importPadding_ = cfg.padding;
+  importSampleColor_ = cfg.sampleColor;
+
+  packObjectPool();
+  fillGpuObjectRecords();
+  ensureGpuBuffers(gfx);
+  {
+    const VkDeviceSize slabBytes = sizeof(uint32_t) * kWordsPerSlab;
+    for (BrickSlab& s : slabs_) {
+      if (s.gpu.buffer != VK_NULL_HANDLE) {
+        gfx.uploadToBuffer(s.gpu, s.words.data(), slabBytes);
+      }
+    }
+    dirtyPages_.clear();
+  }
+  uploadWorldAndObjects(gfx);
+  uploadPalette(gfx);
+  physics_.rebuildFromScene();
+
+  char geom[160];
+  std::snprintf(geom, sizeof(geom), "grid=%d  fines=%zu  size=%.2fx%.2fx%.2f m  resample %.0f ms", gridSize,
+                placed.size(), ext.x * fineVs, ext.y * fineVs, ext.z * fineVs,
+                std::chrono::duration<float, std::milli>(t1 - t0).count());
+  importStatus_ = std::string("Imported as object  ") + geom;
+  camera_.setOrbitTarget(origin + glm::vec3(half, 0.5f * static_cast<float>(ext.y) * fineVs, half));
+
+  if (importMount_) {
+    blast::StructureMountDesc desc;
+    desc.material.strengthPa = std::max(0.01f, importStrengthMPa_) * 1.0e6f;
+    desc.material.ownStrengthPa = desc.material.strengthPa;
+    desc.material.solverIters = 200;
+    const VoxelObjectId id = importedObjectId_;
+    blast::StructureInstance* inst = mountObjectOnGround(id, importAgg_ == 4 ? 4 : 2, desc);
+    if (inst != nullptr && importAgg_ == 0 && inst->graph.nodes.size() > kImportMaxNodes) {
+      std::cout << "Import mount: " << inst->graph.nodes.size() << " nodes at agg 2, retrying agg 4\n";
+      structures_.unmount(id);
+      inst = mountObjectOnGround(id, 4, desc);
+      if (inst != nullptr && inst->graph.nodes.size() > kImportMaxNodes) {
+        structureMountStatus_ = "refused: " + std::to_string(inst->graph.nodes.size()) +
+                                " nodes at agg 4 (budget " + std::to_string(kImportMaxNodes) + ")";
+        structures_.unmount(id);
+        inst = nullptr;
+      }
+    }
+    if (inst != nullptr) {
+      importStatus_ += "\nMounted: " + std::to_string(inst->graph.nodes.size()) + " nodes, " +
+                       std::to_string(inst->graph.bonds.size()) + " bonds, extract " +
+                       std::to_string(static_cast<int>(inst->debug.extractMs)) + " ms; " + structureMountStatus_;
+      lastStressPaintSolveEpoch_ = 0;
+      structures_.warmupGravity(8u, inst);
+      if (stressCylinderDisplay_) {
+        paintCylinderStress(gfx);
+      } else if (anchorDisplay_) {
+        paintAnchors(gfx);
+      }
+    } else {
+      importStatus_ += "\nNot mounted: " + structureMountStatus_;
+    }
   }
   std::cout << importStatus_ << std::endl;
   return true;

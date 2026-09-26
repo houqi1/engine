@@ -50,6 +50,9 @@ struct Options {
   bool benchmark = false;
   bool e2Perf = false;
   bool frameFail = false;
+  bool importObject = false;
+  bool e5Contact = false;
+  bool contactLoads = true;
   int collisionPerf = 0;  // >0: spawn N scatter boxes and time physics stages
   float frameHeightMeters = 4.0f;
   std::string frameImpactMode = "shear";
@@ -94,6 +97,12 @@ Options parseOptions(int argc, char** argv) {
       options.benchmark = true;
     } else if (arg == "--e2-perf") {
       options.e2Perf = true;
+    } else if (arg == "--no-contact-loads") {
+      options.contactLoads = false;
+    } else if (arg == "--e5-contact") {
+      options.e5Contact = true;
+    } else if (arg == "--import-object") {
+      options.importObject = true;
     } else if (arg == "--frame-fail") {
       options.frameFail = true;
     } else if (arg == "--collision-perf") {
@@ -163,7 +172,7 @@ Options parseOptions(int argc, char** argv) {
   if (options.benchmark && options.e2Perf) {
     throw std::runtime_error("Use either --benchmark or --e2-perf, not both");
   }
-  if (argc > 1 && !options.benchmark && !options.e2Perf && !options.frameFail && options.collisionPerf == 0 &&
+  if (argc > 1 && !options.benchmark && !options.e2Perf && !options.frameFail && !options.importObject && !options.e5Contact && options.collisionPerf == 0 &&
       !options.help) {
     throw std::runtime_error("Rendering options require --benchmark; use --help for usage");
   }
@@ -987,6 +996,224 @@ void runFrameFail(GfxDevice& gfx, VoxelScene& scene, PerfLog& out, const Options
   out.line("OK frame-fail: landingSplit=" + std::to_string(landingSplit) + " and distinct fragment objects");
 }
 
+void runE5Contact(GfxDevice& gfx, VoxelScene& scene, PerfLog& out) {
+  uint64_t persistentToLoad = 0;
+  uint64_t impactSkipped = 0;
+  auto st = [&]() -> const blast::StructureDebugSnapshot& {
+    return scene.structures().debug(scene.stressCylinderId());
+  };
+  auto ticks = [&](int n) {
+    for (int i = 0; i < n; ++i) {
+      scene.update(physics::kDt);
+      scene.commitStructureSplits(gfx);
+      persistentToLoad += st().persistentContacts;
+      impactSkipped += st().impactSkippedPersistent;
+    }
+  };
+  auto peak = [](const blast::StructureDebugSnapshot& s) {
+    return std::max({s.maxTension, s.maxCompression, s.maxShear});
+  };
+  auto dump = [&](const std::string& tag) {
+    const blast::StructureDebugSnapshot& s = st();
+    physics::BodyState body;
+    const bool hasBody = scene.getBodyState(scene.stressCylinderId(), body);
+    char line[512];
+    std::snprintf(line, sizeof(line),
+                  "%s conv=%d maxT=%.4g maxC=%.4g maxS=%.4g S=%.3g pairs=%u held=%u nodes=%u |F|=%.1f N "
+                  "awake=%d actors=%u fractured=%u solveMs=%.2f",
+                  tag.c_str(), s.converged ? 1 : 0, s.maxTension, s.maxCompression, s.maxShear, s.strengthPa,
+                  s.contactPairs, s.frozenPairs, s.contactLoadNodes, s.contactForceN, hasBody && body.awake ? 1 : 0,
+                  s.splitActors, s.fracturedBonds, s.solveMs);
+    out.line(line);
+  };
+  bool ok = true;
+  auto check = [&](bool pass, const std::string& what) {
+    out.line(std::string(pass ? "  PASS " : "  FAIL ") + what);
+    ok = ok && pass;
+  };
+  scene.structures().setFractureEnabled(false);
+
+  out.line("== T06 beam on two piers (fracture off) ==");
+  scene.clearScatterBoxes(gfx);
+  if (!scene.spawnBeamOnPiers(gfx, true)) throw std::runtime_error("reference beam mount failed");
+  ticks(600);
+  dump("reference t=10s");
+  const blast::StructureDebugSnapshot ref = st();
+  const float beamWeight = st().mass * 9.81f;
+
+  if (!scene.spawnBeamOnPiers(gfx, false)) throw std::runtime_error("free beam mount failed");
+  float awakePeak = 0.0f;
+  for (int s = 1; s <= 10; ++s) {
+    ticks(60);
+    dump("free t=" + std::to_string(s) + "s");
+    if (s == 3) awakePeak = peak(st());
+  }
+  const blast::StructureDebugSnapshot rest = st();
+  char line[256];
+  std::snprintf(line, sizeof(line), "  beam weight=%.1f N  ratio free/ref: T=%.3f C=%.3f S=%.3f", beamWeight,
+                rest.maxTension / std::max(ref.maxTension, 1e-9f), rest.maxCompression / std::max(ref.maxCompression, 1e-9f),
+                rest.maxShear / std::max(ref.maxShear, 1e-9f));
+  out.line(line);
+  const float ratio = peak(rest) / std::max(peak(ref), 1e-9f);
+  // Resting on the piers is simply supported, the reference is fixed at both ends
+  // (1.5x less mid-span moment), and support concentrates on a few contact nodes.
+  check(ratio > 0.5f && ratio < 4.0f, "T06 resting beam stress of the same order as the anchored reference");
+  check(rest.contactPairs > 0, "T06 contact loads still applied at t=10s (pairs=" + std::to_string(rest.contactPairs) +
+                                   ", held=" + std::to_string(rest.frozenPairs) + ")");
+  check(peak(rest) > 0.5f * awakePeak, "T06 stress kept after the beam sleeps (t=3s vs t=10s)");
+
+  if (!scene.spawnBeamOnPiers(gfx, false, 3.0f)) throw std::runtime_error("drop beam mount failed");
+  float fallPeak = 0.0f;
+  for (int i = 0; i < 36; ++i) {  // 0.6 s, lands after ~0.78 s
+    ticks(1);
+    fallPeak = std::max(fallPeak, peak(st()));
+  }
+  std::snprintf(line, sizeof(line), "  free fall 0.6 s: peak=%.4g Pa  ratio to reference=%.3g", fallPeak,
+                fallPeak / std::max(peak(ref), 1e-9f));
+  out.line(line);
+  check(fallPeak < 1e-3f * peak(ref), "T06 free fall adds < 0.1% of the reference stress");
+
+  // The UI re-applies these every frame, with Fail strength (1 MPa) checked by default;
+  // T06b/c run the same way so the report matches what the app does.
+  bool uiFracture = true;
+  bool uiImpact = true;
+  auto uiTicks = [&](int n) {
+    for (int i = 0; i < n; ++i) {
+      scene.structures().setFractureEnabled(uiFracture);
+      scene.structures().setStrengthPa(blast::kFrameStrengthFailPa);
+      scene.structures().setImpactDamageEnabled(uiImpact);
+      scene.structures().setStressImpactImpulses(false);
+      scene.structures().setStressImpactScale(blast::kExtStressImpactImpulseFactor);
+      scene.structures().setImpactSettings(blast::ImpactSettings{});
+      ticks(1);
+    }
+  };
+  auto pieces = [&]() {
+    std::string s = "  pieces (nodes @ centre x, m):";
+    for (const blast::ActorBinding& b : scene.structures().bindings()) {
+      char buf[48];
+      std::snprintf(buf, sizeof(buf), " %u@%.2f", b.graphNodeCount, b.comAsset.x - 3.2f);
+      s += buf;
+    }
+    out.line(s);
+  };
+  auto notchRun = [&](const char* name, bool contactLoads, bool impactDamage) -> bool {
+    out.line(std::string("== ") + name + " notch the resting beam, UI settings per tick, contact loads " +
+             (contactLoads ? "on" : "off") + ", impact damage " + (impactDamage ? "on" : "off") + " ==");
+    scene.clearScatterBoxes(gfx);
+    scene.structures().setContactLoadsEnabled(contactLoads);
+    uiImpact = impactDamage;
+    if (!scene.spawnBeamOnPiers(gfx, false)) throw std::runtime_error("free beam mount failed");
+    uiFracture = false;
+    uiTicks(360);
+    uiFracture = true;
+    uiTicks(180);
+    dump("intact +3s");
+    const bool intactHeld = st().splitActors == 1 && st().fracturedBonds == 0;
+    if (!scene.notchDemoBeam(gfx)) throw std::runtime_error("notch failed");
+    uiTicks(240);
+    dump("notched +4s");
+    pieces();
+    if (contactLoads || !impactDamage) {
+      check(intactHeld, std::string(name) + " intact beam holds at its own strength");
+    }
+    return st().splitActors > 1 || st().fracturedBonds > 0;
+  };
+  check(notchRun("T06b", true, true), "T06b notched beam breaks under contact loads");
+  check(!notchRun("T06c", false, false), "T06c without contact loads the notched beam does not break");
+  // Pre-E5.4 defaults, recorded only: resting contact counted as impact every tick.
+  notchRun("T06d", false, true);
+  scene.structures().setContactLoadsEnabled(true);
+  scene.structures().setImpactDamageEnabled(true);
+  scene.structures().setFractureEnabled(false);
+
+  out.line("== T07 weight on the four-column roof (fracture off) ==");
+  scene.clearScatterBoxes(gfx);
+  if (!scene.spawnStressFrame(gfx, 4.0f)) throw std::runtime_error("spawnStressFrame failed");
+  ticks(120);
+  dump("roof only");
+  const float base = st().maxCompression;
+  float prev = base;
+  bool monotonic = true;
+  for (float density : {8000.0f, 32000.0f, 128000.0f}) {
+    if (!scene.dropWeightOnRoof(gfx, density)) throw std::runtime_error("dropWeightOnRoof failed");
+    ticks(240);
+    std::snprintf(line, sizeof(line), "weight %.0f kg (W=%.0f N)", density * 0.064f, density * 0.064f * 9.81f);
+    dump(line);
+    monotonic = monotonic && st().maxCompression > prev;
+    prev = st().maxCompression;
+  }
+  scene.removeDemoWeight(gfx);
+  ticks(240);
+  dump("weight removed");
+  check(monotonic, "T07 column compression rises with the weight");
+  check(std::abs(st().maxCompression - base) < 0.1f * base, "T07 compression returns to the roof-only value");
+
+  std::snprintf(line, sizeof(line), "== T08 persistent contacts to addLoad=%llu, skipped by the impact route=%llu ==",
+                static_cast<unsigned long long>(persistentToLoad), static_cast<unsigned long long>(impactSkipped));
+  out.line(line);
+  check(persistentToLoad > 0 && impactSkipped > 0, "T08 persistent contacts took the load channel only");
+  out.line(ok ? "OK e5-contact" : "FAIL e5-contact");
+}
+
+void runImportObject(GfxDevice& gfx, VoxelScene& scene, PerfLog& out) {
+  MeshVoxelizeConfig config;
+  config.gridN = 64;
+  config.padding = 1;
+  config.sampleColor = false;
+  scene.importAsObject() = true;
+  scene.importMount() = true;
+  scene.structures().setFractureEnabled(true);
+  bool allStood = true;
+  for (int agg : {2, 4, 0}) {
+    scene.importAgg() = agg;
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!scene.importMeshAsObject(gfx, scene.importPath(), config)) {
+      throw std::runtime_error("importMeshAsObject failed: " + scene.importStatus());
+    }
+    const float importMs = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    const VoxelObject* o = scene.tryGetObject(scene.importedObjectId());
+    if (o == nullptr) {
+      throw std::runtime_error("imported object missing");
+    }
+    const blast::GroundAnchorResult& anchors = scene.lastGroundAnchors();
+    const float bottomY = o->position.y - 0.5f * static_cast<float>(o->gridSize) * o->voxelSize;
+    char line[512];
+    std::snprintf(line, sizeof(line),
+                  "agg=%s grid=%d bottomY=%.3f anchorFines=%u faces=%u blocked=%u importMs=%.0f",
+                  agg == 0 ? "auto" : std::to_string(agg).c_str(), o->gridSize, bottomY, anchors.anchorFines,
+                  anchors.contactFaces, anchors.blockedFaces, importMs);
+    out.line(line);
+    out.line("  status: " + scene.importStatus());
+    const blast::StructureInstance* inst = scene.structures().find(scene.importedObjectId());
+    if (inst == nullptr) {
+      allStood = false;
+      out.line("  not mounted");
+      continue;
+    }
+    const int seconds = 10;
+    for (int s = 1; s <= seconds; ++s) {
+      for (int i = 0; i < 60; ++i) {
+        scene.update(physics::kDt);
+        scene.commitStructureSplits(gfx);
+      }
+      const blast::StructureDebugSnapshot& st = scene.structures().debug(scene.importedObjectId());
+      std::snprintf(line, sizeof(line),
+                    "  t=%2ds nodes=%u bonds=%u worldBonds=%u mass=%.0f conv=%d linErr=%.3g angErr=%.3g "
+                    "maxT=%.3g maxC=%.3g maxS=%.3g S=%.3g fractured=%u actors=%u solveMs=%.2f",
+                    s, st.nodes, st.bonds, st.worldBonds, st.mass, st.converged ? 1 : 0, st.linErr, st.angErr,
+                    st.maxTension, st.maxCompression, st.maxShear, st.strengthPa, st.fracturedBonds,
+                    st.splitActors, st.solveMs);
+      out.line(line);
+      if (s == seconds && (st.fracturedBonds > 0 || st.splitActors > 1)) {
+        allStood = false;
+      }
+    }
+  }
+  out.line(allStood ? "OK import-object: hut mounted and stood under self-weight at every agg"
+                    : "FAIL import-object: see lines above");
+}
+
 int main(int argc, char** argv) {
   // CLI failures must not block automation, including errors before --benchmark is parsed.
   const bool dialogs = argc == 1;
@@ -996,6 +1223,9 @@ int main(int argc, char** argv) {
     if (options.help) {
       std::cout << "Usage: vulkan_engine_voxel [--benchmark options | --e2-perf | --frame-fail]\n"
                    "  --frame-fail     Test four-column failure through landing\n"
+                   "  --import-object  E5.5: import the hut as a mounted object at agg 2/4/auto, report\n"
+                   "  --e5-contact     E5.4: contact loads (beam on piers, notch, weight on roof), report\n"
+                   "  --no-contact-loads   Pre-E5.4 loads (with --frame-fail etc.)\n"
                    "  --frame-height M Column height for --frame-fail (1.0-9.2 m, default 4.0)\n"
                    "  --frame-impact MODE  shear (Viewer default), spread, or stress\n"
                    "  --frame-render-hz N  Frame test cadence (30-240, default 60)\n"
@@ -1036,7 +1266,7 @@ int main(int argc, char** argv) {
         SetWindowPos(hwnd, HWND_NOTOPMOST, 160, 160, 0, 0, SWP_SHOWWINDOW | SWP_NOSIZE);
       }
     }
-    if (options.e2Perf || options.frameFail || options.collisionPerf > 0) {
+    if (options.e2Perf || options.frameFail || options.importObject || options.e5Contact || options.collisionPerf > 0) {
       if (AttachConsole(ATTACH_PARENT_PROCESS) || AllocConsole()) {
         FILE* fp = nullptr;
         freopen_s(&fp, "CONOUT$", "w", stdout);
@@ -1048,9 +1278,52 @@ int main(int argc, char** argv) {
     GfxDevice gfx(window);
     VoxelScene scene;
     scene.init(gfx, blastRt);
+    scene.structures().setContactLoadsEnabled(options.contactLoads);
 
     if (options.collisionPerf > 0) {
       runCollisionPerf(gfx, scene, options.collisionPerf);
+      gfx.waitIdle();
+      scene.cleanup(gfx);
+      blastRt.shutdown();
+      return 0;
+    }
+
+    if (options.e5Contact) {
+      const std::filesystem::path reportPath =
+          std::filesystem::path(VE_ASSETS_DIR).parent_path() / "docs" / "e5-contact.txt";
+      PerfLog log(reportPath);
+      if (log.f == nullptr) {
+        throw std::runtime_error("Cannot open " + reportPath.string());
+      }
+      try {
+        runE5Contact(gfx, scene, log);
+      } catch (const std::exception& ex) {
+        log.line(std::string("ERROR: ") + ex.what());
+        gfx.waitIdle();
+        scene.cleanup(gfx);
+        throw;
+      }
+      gfx.waitIdle();
+      scene.cleanup(gfx);
+      blastRt.shutdown();
+      return 0;
+    }
+
+    if (options.importObject) {
+      const std::filesystem::path reportPath =
+          std::filesystem::path(VE_ASSETS_DIR).parent_path() / "docs" / "import-object.txt";
+      PerfLog log(reportPath);
+      if (log.f == nullptr) {
+        throw std::runtime_error("Cannot open " + reportPath.string());
+      }
+      try {
+        runImportObject(gfx, scene, log);
+      } catch (const std::exception& ex) {
+        log.line(std::string("ERROR: ") + ex.what());
+        gfx.waitIdle();
+        scene.cleanup(gfx);
+        throw;
+      }
       gfx.waitIdle();
       scene.cleanup(gfx);
       blastRt.shutdown();
