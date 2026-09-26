@@ -10,7 +10,9 @@
 #include <glm/gtc/quaternion.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <iostream>
@@ -687,8 +689,8 @@ VoxelObjectId VoxelScene::objectOwningFamilyFine(const glm::ivec3& absFine) cons
 
 bool VoxelScene::commitOccupancySplit(GfxDevice& gfx, VoxelObjectId parentId,
                                       const std::vector<std::vector<voxel::FineCoord>>& islands,
-                                      const std::vector<uint8_t>& anchored,
-                                      const std::vector<NvBlastActor*>& actors, blast::StructureInstance& inst) {
+                                      const std::vector<uint8_t>& anchored, blast::StructureInstance& inst,
+                                      std::vector<VoxelObjectId>& createdOut) {
   VoxelObject* parent = tryGetObject(parentId);
   if (!parent || islands.empty()) {
     return false;
@@ -714,17 +716,17 @@ bool VoxelScene::commitOccupancySplit(GfxDevice& gfx, VoxelObjectId parentId,
     parentState.x = parent->position;
     parentState.q = parent->rotation;
   }
+  using ProfClock = std::chrono::steady_clock;
+  auto msSince = [](ProfClock::time_point t) {
+    return std::chrono::duration<float, std::milli>(ProfClock::now() - t).count();
+  };
+  ++splitProfile_.owners;
+  auto tProf = ProfClock::now();
   const glm::dvec3 parentCom = computeLocalCom(static_cast<int>(parentId.slot));
   const int parentIndex = static_cast<int>(parentId.slot);
   const uint32_t before = countSolidFines(parentIndex);
-
-  std::vector<blast::ActorObjectLink> links(islands.size());
-  links[keep].objectId = parentId;
-  links[keep].fineOrigin = parent->structureFineOrigin;
-  links[keep].fineN = parent->gridSize * kFinePerCoarse;
-  if (keep < actors.size()) {
-    links[keep].actor = actors[keep];
-  }
+  splitProfile_.scanMs += msSince(tProf);
+  tProf = ProfClock::now();
 
   uint32_t created = 0;
   for (size_t i = 0; i < islands.size(); ++i) {
@@ -744,19 +746,18 @@ bool VoxelScene::commitOccupancySplit(GfxDevice& gfx, VoxelObjectId parentId,
       std::cerr << "Structure split: island extract failed\n";
       return false;
     }
-    links[i].objectId = childId;
-    if (i < actors.size()) {
-      links[i].actor = actors[i];
-    }
     if (childId.valid()) {
       ++created;
-    }
-    if (const VoxelObject* child = tryGetObject(childId)) {
-      links[i].fineOrigin = child->structureFineOrigin;
-      links[i].fineN = child->gridSize * kFinePerCoarse;
+      createdOut.push_back(childId);
     }
   }
 
+  splitProfile_.extractMs += msSince(tProf);
+  splitProfile_.created += created;
+  if (created == 0) {
+    ++splitProfile_.unchangedOwners;
+  }
+  tProf = ProfClock::now();
   parent = tryGetObject(parentId);
   if (parent == nullptr) {
     return false;
@@ -768,6 +769,8 @@ bool VoxelScene::commitOccupancySplit(GfxDevice& gfx, VoxelObjectId parentId,
     inst.topologyRevision = parent->topologyRevision;
   }
   const uint32_t left = countSolidFines(parentIndex);
+  splitProfile_.scanMs += msSince(tProf);
+  tProf = ProfClock::now();
   if (left == 0) {
     parent->enabled = false;
     physics_.removeBody(parentId);
@@ -783,9 +786,10 @@ bool VoxelScene::commitOccupancySplit(GfxDevice& gfx, VoxelObjectId parentId,
     }
     physics_.replaceShape(parentId, &parentState);
   }
+  splitProfile_.shapeMs += msSince(tProf);
+  tProf = ProfClock::now();
 
   if (created == 0) {
-    structures_.bindVisibleActors(links, &inst);
     return true;
   }
   lastStressPaintSolveEpoch_ = 0;
@@ -800,11 +804,10 @@ bool VoxelScene::commitOccupancySplit(GfxDevice& gfx, VoxelObjectId parentId,
     uploadObjectTransforms(gfx, i);
   }
   ++gpuResourceSerial_;
+  splitProfile_.gpuMs += msSince(tProf);
   physics_.activateBodiesInBounds(parentState.x - glm::vec3(2.0f), parentState.x + glm::vec3(2.0f));
-  structures_.bindVisibleActors(links, &inst);
   std::cout << "Structure split: parent slot=" << parentId.slot << " islands=" << islands.size()
-            << " fines " << before << " -> " << left << " keepAnchored=" << (keepAnchored ? 1 : 0)
-            << " bindings=" << structures_.bindings().size() << "\n";
+            << " fines " << before << " -> " << left << " keepAnchored=" << (keepAnchored ? 1 : 0) << "\n";
   return true;
 }
 
@@ -820,14 +823,23 @@ void VoxelScene::commitStructureSplit(GfxDevice& gfx, blast::StructureInstance& 
   if (!inst->occupancyDirty && !inst->pending.valid && !inst->impactAppliedThisTick) return;
   // Capture the object's owners before splitting replaces actor pointers.
   std::vector<VoxelObjectId> owners;
+  // Actor -> (object, graph nodes) before this commit: an owner whose single island is
+  // still the same actor with the same nodes did not change and is skipped.
+  std::unordered_map<const NvBlastActor*, std::pair<VoxelObjectId, uint32_t>> priorBound;
   for (const blast::ActorBinding& binding : inst->bindings) {
     if (binding.objectId.valid() &&
         std::find(owners.begin(), owners.end(), binding.objectId) == owners.end()) {
       owners.push_back(binding.objectId);
     }
+    if (binding.actor != nullptr) {
+      priorBound[binding.actor] = {binding.objectId, binding.graphNodeCount};
+    }
   }
   structures_.applyPendingIfAny(inst);
   if (!structures_.takeOccupancyDirty(inst)) return;
+  ++splitProfile_.commits;
+  const auto tGather0 = std::chrono::steady_clock::now();
+  float traceMs = 0.0f;
   auto findOwner = [&](const glm::ivec3& absFine) -> VoxelObjectId {
     for (VoxelObjectId id : owners) {
       const VoxelObject* object = tryGetObject(id);
@@ -856,14 +868,25 @@ void VoxelScene::commitStructureSplit(GfxDevice& gfx, blast::StructureInstance& 
     uint8_t anchored = 0;
     VoxelObjectId owner{};
   };
+  // Per-actor split trace (console + docs/frame-split-trace.txt) only with VE_SPLIT_TRACE set.
+  const bool traceOn = std::getenv("VE_SPLIT_TRACE") != nullptr;
   FILE* trace = nullptr;
-  fopen_s(&trace, "docs/frame-split-trace.txt", "a");
+  if (traceOn) {
+    fopen_s(&trace, "docs/frame-split-trace.txt", "a");
+  }
   auto tr = [&](const std::string& s) {
+    if (!traceOn) {
+      return;
+    }
+    const auto tTrace0 = std::chrono::steady_clock::now();
     std::cout << s << "\n";
     if (trace) {
       std::fputs(s.c_str(), trace);
       std::fputc('\n', trace);
     }
+    const float dt = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - tTrace0).count();
+    traceMs += dt;
+    splitProfile_.traceMs += dt;
   };
 
   const NvBlastSupportGraph support = NvBlastAssetGetSupportGraph(inst->blast.asset, sceneBlastLog);
@@ -915,6 +938,8 @@ void VoxelScene::commitStructureSplit(GfxDevice& gfx, blast::StructureInstance& 
     pieces.push_back(std::move(piece));
   }
 
+  splitProfile_.gatherMs +=
+      std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - tGather0).count() - traceMs;
   std::unordered_map<uint32_t, std::vector<size_t>> bySlot;
   for (size_t i = 0; i < pieces.size(); ++i) {
     if (pieces[i].owner.valid()) {
@@ -934,20 +959,31 @@ void VoxelScene::commitStructureSplit(GfxDevice& gfx, blast::StructureInstance& 
       anchored.push_back(pieces[idx].anchored);
       actors.push_back(pieces[idx].actor);
     }
-    const uint32_t beforeSolids = countSolidFines(static_cast<int>(owner.slot));
-    tr("Structure split: ownerSlot=" + std::to_string(owner.slot) +
-       " islands=" + std::to_string(islands.size()) + " solidsBefore=" + std::to_string(beforeSolids));
-    if (!commitOccupancySplit(gfx, owner, islands, anchored, actors, *inst)) {
-      inst->occupancyDirty = true;
-    }
-    for (const blast::ActorBinding& binding : inst->bindings) {
-      if (binding.objectId.valid() &&
-          std::find(owners.begin(), owners.end(), binding.objectId) == owners.end()) {
-        owners.push_back(binding.objectId);
+    if (islands.size() == 1) {
+      const auto prior = priorBound.find(actors.front());
+      if (prior != priorBound.end() && prior->second.first == owner &&
+          prior->second.second == NvBlastActorGetGraphNodeCount(actors.front(), sceneBlastLog)) {
+        ++splitProfile_.owners;
+        ++splitProfile_.unchangedOwners;
+        continue;
       }
     }
-    tr("Structure split: solidsAfter=" +
-       std::to_string(countSolidFines(static_cast<int>(owner.slot))));
+    if (traceOn) {
+      tr("Structure split: ownerSlot=" + std::to_string(owner.slot) + " islands=" + std::to_string(islands.size()) +
+         " solidsBefore=" + std::to_string(countSolidFines(static_cast<int>(owner.slot))));
+    }
+    std::vector<VoxelObjectId> created;
+    if (!commitOccupancySplit(gfx, owner, islands, anchored, *inst, created)) {
+      inst->occupancyDirty = true;
+    }
+    for (VoxelObjectId child : created) {
+      if (std::find(owners.begin(), owners.end(), child) == owners.end()) {
+        owners.push_back(child);
+      }
+    }
+    if (traceOn) {
+      tr("Structure split: solidsAfter=" + std::to_string(countSolidFines(static_cast<int>(owner.slot))));
+    }
   }
   std::vector<blast::ActorObjectLink> relink;
   relink.reserve(pieces.size());

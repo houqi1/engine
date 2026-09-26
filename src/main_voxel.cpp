@@ -52,6 +52,7 @@ struct Options {
   bool frameFail = false;
   bool importObject = false;
   bool e5Contact = false;
+  bool collapsePerf = false;
   bool contactLoads = true;
   int collisionPerf = 0;  // >0: spawn N scatter boxes and time physics stages
   float frameHeightMeters = 4.0f;
@@ -99,6 +100,8 @@ Options parseOptions(int argc, char** argv) {
       options.e2Perf = true;
     } else if (arg == "--no-contact-loads") {
       options.contactLoads = false;
+    } else if (arg == "--collapse-perf") {
+      options.collapsePerf = true;
     } else if (arg == "--e5-contact") {
       options.e5Contact = true;
     } else if (arg == "--import-object") {
@@ -172,7 +175,7 @@ Options parseOptions(int argc, char** argv) {
   if (options.benchmark && options.e2Perf) {
     throw std::runtime_error("Use either --benchmark or --e2-perf, not both");
   }
-  if (argc > 1 && !options.benchmark && !options.e2Perf && !options.frameFail && !options.importObject && !options.e5Contact && options.collisionPerf == 0 &&
+  if (argc > 1 && !options.benchmark && !options.e2Perf && !options.frameFail && !options.importObject && !options.e5Contact && !options.collapsePerf && options.collisionPerf == 0 &&
       !options.help) {
     throw std::runtime_error("Rendering options require --benchmark; use --help for usage");
   }
@@ -1156,6 +1159,86 @@ void runE5Contact(GfxDevice& gfx, VoxelScene& scene, PerfLog& out) {
   out.line(ok ? "OK e5-contact" : "FAIL e5-contact");
 }
 
+// Collapse the hut under its own weight (0.6 MPa, fracture on, UI settings per tick) and
+// time every stage while it breaks into many pieces.
+void runCollapsePerf(GfxDevice& gfx, VoxelScene& scene, PerfLog& out) {
+  MeshVoxelizeConfig config;
+  config.gridN = 64;
+  config.padding = 1;
+  config.sampleColor = false;
+  scene.importAsObject() = true;
+  scene.importMount() = true;
+  scene.importAgg() = 0;
+  scene.importStrengthMPa() = 0.6f;
+  if (!scene.importMeshAsObject(gfx, scene.importPath(), config)) {
+    throw std::runtime_error("importMeshAsObject failed: " + scene.importStatus());
+  }
+  out.line(std::string("contactLoads=") + (scene.structures().contactLoadsEnabled() ? "on" : "off"));
+  out.line("tick wallMs/tick | broad narrow solver record sleep | structTick commit | awake/bodies contacts | "
+           "instances actors | loadMs solveMs candMs (sum over instances)");
+  constexpr int kMaxTicks = 300;
+  constexpr int kWindow = 10;
+  constexpr float kMaxWallSeconds = 240.0f;
+  const auto start = std::chrono::steady_clock::now();
+  struct Acc {
+    double wall = 0, broad = 0, narrow = 0, solver = 0, record = 0, sleep = 0, stTick = 0, commit = 0, load = 0,
+           solve = 0, cand = 0;
+  } acc;
+  for (int t = 1; t <= kMaxTicks; ++t) {
+    scene.structures().setFractureEnabled(true);
+    scene.structures().setStrengthPa(blast::kFrameStrengthFailPa);
+    scene.structures().setImpactDamageEnabled(true);
+    scene.structures().setStressImpactImpulses(false);
+    scene.structures().setStressImpactScale(blast::kExtStressImpactImpulseFactor);
+    scene.structures().setImpactSettings(blast::ImpactSettings{});
+    const auto t0 = std::chrono::steady_clock::now();
+    scene.update(physics::kDt);
+    acc.wall += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    const auto& phys = scene.physicsDebug();
+    acc.broad += phys.broadPhaseMs;
+    acc.narrow += phys.narrowPhaseMs;
+    acc.solver += phys.solverOnlyMs;
+    acc.record += phys.contactRecordMs;
+    acc.sleep += phys.sleepMs;
+    acc.stTick += scene.structureTickMs();
+    acc.commit += scene.structureCommitMs();
+    uint32_t actors = 0;
+    for (uint32_t i = 0; i < scene.structures().instanceCount(); ++i) {
+      const blast::StructureInstance* inst = scene.structures().instanceAt(i);
+      acc.load += inst->debug.contactLoadMs;
+      acc.solve += inst->debug.solveMs;
+      acc.cand += inst->debug.candidateMs;
+      actors += static_cast<uint32_t>(inst->bindings.size());
+    }
+    const float wallS = std::chrono::duration<float>(std::chrono::steady_clock::now() - start).count();
+    if (t % kWindow == 0 || wallS > kMaxWallSeconds) {
+      const int n = t % kWindow == 0 ? kWindow : t % kWindow;
+      char line[400];
+      std::snprintf(line, sizeof(line),
+                    "%4d %9.1f | %6.1f %6.1f %6.1f %6.1f %5.1f | %8.1f %7.1f | %4d/%-4d %6d | %3u %5u | %7.1f %7.1f %6.1f",
+                    t, acc.wall / n, acc.broad / n, acc.narrow / n, acc.solver / n, acc.record / n, acc.sleep / n,
+                    acc.stTick / n, acc.commit / n, phys.awakeBodies, phys.occupiedBodies, phys.contacts,
+                    scene.structures().instanceCount(), actors, acc.load / n, acc.solve / n, acc.cand / n);
+      out.line(line);
+      const VoxelScene::SplitProfile& sp = scene.splitProfile();
+      if (sp.commits > 0) {
+        std::snprintf(line, sizeof(line),
+                      "     split/tick: gather %.1f scan %.1f extract %.1f shape %.1f gpu %.1f bind %.1f trace %.1f"
+                      " | commits %u owners %u unchanged %u created %u (window totals)",
+                      sp.gatherMs / n, sp.scanMs / n, sp.extractMs / n, sp.shapeMs / n, sp.gpuMs / n, sp.bindMs / n,
+                      sp.traceMs / n, sp.commits, sp.owners, sp.unchangedOwners, sp.created);
+        out.line(line);
+      }
+      scene.resetSplitProfile();
+      acc = Acc{};
+    }
+    if (wallS > kMaxWallSeconds) {
+      out.line("stopped: wall-clock limit");
+      break;
+    }
+  }
+}
+
 void runImportObject(GfxDevice& gfx, VoxelScene& scene, PerfLog& out) {
   MeshVoxelizeConfig config;
   config.gridN = 64;
@@ -1226,6 +1309,7 @@ int main(int argc, char** argv) {
                    "  --import-object  E5.5: import the hut as a mounted object at agg 2/4/auto, report\n"
                    "  --e5-contact     E5.4: contact loads (beam on piers, notch, weight on roof), report\n"
                    "  --no-contact-loads   Pre-E5.4 loads (with --frame-fail etc.)\n"
+                   "  --collapse-perf  Hut at 0.6 MPa collapses; per-stage tick timing (<= 300 ticks / 240 s)\n"
                    "  --frame-height M Column height for --frame-fail (1.0-9.2 m, default 4.0)\n"
                    "  --frame-impact MODE  shear (Viewer default), spread, or stress\n"
                    "  --frame-render-hz N  Frame test cadence (30-240, default 60)\n"
@@ -1266,7 +1350,7 @@ int main(int argc, char** argv) {
         SetWindowPos(hwnd, HWND_NOTOPMOST, 160, 160, 0, 0, SWP_SHOWWINDOW | SWP_NOSIZE);
       }
     }
-    if (options.e2Perf || options.frameFail || options.importObject || options.e5Contact || options.collisionPerf > 0) {
+    if (options.e2Perf || options.frameFail || options.importObject || options.e5Contact || options.collapsePerf || options.collisionPerf > 0) {
       if (AttachConsole(ATTACH_PARENT_PROCESS) || AllocConsole()) {
         FILE* fp = nullptr;
         freopen_s(&fp, "CONOUT$", "w", stdout);
@@ -1282,6 +1366,28 @@ int main(int argc, char** argv) {
 
     if (options.collisionPerf > 0) {
       runCollisionPerf(gfx, scene, options.collisionPerf);
+      gfx.waitIdle();
+      scene.cleanup(gfx);
+      blastRt.shutdown();
+      return 0;
+    }
+
+    if (options.collapsePerf) {
+      const std::filesystem::path reportPath =
+          std::filesystem::path(VE_ASSETS_DIR).parent_path() / "docs" /
+          (options.contactLoads ? "collapse-perf.txt" : "collapse-perf-nocontact.txt");
+      PerfLog log(reportPath);
+      if (log.f == nullptr) {
+        throw std::runtime_error("Cannot open " + reportPath.string());
+      }
+      try {
+        runCollapsePerf(gfx, scene, log);
+      } catch (const std::exception& ex) {
+        log.line(std::string("ERROR: ") + ex.what());
+        gfx.waitIdle();
+        scene.cleanup(gfx);
+        throw;
+      }
       gfx.waitIdle();
       scene.cleanup(gfx);
       blastRt.shutdown();

@@ -34,10 +34,10 @@ notched +4s conv=1 maxT=1.799e-15 maxC=1.826e-15 maxS=8.707e-17 S=1.2e+05 pairs=
   pieces (nodes @ centre x, m): 40@-0.00
 == T07 weight on the four-column roof (fracture off) ==
 roof only conv=1 maxT=1.302e+04 maxC=6.93e+04 maxS=1.493e+04 S=5e+07 pairs=0 held=0 nodes=0 |F|=0.0 N awake=0 actors=1 fractured=0 solveMs=0.01
-weight 512 kg (W=5023 N) conv=1 maxT=2.55e+04 maxC=8.696e+04 maxS=2.358e+04 S=5e+07 pairs=1 held=1 nodes=4 |F|=5247.4 N awake=0 actors=1 fractured=0 solveMs=0.01
-weight 2048 kg (W=20091 N) conv=1 maxT=9.945e+04 maxC=1.837e+05 maxS=9.838e+04 S=5e+07 pairs=1 held=1 nodes=4 |F|=20989.4 N awake=0 actors=1 fractured=0 solveMs=0.01
-weight 8192 kg (W=80364 N) conv=1 maxT=3.974e+05 maxC=5.727e+05 maxS=3.979e+05 S=5e+07 pairs=1 held=1 nodes=4 |F|=83957.8 N awake=0 actors=1 fractured=0 solveMs=0.01
-weight removed conv=1 maxT=1.356e+04 maxC=7.096e+04 maxS=1.506e+04 S=5e+07 pairs=0 held=0 nodes=0 |F|=0.0 N awake=0 actors=1 fractured=0 solveMs=0.01
+weight 512 kg (W=5023 N) conv=1 maxT=2.549e+04 maxC=8.703e+04 maxS=2.346e+04 S=5e+07 pairs=1 held=1 nodes=4 |F|=5247.4 N awake=0 actors=1 fractured=0 solveMs=0.01
+weight 2048 kg (W=20091 N) conv=1 maxT=9.98e+04 maxC=1.841e+05 maxS=9.783e+04 S=5e+07 pairs=1 held=1 nodes=4 |F|=20989.4 N awake=0 actors=1 fractured=0 solveMs=0.01
+weight 8192 kg (W=80364 N) conv=1 maxT=3.988e+05 maxC=5.749e+05 maxS=3.956e+05 S=5e+07 pairs=1 held=1 nodes=4 |F|=83957.8 N awake=0 actors=1 fractured=0 solveMs=0.01
+weight removed conv=1 maxT=1.357e+04 maxC=7.095e+04 maxS=1.507e+04 S=5e+07 pairs=0 held=0 nodes=0 |F|=0.0 N awake=0 actors=1 fractured=0 solveMs=0.02
   PASS T07 column compression rises with the weight
   PASS T07 compression returns to the roof-only value
 == T08 persistent contacts to addLoad=15916, skipped by the impact route=16216 ==

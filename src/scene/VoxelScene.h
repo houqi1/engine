@@ -296,6 +296,16 @@ public:
   bool dropWeightOnRoof(GfxDevice& gfx, float density);
   void removeDemoWeight(GfxDevice& gfx);
   VoxelObjectId demoWeightId() const { return demoWeightId_; }
+  // Last fixed tick: structure solve (all instances) and split commit, ms.
+  float structureTickMs() const { return structureTickMs_; }
+  float structureCommitMs() const { return structureCommitMs_; }
+  // Split commit stages, accumulated until resetSplitProfile() (ms, counts).
+  struct SplitProfile {
+    float gatherMs = 0, scanMs = 0, extractMs = 0, shapeMs = 0, gpuMs = 0, bindMs = 0, traceMs = 0;
+    uint32_t commits = 0, owners = 0, unchangedOwners = 0, created = 0;
+  };
+  const SplitProfile& splitProfile() const { return splitProfile_; }
+  void resetSplitProfile() { splitProfile_ = {}; }
   // Resting beam peaks near 0.096 MPa, notched near 0.153 MPa: holds intact, breaks notched.
   static constexpr float kBeamDemoStrengthPa = 1.2e5f;
   // E5.2: fines whose exposed faces rest on unmounted static objects (the ground).
@@ -422,6 +432,9 @@ private:
   uint32_t allocDemoSlot(int gridSize, MotionType motion, float density, const glm::vec3& position,
                          const glm::quat& rotation, const std::function<bool(int, int, int)>& fill);
   std::vector<VoxelObjectId> demoAuxIds_;  // piers, weights: freed with the demo structure
+  float structureTickMs_ = 0.0f;
+  float structureCommitMs_ = 0.0f;
+  SplitProfile splitProfile_{};
   VoxelObjectId demoWeightId_{};
   // Writes the anchor color over world-anchored fines of every object bound to inst.
   void overlayAnchorFines(const blast::StructureInstance& inst);
@@ -475,10 +488,12 @@ private:
                               const std::vector<voxel::FineCoord>& fines, VoxelObjectId parentId,
                               const physics::BodyState& parentState, glm::dvec3 parentComLocal,
                               MotionType motion, VoxelObjectId* outId = nullptr);
+  // Carves islands other than the kept one out of parentId into new objects (appended to
+  // createdOut). Actor bindings are refreshed once by the caller after all owners.
   bool commitOccupancySplit(GfxDevice& gfx, VoxelObjectId parentId,
                             const std::vector<std::vector<voxel::FineCoord>>& islands,
-                            const std::vector<uint8_t>& anchored,
-                            const std::vector<NvBlastActor*>& actors, blast::StructureInstance& inst);
+                            const std::vector<uint8_t>& anchored, blast::StructureInstance& inst,
+                            std::vector<VoxelObjectId>& createdOut);
   VoxelObjectId objectOwningFamilyFine(const glm::ivec3& absFine) const;
   bool familyFinesOnObject(VoxelObjectId id, const std::vector<voxel::FineCoord>& fines) const;
   glm::dvec3 computeLocalCom(int objectIndex) const;

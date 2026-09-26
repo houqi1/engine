@@ -243,12 +243,17 @@ void VoxelScene::bindStructureTicks(GfxDevice& gfx) {
           addKin(imp.idA);
           addKin(imp.idB);
         }
+        const auto t0 = std::chrono::steady_clock::now();
         scene->structures_.onPhysicsTick(tickId, dt, imps.data(), static_cast<uint32_t>(imps.size()), kin.data(),
                                          static_cast<uint32_t>(kin.size()));
+        const auto t1 = std::chrono::steady_clock::now();
         // Materialize and rebind split actors before the next fixed physics tick,
         // including when a render frame runs multiple ticks.
         scene->physics_.syncTransformsToScene();
         scene->commitStructureSplits(*scene->structureGfx_);
+        const auto t2 = std::chrono::steady_clock::now();
+        scene->structureTickMs_ = std::chrono::duration<float, std::milli>(t1 - t0).count();
+        scene->structureCommitMs_ = std::chrono::duration<float, std::milli>(t2 - t1).count();
       },
       this);
 }

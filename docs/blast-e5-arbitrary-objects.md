@@ -393,6 +393,29 @@ E5.0 和 E5.1 是纯重构，不改行为，适合先单独提交。
 - `--frame-fail`：`--no-contact-loads` 下 730 行与改动前一致（屏蔽计时）。默认开启时分裂前 23 行一致；分裂后残留柱承受碎块接触力，strip 应力从 fail-tick-5 起不同；塌落结果由 `single-node=20 multi-node=6 largestNodes=66` 变为 `single-node=11 multi-node=10 largestNodes=64`（持续接触不再每 tick 计入冲击伤害，碎得较少），`OK frame-fail`。已接受为新基线。
 - `--import-object`（4 MPa 自带强度，接触载荷开）：三种 agg 自重下均不破。19 个测试全部通过；旧入口 benchmark 占用数不变。
 
+**E5.4 后续：大量碎块时的分裂提交性能（2026-09-27）**
+
+现象：0.6 MPa 的 hut 自重塌成 100 多块后，每个物理 tick 要 0.8–5 s，程序卡死。关掉接触载荷时 hut 只断成 2 块，所以没有暴露；接触载荷让脱落块继续被压碎，才碎到这个规模。
+
+`--collapse-perf`（新增，报告 `docs/collapse-perf.txt`）按阶段计时，95% 以上的时间在分裂提交的重新绑定：每次提交对每个所属物体（不论是否变化）调用一次 `bindVisibleActors`，每次都重建家族全部 binding，而每个 binding 又为整个 hut 的 9028 个节点建一次哈希表并全表扫描，开销约为「物体数 × 块数 × 节点数」。
+
+修复：
+- `commitStructureSplit` 只在最后统一重新绑定一次；`commitOccupancySplit` 不再绑定，新碎块 id 由返回值给出。
+- 所属物体只有一个岛、且仍是提交前绑定的同一 actor、节点数不变时跳过：不再扫描、重建碰撞形状、清零休眠计时。原先每次提交都会把全部碎块唤醒，碎块永远睡不着。
+- `fillBindingKinematics` / `actorNodeRefs` 共用一次构建的 stable → 节点表（`nodesByStable`），每个 actor 只处理自己的节点；质量按原来的图顺序求和。`bindVisibleActors` 删去重复的一次计算。
+- 逐 actor 的分裂跟踪（控制台 + `docs/frame-split-trace.txt` 追加）改为仅在设置 `VE_SPLIT_TRACE` 时输出；此前每次提交都在正式路径里追加写这个文件。
+
+结果（塌到约 100 块）：
+
+| | 修复前 | 修复后 |
+|---|---:|---:|
+| 每 tick 总耗时 | 0.8–5.2 s | 20–64 ms；碎块休眠后 7.6 ms |
+| 其中分裂提交 | 0.8–5.2 s | 1–14 ms |
+| 醒着的碎块（300 tick 时） | 几乎全部 | 2 / 100 |
+| 300 tick 墙钟时间 | > 4 min（只跑到 144 tick） | 14 s |
+
+回归：19 个测试通过；`--e5-contact`、`--import-object` 全部 PASS。`--frame-fail --no-contact-loads` 原与 E5 前基线逐行一致，现从 tick 92 起不同：第一处差异是热启动接触点 32 → 42（未变物体不再重建碰撞形状，接触缓存得以保留），同一 tick 的应力行一致；塌落结果 `single-node=20 multi-node=6 largestNodes=66` 变为 `23 / 6 / 65`，`OK frame-fail`。默认设置下塌落结果与上一版相同（`11 / 10 / 64`）。
+
 ---
 
 ## 5. 验收

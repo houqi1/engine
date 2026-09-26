@@ -352,12 +352,17 @@ private:
   void rebuildBondMeta(StructureInstance& inst);
   void fillNodeOwners(StructureInstance& inst, const NvBlastSupportGraph& graph);
   void rebuildBindingsFromFamily(StructureInstance& inst);
-  void fillBindingKinematics(StructureInstance& inst, ActorBinding& b);
+  using NodesByStable = std::unordered_map<uint32_t, const GraphNode*>;
+  // Built once per rebind; per-actor work is then proportional to the actor's own nodes.
+  static NodesByStable nodesByStable(const StructureInstance& inst);
+  void fillBindingKinematics(StructureInstance& inst, ActorBinding& b, const NodesByStable& byStable);
   // E5.4: fold this tick's persistent contacts into each binding's smoothed pair loads.
   void updateContactLoads(StructureInstance& inst, const WorldContactImpulse* impulses, uint32_t nImpulses,
                           const BodyKinematics* kinematics, uint32_t nKinematics, uint64_t tickId, float dt);
   void applyContactLoads(StructureInstance& inst);
-  std::vector<NodeRef> actorNodeRefs(const StructureInstance& inst, const ActorBinding& b) const;
+  // Node refs of b's actor; nodesOut (optional) receives the matching graph nodes.
+  std::vector<NodeRef> actorNodeRefs(const StructureInstance& inst, const ActorBinding& b, const NodesByStable& byStable,
+                                     std::vector<const GraphNode*>* nodesOut = nullptr) const;
   bool pickContactNode(const StructureInstance& inst, const ActorBinding& b, const WorldContactImpulse& imp,
                        bool sideA, NodeRef& out) const;
   void buildLoadSnapshots(StructureInstance& inst, const WorldContactImpulse* impulses, uint32_t nImpulses,

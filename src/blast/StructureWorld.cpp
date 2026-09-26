@@ -264,11 +264,12 @@ BlastError StructureWorld::applyOccupancyRemoval(VoxelObjectId objectId, const g
     }
     rebuildBondMeta(neu);
     splitAllRequired(&neu, true);
+    const NodesByStable byStable = nodesByStable(neu);
     for (ActorBinding& b : neu.bindings) {
       b.objectId = neu.objectId;
       b.fineOrigin = org;
       b.fineN = known ? ownerFineN[cf.owner] : 0;
-      fillBindingKinematics(neu, b);
+      fillBindingKinematics(neu, b, byStable);
     }
     uint32_t worldBonds = 0;
     float mass = 0.0f;
@@ -1383,7 +1384,16 @@ const StructureDebugSnapshot& StructureWorld::debug(const StructureInstance* tar
   return instances_.front()->debug;
 }
 
-void StructureWorld::fillBindingKinematics(StructureInstance& inst, ActorBinding& b) {
+StructureWorld::NodesByStable StructureWorld::nodesByStable(const StructureInstance& inst) {
+  NodesByStable byStable;
+  byStable.reserve(inst.graph.nodes.size() * 2 + 1);
+  for (const GraphNode& n : inst.graph.nodes) {
+    byStable.emplace(n.stableId, &n);
+  }
+  return byStable;
+}
+
+void StructureWorld::fillBindingKinematics(StructureInstance& inst, ActorBinding& b, const NodesByStable& byStable) {
   b.nodeRefs.clear();
   b.nodeRefIndex.clear();
   if (b.actor == nullptr) {
@@ -1397,36 +1407,27 @@ void StructureWorld::fillBindingKinematics(StructureInstance& inst, ActorBinding
   b.graphNodeCount = NvBlastActorGetGraphNodeCount(b.actor, blastLog);
   b.anchored = NvBlastActorHasExternalBonds(b.actor, blastLog);
   b.stressSolve = b.graphNodeCount > 1;
-  b.nodeRefs = actorNodeRefs(inst, b);
+  std::vector<const GraphNode*> mine;
+  b.nodeRefs = actorNodeRefs(inst, b, byStable, &mine);
   b.nodeRefIndex.reserve(b.nodeRefs.size() * 2 + 1);
   for (uint32_t i = 0; i < b.nodeRefs.size(); ++i) {
     b.nodeRefIndex.emplace(b.nodeRefs[i].graphNode, i);
   }
+  // Sum in graph order (nodes live in one vector), matching the full-graph scan this replaced.
+  std::sort(mine.begin(), mine.end());
   float mass = 0.0f;
   glm::vec3 com(0.0f);
-  std::vector<uint8_t> mine;
-  if (inst.blast.asset != nullptr) {
-    const NvBlastSupportGraph g = NvBlastAssetGetSupportGraph(inst.blast.asset, blastLog);
-    mine.assign(g.nodeCount, 0);
-    for (const NodeRef& r : b.nodeRefs) {
-      if (r.graphNode < g.nodeCount) {
-        mine[r.graphNode] = 1;
-      }
-    }
-  }
-  for (const GraphNode& n : inst.graph.nodes) {
-    const auto it = inst.blast.graphFromStable.find(n.stableId);
-    if (it == inst.blast.graphFromStable.end() || it->second >= mine.size() || mine[it->second] == 0) {
-      continue;
-    }
-    mass += n.mass;
-    com += n.mass * glm::vec3(n.cx, n.cy, n.cz);
+  for (const GraphNode* n : mine) {
+    mass += n->mass;
+    com += n->mass * glm::vec3(n->cx, n->cy, n->cz);
   }
   b.mass = mass;
   b.comAsset = mass > 1e-8f ? com / mass : glm::vec3(0.0f);
 }
 
-std::vector<NodeRef> StructureWorld::actorNodeRefs(const StructureInstance& inst, const ActorBinding& b) const {
+std::vector<NodeRef> StructureWorld::actorNodeRefs(const StructureInstance& inst, const ActorBinding& b,
+                                                   const NodesByStable& byStable,
+                                                   std::vector<const GraphNode*>* nodesOut) const {
   std::vector<NodeRef> refs;
   if (b.actor == nullptr || inst.blast.asset == nullptr) {
     return refs;
@@ -1439,12 +1440,10 @@ std::vector<NodeRef> StructureWorld::actorNodeRefs(const StructureInstance& inst
   NvBlastActorGetGraphNodeIndices(idx.data(), nn, b.actor, blastLog);
   const NvBlastSupportGraph g = NvBlastAssetGetSupportGraph(inst.blast.asset, blastLog);
   const NvBlastChunk* chunks = NvBlastAssetGetChunks(inst.blast.asset, blastLog);
-  std::unordered_map<uint32_t, const GraphNode*> byStable;
-  byStable.reserve(inst.graph.nodes.size() * 2 + 1);
-  for (const GraphNode& n : inst.graph.nodes) {
-    byStable.emplace(n.stableId, &n);
-  }
   refs.reserve(nn);
+  if (nodesOut != nullptr) {
+    nodesOut->reserve(nn);
+  }
   for (uint32_t i = 0; i < nn; ++i) {
     const uint32_t gn = idx[i];
     if (gn >= g.nodeCount || g.chunkIndices[gn] == UINT32_MAX) {
@@ -1459,6 +1458,9 @@ std::vector<NodeRef> StructureWorld::actorNodeRefs(const StructureInstance& inst
     r.graphNode = gn;
     r.center = glm::vec3(it->second->cx, it->second->cy, it->second->cz);
     refs.push_back(r);
+    if (nodesOut != nullptr) {
+      nodesOut->push_back(it->second);
+    }
   }
   return refs;
 }
@@ -1481,6 +1483,7 @@ void StructureWorld::rebuildBindingsFromFamily(StructureInstance& inst) {
   }
   NvBlastFamilyGetActors(inst.actorScratch.data(), nA, inst.blast.family, blastLog);
   inst.bindings.reserve(nA);
+  const NodesByStable byStable = nodesByStable(inst);
   for (uint32_t i = 0; i < nA; ++i) {
     NvBlastActor* a = inst.actorScratch[i];
     if (a == nullptr) {
@@ -1500,7 +1503,7 @@ void StructureWorld::rebuildBindingsFromFamily(StructureInstance& inst) {
       // Same actor, same graph nodes: its held contact loads stay valid.
       b.contactLoads = std::move(it->second.contactLoads);
     }
-    fillBindingKinematics(inst, b);
+    fillBindingKinematics(inst, b, byStable);
     inst.bindings.push_back(std::move(b));
   }
 }
@@ -1528,7 +1531,7 @@ void StructureWorld::bindVisibleActors(const std::vector<ActorObjectLink>& links
     b.objectId = found->objectId;
     b.fineOrigin = found->fineOrigin;
     b.fineN = found->fineN;
-    fillBindingKinematics(*inst, b);
+    // Kinematics depend only on the actor, filled by rebuildBindingsFromFamily above.
   }
   inst->debug.bindingCount = static_cast<uint32_t>(inst->bindings.size());
   inst->loadSnapshots.clear();
