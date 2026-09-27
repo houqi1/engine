@@ -292,6 +292,9 @@ public:
   bool spawnBeamOnPiers(GfxDevice& gfx, bool anchoredReference, float dropHeight = 0.01f);
   // Cuts the top half of the beam at mid-span, as digging would (structure rebuild).
   bool notchDemoBeam(GfxDevice& gfx);
+  // Removes the picked fines (object-local fine coords) like the dig brush does, queuing
+  // the structure rebuild for mounted objects. Returns the number removed.
+  uint32_t carveFines(GfxDevice& gfx, VoxelObjectId id, const std::function<bool(int, int, int)>& pick);
   // A dynamic 0.4 m cube (not a structure) dropped on a four-column roof beam, and its removal.
   bool dropWeightOnRoof(GfxDevice& gfx, float density);
   void removeDemoWeight(GfxDevice& gfx);

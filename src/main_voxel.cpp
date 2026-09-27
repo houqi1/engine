@@ -53,7 +53,10 @@ struct Options {
   bool importObject = false;
   bool e5Contact = false;
   bool collapsePerf = false;
+  bool digConverge = false;
+  bool warmRebuild = true;
   bool contactLoads = true;
+  float solveBudgetMs = -1.0f;  // < 0: keep the scene default
   int collisionPerf = 0;  // >0: spawn N scatter boxes and time physics stages
   float frameHeightMeters = 4.0f;
   std::string frameImpactMode = "shear";
@@ -98,8 +101,14 @@ Options parseOptions(int argc, char** argv) {
       options.benchmark = true;
     } else if (arg == "--e2-perf") {
       options.e2Perf = true;
+    } else if (arg == "--solve-budget") {
+      options.solveBudgetMs = static_cast<float>(integer(0, 1000));
     } else if (arg == "--no-contact-loads") {
       options.contactLoads = false;
+    } else if (arg == "--dig-converge") {
+      options.digConverge = true;
+    } else if (arg == "--no-warm-rebuild") {
+      options.warmRebuild = false;
     } else if (arg == "--collapse-perf") {
       options.collapsePerf = true;
     } else if (arg == "--e5-contact") {
@@ -175,7 +184,7 @@ Options parseOptions(int argc, char** argv) {
   if (options.benchmark && options.e2Perf) {
     throw std::runtime_error("Use either --benchmark or --e2-perf, not both");
   }
-  if (argc > 1 && !options.benchmark && !options.e2Perf && !options.frameFail && !options.importObject && !options.e5Contact && !options.collapsePerf && options.collisionPerf == 0 &&
+  if (argc > 1 && !options.benchmark && !options.e2Perf && !options.frameFail && !options.importObject && !options.e5Contact && !options.collapsePerf && !options.digConverge && options.collisionPerf == 0 &&
       !options.help) {
     throw std::runtime_error("Rendering options require --benchmark; use --help for usage");
   }
@@ -1159,6 +1168,73 @@ void runE5Contact(GfxDevice& gfx, VoxelScene& scene, PerfLog& out) {
   out.line(ok ? "OK e5-contact" : "FAIL e5-contact");
 }
 
+// Dig a block out of the pre-solved hut (fracture off) and time how the rebuilt solver
+// re-converges under the per-tick budget; run with and without --no-warm-rebuild.
+void runDigConverge(GfxDevice& gfx, VoxelScene& scene, PerfLog& out) {
+  MeshVoxelizeConfig config;
+  config.gridN = 64;
+  config.padding = 1;
+  config.sampleColor = false;
+  scene.importAsObject() = true;
+  scene.importMount() = true;
+  scene.importAgg() = 0;
+  scene.importStrengthMPa() = 4.0f;
+  scene.structures().setFractureEnabled(false);
+  if (!scene.importMeshAsObject(gfx, scene.importPath(), config)) {
+    throw std::runtime_error("importMeshAsObject failed: " + scene.importStatus());
+  }
+  out.line(std::string("warmRebuild=") + (scene.structures().warmRebuild() ? "on" : "off") +
+           " budget=" + std::to_string(scene.structures().solveBudgetMs()) + " ms");
+  out.line(scene.importStatus());
+  for (int i = 0; i < 30; ++i) {
+    scene.update(physics::kDt);
+  }
+  const VoxelObjectId id = scene.importedObjectId();
+  const blast::StructureInstance* before = scene.structures().find(id);
+  if (before == nullptr) {
+    throw std::runtime_error("import not mounted");
+  }
+  char line[400];
+  std::snprintf(line, sizeof(line), "before dig: conv=%d maxC=%.4g maxT=%.4g maxS=%.4g", before->debug.converged ? 1 : 0,
+                before->debug.maxCompression, before->debug.maxTension, before->debug.maxShear);
+  out.line(line);
+  // 0.8 x 0.8 m slice through the whole depth at 2.0-2.8 m, x 4.0-4.8 m of the object grid.
+  const uint32_t removed =
+      scene.carveFines(gfx, id, [](int x, int y, int /*z*/) { return x >= 40 && x < 48 && y >= 20 && y < 28; });
+  out.line("dig removed " + std::to_string(removed) + " fines");
+  int firstConverged = -1;
+  const auto wall0 = std::chrono::steady_clock::now();
+  for (int t = 1; t <= 1200; ++t) {
+    scene.update(physics::kDt);
+    scene.commitStructureSplits(gfx);
+    const blast::StructureInstance* inst = scene.structures().find(id);
+    if (inst == nullptr) {
+      out.line("instance gone at tick " + std::to_string(t));
+      break;
+    }
+    const auto& d = inst->debug;
+    if (firstConverged < 0 && d.converged) {
+      firstConverged = t;
+    }
+    if (t == 1 || t == 15 || t == 30 || t == 60 || t == 120 || t == 240 || t == 480 || t == 960 || t == 1200 ||
+        t == firstConverged) {
+      std::snprintf(line, sizeof(line),
+                    "t=%4d conv=%d linErr=%.3g angErr=%.3g maxC=%.4g maxT=%.4g maxS=%.4g iters=%u solveMs=%.2f "
+                    "seeded=%u/%u nodes=%u",
+                    t, d.converged ? 1 : 0, d.linErr, d.angErr, d.maxCompression, d.maxTension, d.maxShear,
+                    d.solverIters, d.solveMs, d.seededBonds, d.seedableBonds, d.nodes);
+      out.line(line);
+    }
+    if (firstConverged > 0 && t > firstConverged + 60 && t >= 120) {
+      break;
+    }
+  }
+  std::snprintf(line, sizeof(line), "first converged at tick %d (%.2f s sim), wall %.1f s", firstConverged,
+                firstConverged / 60.0f,
+                std::chrono::duration<float>(std::chrono::steady_clock::now() - wall0).count());
+  out.line(line);
+}
+
 // Collapse the hut under its own weight (0.6 MPa, fracture on, UI settings per tick) and
 // time every stage while it breaks into many pieces.
 void runCollapsePerf(GfxDevice& gfx, VoxelScene& scene, PerfLog& out) {
@@ -1309,7 +1385,10 @@ int main(int argc, char** argv) {
                    "  --import-object  E5.5: import the hut as a mounted object at agg 2/4/auto, report\n"
                    "  --e5-contact     E5.4: contact loads (beam on piers, notch, weight on roof), report\n"
                    "  --no-contact-loads   Pre-E5.4 loads (with --frame-fail etc.)\n"
+                   "  --solve-budget MS    Stress solve ms per tick for all structures (0 = no limit, default 8)\n"
                    "  --collapse-perf  Hut at 0.6 MPa collapses; per-stage tick timing (<= 300 ticks / 240 s)\n"
+                   "  --dig-converge   Dig the pre-solved hut; ticks for the rebuilt solver to re-converge\n"
+                   "  --no-warm-rebuild    Rebuilt solvers start from zero (compare with --dig-converge)\n"
                    "  --frame-height M Column height for --frame-fail (1.0-9.2 m, default 4.0)\n"
                    "  --frame-impact MODE  shear (Viewer default), spread, or stress\n"
                    "  --frame-render-hz N  Frame test cadence (30-240, default 60)\n"
@@ -1350,7 +1429,7 @@ int main(int argc, char** argv) {
         SetWindowPos(hwnd, HWND_NOTOPMOST, 160, 160, 0, 0, SWP_SHOWWINDOW | SWP_NOSIZE);
       }
     }
-    if (options.e2Perf || options.frameFail || options.importObject || options.e5Contact || options.collapsePerf || options.collisionPerf > 0) {
+    if (options.e2Perf || options.frameFail || options.importObject || options.e5Contact || options.collapsePerf || options.digConverge || options.collisionPerf > 0) {
       if (AttachConsole(ATTACH_PARENT_PROCESS) || AllocConsole()) {
         FILE* fp = nullptr;
         freopen_s(&fp, "CONOUT$", "w", stdout);
@@ -1363,9 +1442,35 @@ int main(int argc, char** argv) {
     VoxelScene scene;
     scene.init(gfx, blastRt);
     scene.structures().setContactLoadsEnabled(options.contactLoads);
+    scene.structures().setWarmRebuild(options.warmRebuild);
+    if (options.solveBudgetMs >= 0.0f) {
+      scene.structures().setSolveBudgetMs(options.solveBudgetMs);
+    }
 
     if (options.collisionPerf > 0) {
       runCollisionPerf(gfx, scene, options.collisionPerf);
+      gfx.waitIdle();
+      scene.cleanup(gfx);
+      blastRt.shutdown();
+      return 0;
+    }
+
+    if (options.digConverge) {
+      const std::filesystem::path reportPath =
+          std::filesystem::path(VE_ASSETS_DIR).parent_path() / "docs" /
+          (options.warmRebuild ? "dig-converge.txt" : "dig-converge-cold.txt");
+      PerfLog log(reportPath);
+      if (log.f == nullptr) {
+        throw std::runtime_error("Cannot open " + reportPath.string());
+      }
+      try {
+        runDigConverge(gfx, scene, log);
+      } catch (const std::exception& ex) {
+        log.line(std::string("ERROR: ") + ex.what());
+        gfx.waitIdle();
+        scene.cleanup(gfx);
+        throw;
+      }
       gfx.waitIdle();
       scene.cleanup(gfx);
       blastRt.shutdown();

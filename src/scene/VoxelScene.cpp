@@ -295,6 +295,8 @@ void VoxelScene::init(GfxDevice& gfx, blast::BlastRuntime& runtime) {
     throw std::runtime_error("StructureWorld init failed: Blast runtime is not initialized");
   }
   structures_.setContactLoadsEnabled(true);  // E5.4; headless StructureWorld tests keep it off
+  structures_.setSolveBudgetMs(8.0f);        // large graphs converge over more ticks, not one slow frame
+  structures_.setWarmRebuild(true);          // digging re-converges from the previous solve
   bindStructureTicks(gfx);
 
   const std::string pirateObj =
@@ -2814,27 +2816,42 @@ bool VoxelScene::notchDemoBeam(GfxDevice& gfx) {
   if (o == nullptr || o->gridSize != kBeamGrid || !structures_.ownsObject(stressCylinderId_)) {
     return false;
   }
+  return carveFines(gfx, stressCylinderId_,
+                    [](int x, int y, int z) { return y == 1 && x >= 31 && x < 33 && z >= 30 && z < 34; }) > 0;
+}
+
+uint32_t VoxelScene::carveFines(GfxDevice& gfx, VoxelObjectId id, const std::function<bool(int, int, int)>& pick) {
+  VoxelObject* o = tryGetObject(id);
+  if (o == nullptr) {
+    return 0;
+  }
   std::vector<voxel::FineCoord> removed;
-  for (int z = 30; z < 34; ++z) {
-    for (int x = 31; x < 33; ++x) {
-      glm::ivec3 c, m, f;
-      splitFineIndex(x, 1, z, c, m, f);
-      if (setFineCpu(*o, c, m, f, false)) {
-        removed.push_back(voxel::FineCoord{x, 1, z});
+  const int n = o->gridSize * kFinePerCoarse;
+  for (int z = 0; z < n; ++z) {
+    for (int y = 0; y < n; ++y) {
+      for (int x = 0; x < n; ++x) {
+        if (!pick(x, y, z)) {
+          continue;
+        }
+        glm::ivec3 c, m, f;
+        splitFineIndex(x, y, z, c, m, f);
+        if (setFineCpu(*o, c, m, f, false)) {
+          removed.push_back(voxel::FineCoord{x, y, z});
+        }
       }
     }
   }
   if (removed.empty()) {
-    return false;
+    return 0;
   }
-  const int slot = static_cast<int>(stressCylinderId_.slot);
+  const int slot = static_cast<int>(id.slot);
   o->topologyRevision += 1;
   recountOccupiedMicro();
   recountOccupiedFine();
   flushObject(gfx, slot);
   notifyOccupancyChanged(slot);
-  queueStructureRemoval(stressCylinderId_, removed);
-  return true;
+  queueStructureRemoval(id, removed);
+  return static_cast<uint32_t>(removed.size());
 }
 
 bool VoxelScene::dropWeightOnRoof(GfxDevice& gfx, float density) {
@@ -3375,7 +3392,15 @@ bool VoxelScene::importMeshAsObject(GfxDevice& gfx, const std::string& path, con
                        std::to_string(inst->graph.bonds.size()) + " bonds, extract " +
                        std::to_string(static_cast<int>(inst->debug.extractMs)) + " ms; " + structureMountStatus_;
       lastStressPaintSolveEpoch_ = 0;
-      structures_.warmupGravity(8u, inst);
+      // Converge now, while the import is already blocking, so the scene does not start
+      // with seconds of partially solved (too stiff) stress.
+      const auto tw0 = std::chrono::steady_clock::now();
+      const uint32_t passes = structures_.warmupGravity(600u, inst);
+      char warm[128];
+      std::snprintf(warm, sizeof(warm), "\nPre-solve: %u passes, %.1f s, %s", passes,
+                    std::chrono::duration<float>(std::chrono::steady_clock::now() - tw0).count(),
+                    inst->debug.converged ? "converged" : "NOT converged (continues in play)");
+      importStatus_ += warm;
       if (stressCylinderDisplay_) {
         paintCylinderStress(gfx);
       } else if (anchorDisplay_) {

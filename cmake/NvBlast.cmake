@@ -154,6 +154,44 @@ endfunction()
 
 ve_apply_p3_extstress()
 
+function(ve_apply_p4_extstress)
+  set(_py "${CMAKE_SOURCE_DIR}/third_party/nvblast/patches/apply_p4_extstress.py")
+  set(_h "${VE_BLAST_ROOT}/include/extensions/stress/NvBlastExtStressSolver.h")
+  file(READ "${_h}" _hc)
+  if(_hc MATCHES "VE_P4_EXTSTRESS")
+    return()
+  endif()
+  if(NOT Python3_EXECUTABLE)
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(NOT Python3_Interpreter_FOUND)
+      find_program(Python3_EXECUTABLE NAMES python python3 py)
+    endif()
+  endif()
+  if(NOT Python3_EXECUTABLE)
+    message(FATAL_ERROR "Python is required to apply P4 NvBlast ExtStress adapters")
+  endif()
+  execute_process(
+    COMMAND "${Python3_EXECUTABLE}" "${_py}" "${VE_BLAST_ROOT}"
+    RESULT_VARIABLE _ok
+    OUTPUT_VARIABLE _out
+    ERROR_VARIABLE _err
+  )
+  if(NOT _ok EQUAL 0)
+    execute_process(
+      COMMAND py -3 "${_py}" "${VE_BLAST_ROOT}"
+      RESULT_VARIABLE _ok
+      OUTPUT_VARIABLE _out
+      ERROR_VARIABLE _err
+    )
+  endif()
+  if(NOT _ok EQUAL 0)
+    message(FATAL_ERROR "P4 ExtStress patch failed: ${_out} ${_err}")
+  endif()
+  message(STATUS "Applied P4 ExtStress warm-start impulses")
+endfunction()
+
+ve_apply_p4_extstress()
+
 set(VE_NVBLAST_LL_SOURCES
   "${VE_BLAST_ROOT}/source/sdk/common/NvBlastAssert.cpp"
   "${VE_BLAST_ROOT}/source/sdk/common/NvBlastAtomic.cpp"

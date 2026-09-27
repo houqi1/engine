@@ -1,0 +1,14 @@
+warmRebuild=on budget=8.000000 ms
+Imported as object  grid=6  fines=39564  size=8.90x8.20x8.70 m  resample 262 ms
+Mounted: 9028 nodes, 19378 bonds, extract 63 ms; ground anchors: 89 fines, 89 faces
+Pre-solve: 194 passes, 10.5 s, converged
+before dig: conv=1 maxC=2.443e+06 maxT=1.522e+06 maxS=8.903e+05
+dig removed 159 fines
+t=   1 conv=0 linErr=3.73e+04 angErr=4.94e+04 maxC=2.326e+06 maxT=1.521e+06 maxS=8.903e+05 iters=23 solveMs=17.33 seeded=19254/19298 nodes=8996
+t=  15 conv=0 linErr=155 angErr=163 maxC=2.329e+06 maxT=1.462e+06 maxS=8.878e+05 iters=28 solveMs=10.09 seeded=19254/19298 nodes=8996
+t=  30 conv=0 linErr=90.1 angErr=109 maxC=2.33e+06 maxT=1.467e+06 maxS=8.856e+05 iters=23 solveMs=8.71 seeded=19254/19298 nodes=8996
+t=  60 conv=0 linErr=164 angErr=183 maxC=2.331e+06 maxT=1.473e+06 maxS=8.85e+05 iters=27 solveMs=6.43 seeded=19254/19298 nodes=8996
+t= 120 conv=0 linErr=39.8 angErr=45.4 maxC=2.336e+06 maxT=1.487e+06 maxS=8.86e+05 iters=33 solveMs=8.00 seeded=19254/19298 nodes=8996
+t= 240 conv=0 linErr=38.4 angErr=45.3 maxC=2.343e+06 maxT=1.502e+06 maxS=8.9e+05 iters=36 solveMs=7.52 seeded=19254/19298 nodes=8996
+t= 254 conv=1 linErr=6.98 angErr=7.07 maxC=2.344e+06 maxT=1.503e+06 maxS=8.903e+05 iters=26 solveMs=1.61 seeded=19254/19298 nodes=8996
+first converged at tick 254 (4.23 s sim), wall 2.5 s

@@ -5,7 +5,7 @@ free t=2s conv=1 maxT=9.581e+04 maxC=9.47e+04 maxS=1.124e+04 S=1.2e+05 pairs=1 h
 free t=3s conv=1 maxT=9.581e+04 maxC=9.47e+04 maxS=1.124e+04 S=1.2e+05 pairs=1 held=1 nodes=8 |F|=1994.2 N awake=0 actors=1 fractured=0 solveMs=0.00
 free t=4s conv=1 maxT=9.581e+04 maxC=9.47e+04 maxS=1.124e+04 S=1.2e+05 pairs=1 held=1 nodes=8 |F|=1994.2 N awake=0 actors=1 fractured=0 solveMs=0.00
 free t=5s conv=1 maxT=9.581e+04 maxC=9.47e+04 maxS=1.124e+04 S=1.2e+05 pairs=1 held=1 nodes=8 |F|=1994.2 N awake=0 actors=1 fractured=0 solveMs=0.00
-free t=6s conv=1 maxT=9.581e+04 maxC=9.47e+04 maxS=1.124e+04 S=1.2e+05 pairs=1 held=1 nodes=8 |F|=1994.2 N awake=0 actors=1 fractured=0 solveMs=0.00
+free t=6s conv=1 maxT=9.581e+04 maxC=9.47e+04 maxS=1.124e+04 S=1.2e+05 pairs=1 held=1 nodes=8 |F|=1994.2 N awake=0 actors=1 fractured=0 solveMs=0.01
 free t=7s conv=1 maxT=9.581e+04 maxC=9.47e+04 maxS=1.124e+04 S=1.2e+05 pairs=1 held=1 nodes=8 |F|=1994.2 N awake=0 actors=1 fractured=0 solveMs=0.00
 free t=8s conv=1 maxT=9.581e+04 maxC=9.47e+04 maxS=1.124e+04 S=1.2e+05 pairs=1 held=1 nodes=8 |F|=1994.2 N awake=0 actors=1 fractured=0 solveMs=0.00
 free t=9s conv=1 maxT=9.581e+04 maxC=9.47e+04 maxS=1.124e+04 S=1.2e+05 pairs=1 held=1 nodes=8 |F|=1994.2 N awake=0 actors=1 fractured=0 solveMs=0.00
@@ -24,20 +24,20 @@ notched +4s conv=1 maxT=1.345e+04 maxC=1.284e+04 maxS=1.138e+04 S=1.2e+05 pairs=
   PASS T06b notched beam breaks under contact loads
 == T06c notch the resting beam, UI settings per tick, contact loads off, impact damage off ==
 intact +3s conv=1 maxT=4.177e-15 maxC=3.402e-15 maxS=2.248e-15 S=1.2e+05 pairs=0 held=0 nodes=0 |F|=0.0 N awake=0 actors=1 fractured=0 solveMs=0.00
-notched +4s conv=1 maxT=1.799e-15 maxC=1.826e-15 maxS=8.707e-17 S=1.2e+05 pairs=0 held=0 nodes=0 |F|=0.0 N awake=0 actors=1 fractured=0 solveMs=0.00
+notched +4s conv=1 maxT=4.286e-15 maxC=3.875e-15 maxS=2.267e-15 S=1.2e+05 pairs=0 held=0 nodes=0 |F|=0.0 N awake=0 actors=1 fractured=0 solveMs=0.00
   pieces (nodes @ centre x, m): 40@-0.00
   PASS T06c intact beam holds at its own strength
   PASS T06c without contact loads the notched beam does not break
 == T06d notch the resting beam, UI settings per tick, contact loads off, impact damage on ==
 intact +3s conv=1 maxT=4.177e-15 maxC=3.402e-15 maxS=2.248e-15 S=1.2e+05 pairs=0 held=0 nodes=0 |F|=0.0 N awake=0 actors=1 fractured=0 solveMs=0.00
-notched +4s conv=1 maxT=1.799e-15 maxC=1.826e-15 maxS=8.707e-17 S=1.2e+05 pairs=0 held=0 nodes=0 |F|=0.0 N awake=0 actors=1 fractured=0 solveMs=0.00
+notched +4s conv=1 maxT=4.286e-15 maxC=3.875e-15 maxS=2.267e-15 S=1.2e+05 pairs=0 held=0 nodes=0 |F|=0.0 N awake=0 actors=1 fractured=0 solveMs=0.00
   pieces (nodes @ centre x, m): 40@-0.00
 == T07 weight on the four-column roof (fracture off) ==
-roof only conv=1 maxT=1.302e+04 maxC=6.93e+04 maxS=1.493e+04 S=5e+07 pairs=0 held=0 nodes=0 |F|=0.0 N awake=0 actors=1 fractured=0 solveMs=0.01
-weight 512 kg (W=5023 N) conv=1 maxT=2.549e+04 maxC=8.703e+04 maxS=2.346e+04 S=5e+07 pairs=1 held=1 nodes=4 |F|=5247.4 N awake=0 actors=1 fractured=0 solveMs=0.01
-weight 2048 kg (W=20091 N) conv=1 maxT=9.98e+04 maxC=1.841e+05 maxS=9.783e+04 S=5e+07 pairs=1 held=1 nodes=4 |F|=20989.4 N awake=0 actors=1 fractured=0 solveMs=0.01
-weight 8192 kg (W=80364 N) conv=1 maxT=3.988e+05 maxC=5.749e+05 maxS=3.956e+05 S=5e+07 pairs=1 held=1 nodes=4 |F|=83957.8 N awake=0 actors=1 fractured=0 solveMs=0.01
-weight removed conv=1 maxT=1.357e+04 maxC=7.095e+04 maxS=1.507e+04 S=5e+07 pairs=0 held=0 nodes=0 |F|=0.0 N awake=0 actors=1 fractured=0 solveMs=0.01
+roof only conv=1 maxT=1.302e+04 maxC=6.93e+04 maxS=1.493e+04 S=5e+07 pairs=0 held=0 nodes=0 |F|=0.0 N awake=0 actors=1 fractured=0 solveMs=0.03
+weight 512 kg (W=5023 N) conv=1 maxT=2.549e+04 maxC=8.703e+04 maxS=2.346e+04 S=5e+07 pairs=1 held=1 nodes=4 |F|=5247.4 N awake=0 actors=1 fractured=0 solveMs=0.02
+weight 2048 kg (W=20091 N) conv=1 maxT=9.98e+04 maxC=1.841e+05 maxS=9.783e+04 S=5e+07 pairs=1 held=1 nodes=4 |F|=20989.4 N awake=0 actors=1 fractured=0 solveMs=0.02
+weight 8192 kg (W=80364 N) conv=1 maxT=3.988e+05 maxC=5.749e+05 maxS=3.956e+05 S=5e+07 pairs=1 held=1 nodes=4 |F|=83957.8 N awake=0 actors=1 fractured=0 solveMs=0.02
+weight removed conv=1 maxT=1.357e+04 maxC=7.095e+04 maxS=1.507e+04 S=5e+07 pairs=0 held=0 nodes=0 |F|=0.0 N awake=0 actors=1 fractured=0 solveMs=0.06
   PASS T07 column compression rises with the weight
   PASS T07 compression returns to the roof-only value
 == T08 persistent contacts to addLoad=15916, skipped by the impact route=16216 ==

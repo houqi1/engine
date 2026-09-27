@@ -423,6 +423,29 @@ E5.0 和 E5.1 是纯重构，不改行为，适合先单独提交。
 - 导入面板「Import Strength」改为「Own Strength」，拖动即时生效：`StructureWorld::setOwnStrengthPa` 作用于所有自带强度的结构（导入物体、它的全部碎块，含挖洞重建出的独立实例，以及 E5.4 梁），同时是下次导入的强度。
 - 验证：19 个测试、`--e5-contact` 通过；交互程序启动正常。面板显示未做截图核对，待用户确认。
 
+**E5.4 后续：大结构求解限时、导入预收敛、挖洞热启动（2026-09-27，用户选方案 C）**
+
+问题：hut（agg 2，9028 节点 / 19378 键）每次冷启动要约 240 次更新才收敛，每次 40–45 ms。导入后、每次挖洞后都有数秒约 20 FPS，期间应力偏低（结构过于「结实」）。
+
+- 每 tick 限时（`setSolveBudgetMs`，场景默认 8 ms，所有实例分摊）：在未收敛的 tick 上测每次迭代耗时，迭代上限 = 预算 ÷ 单次耗时，收敛时也保持该上限；(重)建后的第一次求解含图同步开销，不计入。小结构的上限仍是材料设定（200），`--frame-fail` 开 / 关限时逐行一致。`--solve-budget MS` 用于对比。
+- 导入预收敛：挂载后 `warmupGravity(600)` 迭代到收敛，状态栏显示用时。hut：194 次、约 9–10 s（导入时一次性阻塞），之后运行中每 tick 求解 < 1 ms。
+- 挖洞热启动：Blast 补丁 P4（`third_party/nvblast/patches/apply_p4_extstress.py`，`VE_P4_EXTSTRESS`）增加 `copyBondImpulses` / `seedBondImpulses`：导出每个求解器键的冲量与端点，注入在下次 `update` 图同步后按 Blast 键下标写回（端点顺序相反则取负），该次热启动。引擎在 `applyOccupancyRemoval` 重建前按稳定键 / 节点 id 导出（`exportStableImpulses`），新实例建好后映射注入（`seedStableImpulses`）；预算迭代数与单次耗时也随重建继承。`setWarmRebuild`（库默认关，场景默认开），`--no-warm-rebuild` 用于对比。
+
+验收（`--dig-converge`：预收敛的 hut 在 2.0–2.8 m 高处挖掉 0.8 × 0.8 m 贯通截面，159 fine，断裂关，8 ms 预算）：
+
+| | 热启动 | 冷启动 |
+|---|---:|---:|
+| 继承的键 | 19254 / 19298（99.8%） | 0 |
+| 第 1 tick 最大压应力 | 2.33 MPa | 0.015 MPa |
+| 第 120 tick（2 s） | 2.33 MPa | 0.56 MPa |
+| 满足收敛判据 | 3.9–4.2 s | 20 s 内未满足（2.12 MPa） |
+| 第 1 tick 求解耗时 | 17–19 ms（含图同步） | 21–26 ms |
+
+- 热启动下应力从第 1 tick 起与最终值相差 < 0.5%；判据要数秒才满足是因为每 tick 迭代受限。挖之前为 2.44 MPa。
+- 不限时的一次对比中，热启动与冷启动收敛后的最大压应力为 2.35 与 2.23 MPa：Blast 收敛容差下冷启动自下而上、热启动自上而下停止，真实值在两者之间。
+- 代价：大结构每 tick 迭代数取决于实测耗时，结果在不同运行 / 机器间不逐位可复现（两次挖洞测试收敛于第 231 与 254 tick）；小结构不受影响。0.6 MPa hut 自重塌落由约 2–3 s 推迟到约 4 s。`--collapse-perf`：塌落前每 tick 约 9 ms，塌落后 25–38 ms。
+- 回归：19 个测试通过；`--frame-fail` 默认 / `--no-warm-rebuild` / `--solve-budget 0` 三者逐行一致；`--e5-contact`、`--import-object` 通过。
+
 ---
 
 ## 5. 验收

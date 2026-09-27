@@ -69,6 +69,9 @@ struct StructureDebugSnapshot {
   uint32_t persistentContacts = 0; // persistent impulses routed to addLoad
   uint32_t impactSkippedPersistent = 0;
   float contactForceN = 0.0f;      // sum of |F| applied
+  // Bonds whose solved impulses were carried from the previous solver on the last rebuild.
+  uint32_t seededBonds = 0;
+  uint32_t seedableBonds = 0;
   bool stressImpactImpulses = false;
   float stressImpactScale = 0.01f;
   uint32_t gravityActors = 0;
@@ -233,6 +236,10 @@ struct StructureInstance {
   uint32_t lastBoundTopologyEpoch = 0xFFFFFFFFu;
   ImpulseEvents impactEvents{};
   bool impactAppliedThisTick = false;
+  // Solver iterations for the next tick under the solve time budget (0 = material.solverIters).
+  uint32_t tickIters = 0;
+  float msPerIter = 0.0f;  // measured solve cost per iteration (0 = not measured yet)
+  uint32_t budgetSolves = 0;  // solves seen by adaptSolverIters since this solver was built
   bool occupancyDirty = false;
 };
 
@@ -292,6 +299,14 @@ public:
   // E5.4: persistent contacts load the stress solver (addLoad); one-shot impacts keep
   // the Viewer route. Off keeps the pre-E5.4 behavior.
   void setContactLoadsEnabled(bool on) { contactLoadsEnabled_ = on; }
+  // Stress solve time per physics tick, shared by all instances. Large graphs then take
+  // more ticks to converge instead of stalling the frame. <= 0 disables the limit.
+  void setSolveBudgetMs(float ms) { solveBudgetMs_ = ms; }
+  float solveBudgetMs() const { return solveBudgetMs_; }
+  // Digging rebuilds the asset; on, the new solver starts from the old solve (by stable bond
+  // id) instead of zero, so it re-converges in a few ticks.
+  void setWarmRebuild(bool on) { warmRebuild_ = on; }
+  bool warmRebuild() const { return warmRebuild_; }
   bool contactLoadsEnabled() const { return contactLoadsEnabled_; }
   // SampleAssetViewer: pass impact to stress instead of the damage shader.
   // addForce(contact, ViewerForce * 0.01). Default off.
@@ -362,6 +377,18 @@ private:
   void updateContactLoads(StructureInstance& inst, const WorldContactImpulse* impulses, uint32_t nImpulses,
                           const BodyKinematics* kinematics, uint32_t nKinematics, uint64_t tickId, float dt);
   void applyContactLoads(StructureInstance& inst);
+  void adaptSolverIters(StructureInstance& inst, float solveMs);
+  // Solved bond impulses keyed by stable bond / node ids, to survive an asset rebuild.
+  struct CarriedImpulse {
+    uint32_t stableBond = 0;
+    uint32_t stableNode0 = 0;  // kWorldStable for the world node
+    uint32_t stableNode1 = 0;
+    NvcVec3 linear{};
+    NvcVec3 angular{};
+  };
+  static constexpr uint32_t kWorldStable = 0xFFFFFFFFu;
+  std::vector<CarriedImpulse> exportStableImpulses(const StructureInstance& inst) const;
+  void seedStableImpulses(StructureInstance& inst, const std::vector<CarriedImpulse>& carried) const;
   // Node refs of b's actor; nodesOut (optional) receives the matching graph nodes.
   std::vector<NodeRef> actorNodeRefs(const StructureInstance& inst, const ActorBinding& b, const NodesByStable& byStable,
                                      std::vector<const GraphNode*>* nodesOut = nullptr) const;
@@ -392,6 +419,8 @@ private:
   bool stressImpactImpulses_ = false;
   bool contactLoadsEnabled_ = false;
   float contactLoadTau_ = 0.1f;  // s, smoothing of solver contact impulses
+  float solveBudgetMs_ = 0.0f;
+  bool warmRebuild_ = false;
   float stressImpactScale_ = 0.01f;
   bool impactDamageEnabled_ = true;
   ImpactSettings impactSettings_{};

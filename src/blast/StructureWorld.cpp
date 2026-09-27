@@ -223,6 +223,10 @@ BlastError StructureWorld::applyOccupancyRemoval(VoxelObjectId objectId, const g
   const VoxelObjectId oldRoot = inst.objectId;
   const float strength = material.strengthPa;
   const uint32_t iters = material.solverIters;
+  const std::vector<CarriedImpulse> carried = warmRebuild_ ? exportStableImpulses(inst) : std::vector<CarriedImpulse>{};
+  // Keep the budgeted iteration count so the first solve after the edit is not a full-cost one.
+  const uint32_t tickIters = inst.tickIters;
+  const float msPerIter = inst.msPerIter;
 
   std::vector<CompactFamily> families;
   const RebuildResult rebuilt =
@@ -261,6 +265,14 @@ BlastError StructureWorld::applyOccupancyRemoval(VoxelObjectId objectId, const g
     neu.pending.valid = false;
     if (neu.blast.solver != nullptr) {
       applyExtStressStrength(*neu.blast.solver, strength);
+    }
+    seedStableImpulses(neu, carried);
+    neu.msPerIter = msPerIter;
+    if (tickIters != 0 && neu.blast.solver != nullptr) {
+      neu.tickIters = tickIters;
+      auto st = neu.blast.solver->getSettings();
+      st.maxSolverIterationsPerFrame = tickIters;
+      neu.blast.solver->setSettings(st);
     }
     rebuildBondMeta(neu);
     splitAllRequired(&neu, true);
@@ -306,6 +318,77 @@ BlastError StructureWorld::applyOccupancyRemoval(VoxelObjectId objectId, const g
   return BlastError::Ok;
 }
 
+std::vector<StructureWorld::CarriedImpulse> StructureWorld::exportStableImpulses(const StructureInstance& inst) const {
+  std::vector<CarriedImpulse> out;
+  if (inst.blast.solver == nullptr || inst.blast.asset == nullptr) {
+    return out;
+  }
+  const uint32_t bondCount = NvBlastAssetGetBondCount(inst.blast.asset, blastLog);
+  std::vector<Nv::Blast::ExtStressSolver::BondImpulse> raw(bondCount);
+  raw.resize(inst.blast.solver->copyBondImpulses(raw.data(), bondCount));
+  const NvBlastSupportGraph g = NvBlastAssetGetSupportGraph(inst.blast.asset, blastLog);
+  const NvBlastChunk* chunks = NvBlastAssetGetChunks(inst.blast.asset, blastLog);
+  auto stableOfNode = [&](uint32_t node) {
+    return isWorldGraphNode(g, node) ? kWorldStable : chunks[g.chunkIndices[node]].userData;
+  };
+  out.reserve(raw.size());
+  for (const auto& r : raw) {
+    if (r.blastBondIndex >= inst.bondMeta.size() || inst.bondMeta[r.blastBondIndex].stableId == 0) {
+      continue;
+    }
+    CarriedImpulse c;
+    c.stableBond = inst.bondMeta[r.blastBondIndex].stableId;
+    c.stableNode0 = stableOfNode(r.node0);
+    c.stableNode1 = stableOfNode(r.node1);
+    c.linear = r.linear;
+    c.angular = r.angular;
+    out.push_back(c);
+  }
+  return out;
+}
+
+void StructureWorld::seedStableImpulses(StructureInstance& inst, const std::vector<CarriedImpulse>& carried) const {
+  inst.debug.seededBonds = 0;
+  inst.debug.seedableBonds = static_cast<uint32_t>(inst.graph.bonds.size());
+  if (carried.empty() || inst.blast.solver == nullptr || inst.blast.asset == nullptr) {
+    return;
+  }
+  const NvBlastSupportGraph g = NvBlastAssetGetSupportGraph(inst.blast.asset, blastLog);
+  uint32_t worldNode = g.nodeCount;
+  for (uint32_t i = 0; i < g.nodeCount; ++i) {
+    if (g.chunkIndices[i] == UINT32_MAX) {
+      worldNode = i;
+      break;
+    }
+  }
+  auto nodeOfStable = [&](uint32_t stable, uint32_t& node) {
+    if (stable == kWorldStable) {
+      node = worldNode;
+      return worldNode < g.nodeCount;
+    }
+    const auto it = inst.blast.graphFromStable.find(stable);
+    if (it == inst.blast.graphFromStable.end()) {
+      return false;
+    }
+    node = it->second;
+    return true;
+  };
+  std::vector<Nv::Blast::ExtStressSolver::BondImpulse> seeds;
+  seeds.reserve(carried.size());
+  for (const CarriedImpulse& c : carried) {
+    const auto bond = inst.blast.sdkBondFromStable.find(c.stableBond);
+    uint32_t node0 = 0;
+    uint32_t node1 = 0;
+    if (bond == inst.blast.sdkBondFromStable.end() || !nodeOfStable(c.stableNode0, node0) ||
+        !nodeOfStable(c.stableNode1, node1)) {
+      continue;  // bond or an end node changed with the edit: solved from zero
+    }
+    seeds.push_back({bond->second, node0, node1, c.linear, c.angular});
+  }
+  inst.blast.solver->seedBondImpulses(seeds.data(), static_cast<uint32_t>(seeds.size()));
+  inst.debug.seededBonds = static_cast<uint32_t>(seeds.size());
+}
+
 void StructureWorld::markCut(bool cut, StructureInstance* target) {
   StructureInstance* inst = target != nullptr ? target : instance();
   if (inst != nullptr) {
@@ -321,6 +404,13 @@ uint32_t StructureWorld::warmupGravity(uint32_t maxPasses, StructureInstance* ta
   }
   if (inst->bindings.empty()) {
     rebuildBindingsFromFamily(*inst);
+  }
+  if (inst->tickIters != 0) {
+    // Warm-up is a deliberate full-cost solve: run at the material's iteration count.
+    inst->tickIters = 0;
+    auto st = inst->blast.solver->getSettings();
+    st.maxSolverIterationsPerFrame = inst->material.solverIters == 0 ? 200u : inst->material.solverIters;
+    inst->blast.solver->setSettings(st);
   }
   uint32_t n = 0;
   for (; n < maxPasses; ++n) {
@@ -475,6 +565,7 @@ void StructureWorld::setSolverIters(uint32_t iters, StructureInstance* target) {
     return;
   }
   inst->material.solverIters = iters == 0 ? 25u : iters;
+  inst->tickIters = 0;
   auto st = inst->blast.solver->getSettings();
   st.maxSolverIterationsPerFrame = inst->material.solverIters;
   inst->blast.solver->setSettings(st);
@@ -631,6 +722,36 @@ void StructureWorld::setStrengthPa(float globalStrengthPa) {
       applyExtStressStrength(*inst.blast.solver, strengthPa);
     }
   }
+}
+
+void StructureWorld::adaptSolverIters(StructureInstance& inst, float solveMs) {
+  if (inst.blast.solver == nullptr) {
+    return;
+  }
+  const uint32_t maxIters = inst.material.solverIters == 0 ? 200u : inst.material.solverIters;
+  const uint32_t cur = inst.tickIters != 0 ? inst.tickIters : maxIters;
+  // An unconverged solve used every iteration: that is the cost per iteration. Converged
+  // solves stop early and say nothing, so the cap (and the estimate) is kept through them,
+  // and the first solve after an edit stays within budget.
+  // The first solve of a (re)built solver also syncs its graph; that cost is not per iteration.
+  const bool firstSolve = inst.budgetSolves++ == 0;
+  if (!firstSolve && !inst.debug.converged && solveMs > 0.0f) {
+    const float sample = solveMs / static_cast<float>(cur);
+    inst.msPerIter = inst.msPerIter > 0.0f ? 0.7f * inst.msPerIter + 0.3f * sample : sample;
+  }
+  uint32_t next = maxIters;
+  if (solveBudgetMs_ > 0.0f && inst.msPerIter > 0.0f) {
+    const float budget = solveBudgetMs_ / static_cast<float>(std::max<size_t>(1, instances_.size()));
+    next = static_cast<uint32_t>(std::clamp(budget / inst.msPerIter, 8.0f, static_cast<float>(maxIters)));
+  }
+  inst.debug.solverIters = cur;  // what this tick's solve used (refreshDebug reports the material cap)
+  if (next == cur) {
+    return;
+  }
+  inst.tickIters = next == maxIters ? 0u : next;
+  auto st = inst.blast.solver->getSettings();
+  st.maxSolverIterationsPerFrame = next;
+  inst.blast.solver->setSettings(st);
 }
 
 void StructureWorld::setOwnStrengthPa(float strengthPa) {
@@ -1349,7 +1470,9 @@ void StructureWorld::solveInstance(StructureInstance& inst, const WorldContactIm
   inst.blast.solver->update();
   ++inst.solveEpoch;
   const auto t1 = std::chrono::steady_clock::now();
-  refreshDebug(inst, std::chrono::duration<float, std::milli>(t1 - t0).count());
+  const float solveMs = std::chrono::duration<float, std::milli>(t1 - t0).count();
+  refreshDebug(inst, solveMs);
+  adaptSolverIters(inst, solveMs);
   inst.debug.bindingCount = static_cast<uint32_t>(inst.bindings.size());
   inst.debug.impactDamageEnabled = impactDamageEnabled_;
   inst.debug.stressImpactImpulses = stressImpactImpulses_;
