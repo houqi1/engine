@@ -86,6 +86,51 @@ void eccentricSupport(blast::BlastRuntime& runtime, float normalTolerance) {
   world.shutdown();
 }
 
+void largeSupportWithContactJitter(blast::BlastRuntime& runtime) {
+  blast::StructureWorld world;
+  require(world.init(runtime),"large support init");
+  blast::ObjectOccupancyView occupancy(64,0.1f,600.0f,[](int x,int y,int z) {
+    return x<64 && z<64 && (y<2 || (y>=22 && y<30) || (x==4 && z==4 && y<22));
+  },nullptr);
+  blast::OccupancySampleOpts opts; opts.agg=2; opts.allowFloating=true;
+  blast::StructureMountDesc desc; desc.objectId=object;
+  desc.material.strengthPa=4e6f; desc.material.ownStrengthPa=4e6f;
+  desc.material.fractureEnabled=true; desc.material.solverIters=8;
+  require(world.mount(desc,blast::sampleOccupancy(occupancy,opts))==blast::BlastError::Ok,"large support mount");
+  world.setContactLoadsEnabled(true); world.setImpactDamageEnabled(false);
+  auto* inst=world.find(object); const auto& body=inst->bindings.front();
+  std::vector<blast::WorldContactImpulse> contacts;
+  for(float x:{0.1f,6.3f}) for(float z:{0.1f,6.3f}) {
+    blast::WorldContactImpulse p; p.idA=object; p.idB=ground; p.persistent=true;
+    p.xA=body.comAsset; p.worldPoint={x,0,z}; contacts.push_back(p);
+  }
+  blast::BodyKinematics kin[2]; kin[0].objectId=object; kin[1].objectId=ground; kin[1].awake=false;
+  int ticks=0;
+  for(int t=1;t<=1200;++t) {
+    for(size_t i=0;i<contacts.size();++i)
+      contacts[i].JA={0,body.mass*9.81f*dt/4*(1+(i%2 ? -1:1)*0.001f*std::sin(float(t))),0};
+    world.onPhysicsTick(t,dt,contacts.data(),uint32_t(contacts.size()),kin,2);
+    if(!inst->debug.converged) require(inst->debug.candidateCount==0,"unfinished support emitted fracture");
+    ticks=t;
+    if(inst->debug.converged) break;
+  }
+  std::printf("large jitter support: ticks=%d nodes=%u residual=%g drift=%g candidates=%u\n",ticks,
+    inst->debug.nodes,inst->debug.equilibriumError,inst->debug.loadSnapshotDrift,inst->debug.candidateCount);
+  require(inst->debug.converged,"large support starved under 8-iteration budget and contact jitter");
+  require(inst->debug.loadSnapshotDrift<=0.005f,"accepted stale load snapshot");
+  std::vector<Nv::Blast::ExtStressSolver::BondImpulse> impulses(inst->graph.bonds.size());
+  impulses.resize(inst->blast.solver->copyBondImpulses(impulses.data(),uint32_t(impulses.size())));
+  const auto* bonds=NvBlastAssetGetBonds(inst->blast.asset,nullptr);
+  uint32_t cut=UINT32_MAX;
+  for(const auto& p:impulses) if(std::abs(bonds[p.blastBondIndex].centroid[1]-1.2f)<1e-4f) {
+    cut=p.blastBondIndex;
+    require(std::abs(std::abs(p.linear.y)/(64*64*8*0.6f*9.81f)-1)<0.01f,"large support cut does not carry roof weight");
+  }
+  require(cut!=UINT32_MAX && inst->debug.candidateCount>0,"thin support not scheduled to break");
+  require(world.applyPendingIfAny(inst)>0,"accepted support fracture did not commit");
+  require(NvBlastActorGetBondHealths(inst->bindings.front().actor,nullptr)[cut]<=0,"thin column remained intact");
+}
+
 void rigidModesAndSplit() {
   // Unequal masses, two free islands and one anchored island. Rotation uses
   // the SDK's angular sign convention, tested against its actual B operator.
@@ -123,6 +168,7 @@ int main() {
     require(runtime.init(),"runtime");
     eccentricSupport(runtime,1e-6f);
     eccentricSupport(runtime,1e-3f); // loose normal residual must not bypass equilibrium verification
+    largeSupportWithContactJitter(runtime);
     require(runtime.errorCount()==0,"Blast errors");
     std::puts("OK convergence: cut balance, rigid modes, split, budget, sleep, changed load, numerical failure");
     return 0;

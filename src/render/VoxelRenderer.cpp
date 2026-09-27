@@ -2346,6 +2346,10 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
     ImGui::Text("Anchors: %s", scene.structureMountStatus().empty() ? "-" : scene.structureMountStatus().c_str());
     ImGui::Text("Status: %s  lin=%.3g ang=%.3g", st.status, st.linErr, st.angErr);
     ImGui::Text("Equilibrium residual: %.3g", st.equilibriumError);
+    ImGui::Text("Load snapshot drift: %.3f%% (restart above 0.5%%)", 100.0f * st.loadSnapshotDrift);
+    if (st.hasInstance && st.fractureEnabled && !st.converged) {
+      ImGui::TextWrapped("Stress fracture is waiting for convergence; displayed stresses are provisional.");
+    }
     if (ImGui::TreeNode("Solver accuracy")) {
       float tolerance = sw.solverTolerance();
       float equilibrium = sw.equilibriumTolerance();

@@ -298,6 +298,10 @@ void testWorldRemovalAndSecondInstance(blast::BlastRuntime& runtime) {
     expect(world.mountSample(child, columnSample(), 50, 1.0e7f, 0, 0) == blast::BlastError::Ok, "E4 second mount");
     auto* first = world.instanceAt(0);
     auto* second = world.instanceAt(1);
+    // The synthetic command below exercises routing, not stress generation.
+    // Establish an accepted solve before submitting it through the stress gate.
+    second->blast.solver->update();
+    expect(second->blast.solver->converged(), "E4 command fixture has accepted solve");
     const auto& bond = second->graph.bonds.front();
     blast::FractureCandidate candidate;
     candidate.stableId = bond.stableId;

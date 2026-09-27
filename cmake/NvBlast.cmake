@@ -251,6 +251,40 @@ endfunction()
 
 ve_apply_p6_convergence()
 
+function(ve_apply_p7_load_torque)
+  find_package(Python3 COMPONENTS Interpreter QUIET)
+  if(NOT Python3_Interpreter_FOUND)
+    find_program(Python3_EXECUTABLE NAMES python python3 py)
+  endif()
+  set(_py "${CMAKE_SOURCE_DIR}/third_party/nvblast/patches/apply_p7_load_torque.py")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_py}")
+  execute_process(COMMAND "${Python3_EXECUTABLE}" "${_py}" "${VE_BLAST_ROOT}"
+    RESULT_VARIABLE _ok OUTPUT_VARIABLE _out ERROR_VARIABLE _err)
+  if(NOT _ok EQUAL 0)
+    execute_process(COMMAND py -3 "${_py}" "${VE_BLAST_ROOT}"
+      RESULT_VARIABLE _ok OUTPUT_VARIABLE _out ERROR_VARIABLE _err)
+  endif()
+  if(NOT _ok EQUAL 0)
+    message(FATAL_ERROR "P7 ExtStress torque patch failed: ${_out} ${_err}")
+  endif()
+endfunction()
+
+ve_apply_p7_load_torque()
+
+function(ve_apply_p8_double_solve)
+  find_package(Python3 COMPONENTS Interpreter REQUIRED)
+  set(_py "${CMAKE_SOURCE_DIR}/third_party/nvblast/patches/apply_p8_double_solve.py")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${_py}" "${CMAKE_SOURCE_DIR}/third_party/nvblast/patches/StressDoubleSolve.h")
+  execute_process(COMMAND "${Python3_EXECUTABLE}" "${_py}" "${VE_BLAST_ROOT}"
+    RESULT_VARIABLE _ok OUTPUT_VARIABLE _out ERROR_VARIABLE _err)
+  if(NOT _ok EQUAL 0)
+    message(FATAL_ERROR "P8 ExtStress double solve patch failed: ${_out} ${_err}")
+  endif()
+endfunction()
+
+ve_apply_p8_double_solve()
+
 set(VE_NVBLAST_LL_SOURCES
   "${VE_BLAST_ROOT}/source/sdk/common/NvBlastAssert.cpp"
   "${VE_BLAST_ROOT}/source/sdk/common/NvBlastAtomic.cpp"

@@ -34,6 +34,7 @@ class StressEquilibrium
     }
     static V vec(const NvcVec3& p) { return {p.x,p.y,p.z}; }
     static W vec(const AngLin6& p) { return {p.ang.x,p.ang.y,p.ang.z,p.lin.x,p.lin.y,p.lin.z}; }
+    static W vec(const W& p) { return p; }
 
     void rebuild(const BondMatrixS& B)
     {
@@ -142,6 +143,23 @@ public:
         dirty=true;
     }
     void topologyChanged() { dirty=true; }
+    double relativeChange(const AngLin6* current,const AngLin6* reference,const BondMatrixS& B,double absoluteTolerance)
+    {
+        rebuild(B);
+        double result=0;
+        for(const auto& c:components)
+        {
+            double change2=0,scale2=0;
+            for(uint32_t i:c.nodes)
+            {
+                const W a=vec(current[i]),b=vec(reference[i]);
+                for(int k=0;k<6;++k) { const double d=a[k]-b[k]; change2+=d*d; scale2+=b[k]*b[k]; }
+            }
+            if(!std::isfinite(change2) || !std::isfinite(scale2)) return INFINITY;
+            result=std::max(result,std::sqrt(change2)/std::max(std::sqrt(scale2),absoluteTolerance));
+        }
+        return result;
+    }
     void project(AngLin6* b,const BondMatrixS& B)
     {
         rebuild(B);
@@ -153,7 +171,8 @@ public:
             b[i].lin={float(work[i][3]),float(work[i][4]),float(work[i][5])};
         }
     }
-    bool check(const AngLin6* x,const AngLin6* b,const BondMatrixS& B,double relativeTolerance,double absoluteTolerance, AngLin6* refreshedResidual=nullptr)
+    template<class X>
+    bool check(const X* x,const AngLin6* b,const BondMatrixS& B,double relativeTolerance,double absoluteTolerance, AngLin6* refreshedResidual=nullptr)
     {
         rebuild(B);
         std::fill(work.begin(),work.end(),W{});
@@ -162,7 +181,8 @@ public:
         for(uint32_t j=0;j<B.N;++j)
         {
             const auto& c=B.C[j];
-            const V f=vec(x[j].lin), m=vec(x[j].ang);
+            const W value=vec(x[j]);
+            const V f{value[3],value[4],value[5]}, m{value[0],value[1],value[2]};
             const V r0=cross(vec(c.offset0),f),r1=cross(vec(c.offset1),f);
             for(int k=0;k<3;++k)
             {

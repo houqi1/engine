@@ -1223,9 +1223,9 @@ void runDigConverge(GfxDevice& gfx, VoxelScene& scene, PerfLog& out) {
         t == firstConverged) {
       std::snprintf(line, sizeof(line),
                     "t=%4d conv=%d linErr=%.3g angErr=%.3g maxC=%.4g maxT=%.4g maxS=%.4g iters=%u solveMs=%.2f "
-                    "seeded=%u/%u nodes=%u equilibrium=%.3g status=%s",
+                    "seeded=%u/%u nodes=%u equilibrium=%.3g drift=%.3g status=%s",
                     t, d.converged ? 1 : 0, d.linErr, d.angErr, d.maxCompression, d.maxTension, d.maxShear,
-                    d.solverIters, d.solveMs, d.seededBonds, d.seedableBonds, d.nodes, d.equilibriumError, d.status);
+                    d.solverIters, d.solveMs, d.seededBonds, d.seedableBonds, d.nodes, d.equilibriumError, d.loadSnapshotDrift, d.status);
       out.line(line);
     }
     if (firstConverged > 0 && t > firstConverged + 60 && t >= 120) {

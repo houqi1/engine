@@ -1,0 +1,15 @@
+warmRebuild=on budget=8.000000 ms
+Imported as dynamic object  grid=6  fines=39564  size=8.90x8.20x8.70 m  resample 239 ms
+Mounted: 9028 nodes, 19334 bonds, extract 46 ms; free body: no world bonds
+Pre-solve: 1 passes, 0.0 s, converged
+before dig: conv=0 maxC=9.065e+06 maxT=6.039e+06 maxS=1.775e+06
+dig removed 159 fines
+t=   1 conv=0 linErr=2.18e+05 angErr=2.34e+05 maxC=9.094e+06 maxT=6.133e+06 maxS=9.468e+05 iters=10 solveMs=27.34 seeded=19254/19254 nodes=8996 equilibrium=1.2 drift=0 status=iteration budget reached; continuing
+t=  15 conv=0 linErr=2.14e+04 angErr=2.52e+04 maxC=8.639e+06 maxT=5.649e+06 maxS=1.643e+06 iters=8 solveMs=8.86 seeded=19254/19254 nodes=8996 equilibrium=0.0556 drift=0 status=iteration budget reached; continuing
+t=  30 conv=0 linErr=1.26e+04 angErr=1.48e+04 maxC=1.053e+07 maxT=6.857e+06 maxS=1.77e+06 iters=9 solveMs=6.16 seeded=19254/19254 nodes=8996 equilibrium=0.0478 drift=0.00269 status=iteration budget reached; continuing
+t=  60 conv=0 linErr=3.82e+03 angErr=4.25e+03 maxC=1.743e+07 maxT=2.207e+07 maxS=2.752e+06 iters=8 solveMs=6.17 seeded=19254/19254 nodes=8996 equilibrium=0.0241 drift=0.00269 status=iteration budget reached; continuing
+t= 120 conv=0 linErr=2.42e+03 angErr=2.82e+03 maxC=1.723e+07 maxT=2.307e+07 maxS=3.227e+06 iters=8 solveMs=6.98 seeded=19254/19254 nodes=8996 equilibrium=0.0145 drift=0.00269 status=iteration budget reached; continuing
+t= 240 conv=0 linErr=740 angErr=862 maxC=1.696e+07 maxT=2.23e+07 maxS=4.46e+06 iters=8 solveMs=8.51 seeded=19254/19254 nodes=8996 equilibrium=0.00438 drift=0.00269 status=iteration budget reached; continuing
+t= 480 conv=0 linErr=37.3 angErr=41.6 maxC=1.691e+07 maxT=2.169e+07 maxS=4.65e+06 iters=8 solveMs=5.96 seeded=19254/19254 nodes=8996 equilibrium=0.000213 drift=0.00269 status=iteration budget reached; continuing
+t= 814 conv=1 linErr=0.593 angErr=0.651 maxC=1.691e+07 maxT=2.17e+07 maxS=4.648e+06 iters=8 solveMs=6.30 seeded=19254/19254 nodes=8996 equilibrium=2.21e-06 drift=0.00269 status=converged (verified)
+first converged at tick 814 (13.57 s sim), wall 7.6 s

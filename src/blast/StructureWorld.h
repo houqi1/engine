@@ -15,6 +15,7 @@
 #include <glm/glm.hpp>
 
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <unordered_map>
 #include <vector>
@@ -40,6 +41,7 @@ struct StructureDebugSnapshot {
   float linErr = 0.0f;
   float angErr = 0.0f;
   float equilibriumError = 0.0f;
+  float loadSnapshotDrift = 0.0f;
   float extractMs = 0.0f;
   float assetMs = 0.0f;
   float solveMs = 0.0f;
@@ -236,6 +238,13 @@ struct StructureInstance {
   uint64_t lastLoadTick = 0;
   uint32_t lastBoundTopologyEpoch = 0xFFFFFFFFu;
   ImpulseEvents impactEvents{};
+  struct StressImpactBatch {
+    uint64_t tickId = 0;
+    std::vector<MappedLoad> loads;
+  };
+  // A short impact remains a solver input until its stress result is accepted.
+  // Separate ticks are queued, not added together into an artificial larger hit.
+  std::deque<StressImpactBatch> stressImpactBatches;
   bool impactAppliedThisTick = false;
   // Solver iterations for the next tick under the solve time budget (0 = material.solverIters).
   uint32_t tickIters = 0;
