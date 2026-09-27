@@ -1,0 +1,14 @@
+warmRebuild=on budget=8.000000 ms
+Imported as dynamic object  grid=6  fines=39564  size=8.90x8.20x8.70 m  resample 207 ms
+Mounted: 9028 nodes, 19334 bonds, extract 39 ms; free body: no world bonds
+Pre-solve: 1 passes, 0.0 s, converged
+before dig: conv=0 maxC=1.119e+07 maxT=1.281e+07 maxS=2.238e+06
+dig removed 159 fines
+t=   1 conv=0 linErr=4.44e+04 angErr=5.09e+04 maxC=9.573e+06 maxT=1.227e+07 maxS=2.041e+06 iters=46 solveMs=23.55 seeded=19254/19254 nodes=8996 equilibrium=0.425 status=iteration budget reached; continuing
+t=  15 conv=0 linErr=3.68e+03 angErr=3.96e+03 maxC=1.034e+07 maxT=1.214e+07 maxS=2.06e+06 iters=45 solveMs=7.79 seeded=19254/19254 nodes=8996 equilibrium=0.0269 status=iteration budget reached; continuing
+t=  30 conv=0 linErr=1.51e+03 angErr=1.76e+03 maxC=1.161e+07 maxT=1.412e+07 maxS=2.406e+06 iters=43 solveMs=10.58 seeded=19254/19254 nodes=8996 equilibrium=0.0241 status=iteration budget reached; continuing
+t=  60 conv=0 linErr=1.07e+03 angErr=1.21e+03 maxC=1.421e+07 maxT=1.771e+07 maxS=4.83e+06 iters=36 solveMs=12.23 seeded=19254/19254 nodes=8996 equilibrium=0.00622 status=iteration budget reached; continuing
+t= 120 conv=0 linErr=36.3 angErr=41.9 maxC=1.93e+07 maxT=1.476e+07 maxS=5.123e+06 iters=40 solveMs=7.29 seeded=19254/19254 nodes=8996 equilibrium=0.000236 status=iteration budget reached; continuing
+t= 200 conv=1 linErr=0.592 angErr=0.662 maxC=1.929e+07 maxT=1.476e+07 maxS=5.121e+06 iters=37 solveMs=2.71 seeded=19254/19254 nodes=8996 equilibrium=2.55e-05 status=converged (verified)
+t= 240 conv=1 linErr=0.577 angErr=0.669 maxC=1.929e+07 maxT=1.476e+07 maxS=5.121e+06 iters=37 solveMs=2.26 seeded=19254/19254 nodes=8996 equilibrium=2.34e-06 status=converged (verified)
+first converged at tick 200 (3.33 s sim), wall 2.0 s

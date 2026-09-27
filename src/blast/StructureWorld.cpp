@@ -635,7 +635,14 @@ void StructureWorld::refreshDebug(StructureInstance& inst, float solveMs) {
   inst.debug.converged = inst.blast.solver->converged();
   inst.debug.linErr = inst.blast.solver->getStressErrorLinear();
   inst.debug.angErr = inst.blast.solver->getStressErrorAngular();
-  inst.debug.status = inst.debug.converged ? "converged" : "未收敛";
+  inst.debug.equilibriumError = inst.blast.solver->getEquilibriumError();
+  using SolveStatus = Nv::Blast::ExtStressSolver::SolveStatus;
+  switch (inst.blast.solver->getSolveStatus()) {
+    case SolveStatus::Converged: inst.debug.status = "converged (verified)"; break;
+    case SolveStatus::IterationLimit: inst.debug.status = "iteration budget reached; continuing"; break;
+    case SolveStatus::NumericalFailure: inst.debug.status = "numerical failure"; break;
+    default: inst.debug.status = "not solved"; break;
+  }
   const uint32_t nb = familyAssetBondCount(inst.blast.actor, blastLog);
   if (inst.probes.size() < nb) {
     inst.probes.resize(nb);
@@ -735,7 +742,8 @@ void StructureWorld::adaptSolverIters(StructureInstance& inst, float solveMs) {
   // and the first solve after an edit stays within budget.
   // The first solve of a (re)built solver also syncs its graph; that cost is not per iteration.
   const bool firstSolve = inst.budgetSolves++ == 0;
-  if (!firstSolve && !inst.debug.converged && solveMs > 0.0f) {
+  if (!firstSolve && inst.blast.solver->getSolveStatus() == Nv::Blast::ExtStressSolver::SolveStatus::IterationLimit &&
+      solveMs > 0.0f) {
     const float sample = solveMs / static_cast<float>(cur);
     inst.msPerIter = inst.msPerIter > 0.0f ? 0.7f * inst.msPerIter + 0.3f * sample : sample;
   }
@@ -752,6 +760,12 @@ void StructureWorld::adaptSolverIters(StructureInstance& inst, float solveMs) {
   auto st = inst.blast.solver->getSettings();
   st.maxSolverIterationsPerFrame = next;
   inst.blast.solver->setSettings(st);
+}
+
+void StructureWorld::setSolverAccuracy(float tolerance, float equilibriumTolerance) {
+  if (std::isfinite(tolerance) && tolerance > 0.0f) solverTolerance_ = tolerance;
+  if (std::isfinite(equilibriumTolerance) && equilibriumTolerance > 0.0f)
+    equilibriumTolerance_ = equilibriumTolerance;
 }
 
 void StructureWorld::setOwnStrengthPa(float strengthPa) {
@@ -1414,6 +1428,12 @@ void StructureWorld::solveInstance(StructureInstance& inst, const WorldContactIm
                                    uint32_t nImpulses, const BodyKinematics* kinematics, uint32_t nKinematics) {
   if (inst.blast.solver == nullptr || inst.blast.family == nullptr) {
     return;
+  }
+  auto accuracy = inst.blast.solver->getSettings();
+  if (accuracy.solverTolerance != solverTolerance_ || accuracy.equilibriumTolerance != equilibriumTolerance_) {
+    accuracy.solverTolerance = solverTolerance_;
+    accuracy.equilibriumTolerance = equilibriumTolerance_;
+    inst.blast.solver->setSettings(accuracy);
   }
   inst.debug.probeExportCount = 0;
   inst.debug.gravityActors = 0;

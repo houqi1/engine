@@ -2345,6 +2345,16 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
     ImGui::Text("Nodes: %u  bonds: %u  world bonds: %u", st.nodes, st.bonds, st.worldBonds);
     ImGui::Text("Anchors: %s", scene.structureMountStatus().empty() ? "-" : scene.structureMountStatus().c_str());
     ImGui::Text("Status: %s  lin=%.3g ang=%.3g", st.status, st.linErr, st.angErr);
+    ImGui::Text("Equilibrium residual: %.3g", st.equilibriumError);
+    if (ImGui::TreeNode("Solver accuracy")) {
+      float tolerance = sw.solverTolerance();
+      float equilibrium = sw.equilibriumTolerance();
+      bool changed = ImGui::SliderFloat("Solve tolerance", &tolerance, 1e-8f, 1e-3f, "%.1e", ImGuiSliderFlags_Logarithmic);
+      changed |= ImGui::SliderFloat("Equilibrium tolerance", &equilibrium, 1e-6f, 1e-2f, "%.1e", ImGuiSliderFlags_Logarithmic);
+      if (changed) scene.structures().setSolverAccuracy(tolerance, equilibrium);
+      ImGui::TextWrapped("Smaller tolerances improve accuracy and can require more simulation ticks.");
+      ImGui::TreePop();
+    }
     ImGui::Text("Reaction Ry=%.1f N   strip max=%.3g Pa   S=%.3g Pa", st.reactionY, st.stripMaxStress,
                 st.strengthPa);
     ImGui::Text("Candidates: %u (strip %u)  fractured bonds: %u  actors: %u  bindings: %u",

@@ -1223,9 +1223,9 @@ void runDigConverge(GfxDevice& gfx, VoxelScene& scene, PerfLog& out) {
         t == firstConverged) {
       std::snprintf(line, sizeof(line),
                     "t=%4d conv=%d linErr=%.3g angErr=%.3g maxC=%.4g maxT=%.4g maxS=%.4g iters=%u solveMs=%.2f "
-                    "seeded=%u/%u nodes=%u",
+                    "seeded=%u/%u nodes=%u equilibrium=%.3g status=%s",
                     t, d.converged ? 1 : 0, d.linErr, d.angErr, d.maxCompression, d.maxTension, d.maxShear,
-                    d.solverIters, d.solveMs, d.seededBonds, d.seedableBonds, d.nodes);
+                    d.solverIters, d.solveMs, d.seededBonds, d.seedableBonds, d.nodes, d.equilibriumError, d.status);
       out.line(line);
     }
     if (firstConverged > 0 && t > firstConverged + 60 && t >= 120) {
@@ -1540,21 +1540,21 @@ int main(int argc, char** argv) {
         .height = options.benchmark ? options.height : 720,
     });
 
-    if (options.importTopple) {
+    if (options.importTopple || options.digConverge) {
       glfwHideWindow(window.handle());
     }
     if (options.benchmark) {
       sizeBenchmarkWindow(window, options);
     }
 #ifdef _WIN32
-    if (!options.benchmark && !options.e2Perf && !options.importTopple) {
+    if (!options.benchmark && !options.e2Perf && !options.importTopple && !options.digConverge) {
       if (HWND hwnd = glfwGetWin32Window(window.handle())) {
         SetWindowPos(hwnd, HWND_TOPMOST, 160, 160, 0, 0, SWP_SHOWWINDOW | SWP_NOSIZE);
         SetForegroundWindow(hwnd);
         SetWindowPos(hwnd, HWND_NOTOPMOST, 160, 160, 0, 0, SWP_SHOWWINDOW | SWP_NOSIZE);
       }
     }
-    if (options.e2Perf || options.frameFail || options.importObject || options.e5Contact || options.collapsePerf || options.digConverge || options.collisionPerf > 0) {
+    if (options.e2Perf || options.frameFail || options.importObject || options.e5Contact || options.collapsePerf || options.collisionPerf > 0) {
       if (AttachConsole(ATTACH_PARENT_PROCESS) || AllocConsole()) {
         FILE* fp = nullptr;
         freopen_s(&fp, "CONOUT$", "w", stdout);

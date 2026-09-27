@@ -39,6 +39,7 @@ struct StructureDebugSnapshot {
   float stripMaxStress = 0.0f;
   float linErr = 0.0f;
   float angErr = 0.0f;
+  float equilibriumError = 0.0f;
   float extractMs = 0.0f;
   float assetMs = 0.0f;
   float solveMs = 0.0f;
@@ -303,6 +304,9 @@ public:
   // more ticks to converge instead of stalling the frame. <= 0 disables the limit.
   void setSolveBudgetMs(float ms) { solveBudgetMs_ = ms; }
   float solveBudgetMs() const { return solveBudgetMs_; }
+  void setSolverAccuracy(float tolerance, float equilibriumTolerance);
+  float solverTolerance() const { return solverTolerance_; }
+  float equilibriumTolerance() const { return equilibriumTolerance_; }
   // Digging rebuilds the asset; on, the new solver starts from the old solve (by stable bond
   // id) instead of zero, so it re-converges in a few ticks.
   void setWarmRebuild(bool on) { warmRebuild_ = on; }
@@ -420,6 +424,8 @@ private:
   bool contactLoadsEnabled_ = false;
   float contactLoadTau_ = 0.1f;  // s, smoothing of solver contact impulses
   float solveBudgetMs_ = 0.0f;
+  float solverTolerance_ = 1.0e-6f;
+  float equilibriumTolerance_ = 1.0e-4f;
   bool warmRebuild_ = false;
   float stressImpactScale_ = 0.01f;
   bool impactDamageEnabled_ = true;

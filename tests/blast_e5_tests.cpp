@@ -624,6 +624,13 @@ void testGroundAnchorsMatchExplicitNodes(blast::BlastRuntime& rt) {
     const float re = settledReaction(world, world.find(he), convE);
     const float ra = settledReaction(world, world.find(ha), convA);
     const float weight = world.find(ha)->debug.weight;
+    if (!convE || !convA) {
+      for (auto handle : {he, ha}) {
+        const auto& d = world.find(handle)->debug;
+        std::cout << "  convergence: " << d.status << " equilibrium=" << d.equilibriumError
+                  << " lin=" << d.linErr << " ang=" << d.angErr << "\n";
+      }
+    }
     expect(convE && convA, k.tag + " both converge");
     const float relPair = std::abs(ra - re) / weight;
     const float relWeight = std::abs(ra - weight) / weight;

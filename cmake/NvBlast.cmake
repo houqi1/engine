@@ -192,6 +192,65 @@ endfunction()
 
 ve_apply_p4_extstress()
 
+function(ve_apply_p5_beam_bending)
+  set(_py "${CMAKE_SOURCE_DIR}/third_party/nvblast/patches/apply_p5_beam_bending.py")
+  set(_cpp "${VE_BLAST_ROOT}/source/sdk/extensions/stress/NvBlastExtStressSolver.cpp")
+  file(READ "${_cpp}" _cppc)
+  if(_cppc MATCHES "VE_P5_BEAM_BENDING")
+    return()
+  endif()
+  if(NOT Python3_EXECUTABLE)
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(NOT Python3_Interpreter_FOUND)
+      find_program(Python3_EXECUTABLE NAMES python python3 py)
+    endif()
+  endif()
+  if(NOT Python3_EXECUTABLE)
+    message(FATAL_ERROR "Python is required to apply P5 NvBlast beam bending")
+  endif()
+  execute_process(
+    COMMAND "${Python3_EXECUTABLE}" "${_py}" "${VE_BLAST_ROOT}"
+    RESULT_VARIABLE _ok
+    OUTPUT_VARIABLE _out
+    ERROR_VARIABLE _err
+  )
+  if(NOT _ok EQUAL 0)
+    execute_process(
+      COMMAND py -3 "${_py}" "${VE_BLAST_ROOT}"
+      RESULT_VARIABLE _ok
+      OUTPUT_VARIABLE _out
+      ERROR_VARIABLE _err
+    )
+  endif()
+  if(NOT _ok EQUAL 0)
+    message(FATAL_ERROR "P5 ExtStress beam-bending patch failed: ${_out} ${_err}")
+  endif()
+  message(STATUS "Applied P5 ExtStress beam-bending stress")
+endfunction()
+
+ve_apply_p5_beam_bending()
+
+function(ve_apply_p6_convergence)
+  find_package(Python3 COMPONENTS Interpreter QUIET)
+  if(NOT Python3_Interpreter_FOUND)
+    find_program(Python3_EXECUTABLE NAMES python python3 py)
+  endif()
+  set(_py "${CMAKE_SOURCE_DIR}/third_party/nvblast/patches/apply_p6_convergence.py")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${_py}" "${CMAKE_SOURCE_DIR}/third_party/nvblast/patches/StressEquilibrium.h")
+  execute_process(COMMAND "${Python3_EXECUTABLE}" "${_py}" "${VE_BLAST_ROOT}"
+    RESULT_VARIABLE _ok OUTPUT_VARIABLE _out ERROR_VARIABLE _err)
+  if(NOT _ok EQUAL 0)
+    execute_process(COMMAND py -3 "${_py}" "${VE_BLAST_ROOT}"
+      RESULT_VARIABLE _ok OUTPUT_VARIABLE _out ERROR_VARIABLE _err)
+  endif()
+  if(NOT _ok EQUAL 0)
+    message(FATAL_ERROR "P6 ExtStress convergence patch failed: ${_out} ${_err}")
+  endif()
+endfunction()
+
+ve_apply_p6_convergence()
+
 set(VE_NVBLAST_LL_SOURCES
   "${VE_BLAST_ROOT}/source/sdk/common/NvBlastAssert.cpp"
   "${VE_BLAST_ROOT}/source/sdk/common/NvBlastAtomic.cpp"

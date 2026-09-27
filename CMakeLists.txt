@@ -216,6 +216,11 @@ ve_blast_test(blast_e3_tests
   src/physics/Solver.cpp
 )
 ve_blast_test(blast_e5_tests tests/blast_e5_tests.cpp)
+ve_blast_test(blast_convergence_tests tests/blast_convergence_tests.cpp)
+target_include_directories(blast_convergence_tests PRIVATE "${VE_BLAST_ROOT}/source/shared/stress_solver")
+if(MSVC)
+  target_compile_options(blast_convergence_tests PRIVATE /arch:AVX2)
+endif()
 
 # ---- Shader compilation ----
 find_program(GLSLC glslc HINTS /opt/homebrew/bin ENV VULKAN_SDK PATH_SUFFIXES bin REQUIRED)
