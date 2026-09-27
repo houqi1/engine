@@ -793,6 +793,7 @@ bool VoxelScene::commitOccupancySplit(GfxDevice& gfx, VoxelObjectId parentId,
     return true;
   }
   lastStressPaintSolveEpoch_ = 0;
+  stressPaintStamps_.clear();
   gfx.waitIdle();
   packObjectPool();
   fillGpuObjectRecords();

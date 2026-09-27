@@ -2422,7 +2422,11 @@ void VoxelRenderer::recordImGui(VkCommandBuffer cmd, VoxelScene& scene, float di
     if (ImGui::Combo("Import Agg", &aggIndex, aggNames, 3)) {
       scene.importAgg() = aggIndex == 2 ? 4 : (aggIndex == 1 ? 2 : 0);
     }
-    ImGui::TextDisabled("Stands on the ground; mounted imports anchor where they touch it.");
+    if (scene.importMount()) {
+      ImGui::TextWrapped("Free-body stress with no ground anchors. Ground contacts feed stress when Contact loads is enabled.");
+    } else {
+      ImGui::TextWrapped("Dynamic object without a stress structure.");
+    }
   } else {
     ImGui::TextDisabled("Stamped into the ground grid (decoration only, no stress).");
   }

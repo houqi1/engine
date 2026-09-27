@@ -154,9 +154,9 @@ public:
   bool importSurfaceMesh(GfxDevice& gfx, const std::string& path, const MeshVoxelizeConfig& cfg);
   void removeImportedMesh(GfxDevice& gfx);
   const std::string& importStatus() const { return importStatus_; }
-  // E5.5: voxelize a mesh into its own static object standing on the ground (lowest
+  // E5.5: voxelize a mesh into its own dynamic object standing on the ground (lowest
   // occupied layer on the ground top, centred in x/z). With importMount() it is mounted
-  // as a stress structure anchored where it touches the ground.
+  // as a free stress structure with no ground anchors.
   bool importMeshAsObject(GfxDevice& gfx, const std::string& path, const MeshVoxelizeConfig& cfg);
   bool& importAsObject() { return importAsObject_; }
   bool& importMount() { return importMount_; }
@@ -164,7 +164,8 @@ public:
   float& importStrengthMPa() { return importStrengthMPa_; }  // the import's own strength
   int& importAgg() { return importAgg_; }  // 0 = auto (2, or 4 when over the node budget)
   VoxelObjectId importedObjectId() const { return importedObjectId_; }
-  // Structure shown by the panel and stress / anchor colors: the last spawned demo or import.
+  // Structure shown by the panel and anchor colors: the last spawned demo or import.
+  // Stress colors cover all mounted structures, including rebuilt fragments.
   VoxelObjectId structureFocusId() const;
   std::string& importPath() { return importPath_; }
   int& importGridN() { return importGridN_; }
@@ -423,6 +424,8 @@ private:
   bool mountCylinderFromOccupancy(GfxDevice& gfx);
   bool mountFrameFromOccupancy(GfxDevice& gfx);
   void paintCylinderStress(GfxDevice& gfx);
+  void paintStructureStress(const blast::StructureInstance& inst);
+  void refreshAllStressColors(GfxDevice& gfx);
   void paintBondDamage(GfxDevice& gfx);
   void paintAnchors(GfxDevice& gfx);
   // Allocates the stress demo object (replacing the previous one) filled by fill(x,y,z).
@@ -617,6 +620,14 @@ private:
   bool stressCylinderDoubleDensity_ = false;
   bool stressCylinderDisplay_ = false;
   uint64_t lastStressPaintSolveEpoch_ = 0;
+  struct StressPaintStamp {
+    blast::StructureHandle handle{};
+    uint64_t solveEpoch = 0;
+    uint64_t topologyRevision = 0;
+    uint32_t boundTopologyEpoch = 0;
+    uint32_t probeCount = 0;
+  };
+  std::vector<StressPaintStamp> stressPaintStamps_;
   bool groundContactAnchors_ = false;
   bool anchorDisplay_ = false;
   std::string structureMountStatus_;

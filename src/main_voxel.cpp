@@ -51,6 +51,7 @@ struct Options {
   bool e2Perf = false;
   bool frameFail = false;
   bool importObject = false;
+  bool importTopple = false;
   bool e5Contact = false;
   bool collapsePerf = false;
   bool digConverge = false;
@@ -115,6 +116,8 @@ Options parseOptions(int argc, char** argv) {
       options.e5Contact = true;
     } else if (arg == "--import-object") {
       options.importObject = true;
+    } else if (arg == "--import-topple") {
+      options.importTopple = true;
     } else if (arg == "--frame-fail") {
       options.frameFail = true;
     } else if (arg == "--collision-perf") {
@@ -184,7 +187,7 @@ Options parseOptions(int argc, char** argv) {
   if (options.benchmark && options.e2Perf) {
     throw std::runtime_error("Use either --benchmark or --e2-perf, not both");
   }
-  if (argc > 1 && !options.benchmark && !options.e2Perf && !options.frameFail && !options.importObject && !options.e5Contact && !options.collapsePerf && !options.digConverge && options.collisionPerf == 0 &&
+  if (argc > 1 && !options.benchmark && !options.e2Perf && !options.frameFail && !options.importObject && !options.importTopple && !options.e5Contact && !options.collapsePerf && !options.digConverge && options.collisionPerf == 0 &&
       !options.help) {
     throw std::runtime_error("Rendering options require --benchmark; use --help for usage");
   }
@@ -1315,6 +1318,124 @@ void runCollapsePerf(GfxDevice& gfx, VoxelScene& scene, PerfLog& out) {
   }
 }
 
+// Real imported geometry: a resting free structure must wake and tip after all but
+// one off-centre foot are removed, without needing stress fracture first.
+void runImportTopple(GfxDevice& gfx, VoxelScene& scene, PerfLog& out) {
+  auto require = [](bool ok, const char* message) {
+    if (!ok) throw std::runtime_error(message);
+  };
+  MeshVoxelizeConfig config;
+  config.gridN = 64;
+  config.padding = 1;
+  config.sampleColor = false;
+  scene.importAsObject() = true;
+  scene.importMount() = true;
+  scene.importAgg() = 2;
+  require(scene.importMeshAsObject(gfx, scene.importPath(), config), "import failed");
+  out.line(scene.importStatus());
+  scene.structures().setFractureEnabled(false);
+  scene.structures().setImpactDamageEnabled(false);
+  const VoxelObjectId id = scene.importedObjectId();
+  const blast::StructureInstance* inst = scene.structures().find(id);
+  require(inst != nullptr && inst->debug.worldBonds == 0, "import must have zero world bonds");
+  require(scene.tryGetObject(id)->motionType == MotionType::Dynamic, "import must be dynamic");
+
+  // Flood the first footprint on the lowest occupied layer, retaining its column.
+  const blast::VoxelGrid& grid = inst->grid;
+  const int nx = grid.nx, nz = grid.nz;
+  int bottom = 0;
+  std::vector<glm::ivec2> foot;
+  for (; bottom < grid.ny && foot.empty(); ++bottom) {
+    for (int z = 0; z < nz && foot.empty(); ++z) {
+      for (int x = 0; x < nx; ++x) {
+        if (grid.isSolid(x, bottom, z)) {
+          foot.emplace_back(x, z);
+          break;
+        }
+      }
+    }
+  }
+  require(!foot.empty(), "hut has no footprint");
+  --bottom;
+  std::vector<uint8_t> seen(static_cast<size_t>(nx * nz), 0);
+  seen[foot.front().x + nx * foot.front().y] = 1;
+  glm::ivec2 lo = foot.front(), hi = lo;
+  const glm::ivec2 dirs[] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+  for (size_t i = 0; i < foot.size(); ++i) {
+    const glm::ivec2 p = foot[i];
+    lo = glm::min(lo, p);
+    hi = glm::max(hi, p);
+    for (const glm::ivec2 d : dirs) {
+      const glm::ivec2 q = p + d;
+      if (q.x < 0 || q.y < 0 || q.x >= nx || q.y >= nz) continue;
+      const size_t key = static_cast<size_t>(q.x + nx * q.y);
+      if (!seen[key] && grid.isSolid(q.x, bottom, q.y)) {
+        seen[key] = 1;
+        foot.push_back(q);
+      }
+    }
+  }
+  lo -= glm::ivec2(1);
+  hi += glm::ivec2(1);
+  const float fineSize = grid.voxelSize;
+  const int cutTop = bottom + static_cast<int>(std::ceil(0.8f / fineSize));
+  auto body = [&]() {
+    physics::BodyState state;
+    require(scene.getBodyState(id, state), "imported body missing");
+    return state;
+  };
+  auto tilt = [](const physics::BodyState& state) {
+    return glm::degrees(std::acos(std::clamp((state.q * glm::vec3(0, 1, 0)).y, -1.0f, 1.0f)));
+  };
+  auto tick = [&]() {
+    glfwPollEvents();
+    scene.update(physics::kDt);
+    scene.commitStructureSplits(gfx);
+  };
+  for (int t = 0; t < 180; ++t) {
+    tick();
+    if (t >= 60 && !body().awake) break;
+  }
+  const physics::BodyState settled = body();
+  char line[384];
+  std::snprintf(line, sizeof(line), "settled: tilt=%.3f deg awake=%d comY=%.3f foot=[%d,%d]x[%d,%d]",
+                tilt(settled), settled.awake ? 1 : 0, settled.x.y, lo.x, hi.x, lo.y, hi.y);
+  out.line(line);
+  require(tilt(settled) < 3.0f, "intact hut did not remain upright");
+  const uint32_t removed = scene.carveFines(gfx, id, [=](int x, int y, int z) {
+    return y < cutTop && (x < lo.x || x > hi.x || z < lo.y || z > hi.y);
+  });
+  require(removed > 0, "no other supports were removed");
+  tick();
+  const physics::BodyState cut = body();
+  const VoxelObject* o = scene.tryGetObject(id);
+  require(o != nullptr && o->motionType == MotionType::Dynamic, "cut made the hut static");
+  const float half = 0.5f * o->gridSize * o->voxelSize;
+  const glm::vec3 localCom = (glm::inverse(o->rotation) * (cut.x - o->position) + glm::vec3(half)) / fineSize;
+  require(localCom.x < lo.x || localCom.x > hi.x + 1 || localCom.z < lo.y || localCom.z > hi.y + 1,
+          "remaining foot still contains the centre of mass projection");
+  std::snprintf(line, sizeof(line), "cut: removed=%u awake=%d localCOM=(%.2f,%.2f) outside remaining foot",
+                removed, cut.awake ? 1 : 0, localCom.x, localCom.z);
+  out.line(line);
+  require(cut.awake, "cut did not wake the hut");
+  float maxTilt = tilt(cut);
+  for (int t = 1; t <= 180; ++t) {
+    tick();
+    const physics::BodyState st = body();
+    maxTilt = std::max(maxTilt, tilt(st));
+    if (t == 1 || t % 30 == 0 || maxTilt > 20.0f) {
+      std::snprintf(line, sizeof(line), "t=%d tilt=%.3f deg angularSpeed=%.4f awake=%d comY=%.3f",
+                    t, tilt(st), glm::length(st.w), st.awake ? 1 : 0, st.x.y);
+      out.line(line);
+    }
+    if (maxTilt > 20.0f) break;
+  }
+  inst = scene.structures().find(id);
+  require(inst != nullptr && inst->debug.worldBonds == 0, "cut introduced ground bonds");
+  require(maxTilt > 5.0f, "unsupported hut failed to tip by 5 degrees within three seconds");
+  out.line("OK import-topple: zero world bonds, cut wakes body, one off-centre foot causes rigid-body tipping");
+}
+
 void runImportObject(GfxDevice& gfx, VoxelScene& scene, PerfLog& out) {
   MeshVoxelizeConfig config;
   config.gridN = 64;
@@ -1323,7 +1444,7 @@ void runImportObject(GfxDevice& gfx, VoxelScene& scene, PerfLog& out) {
   scene.importAsObject() = true;
   scene.importMount() = true;
   scene.structures().setFractureEnabled(true);
-  bool allStood = true;
+  bool allFreeAndIntact = true;
   for (int agg : {2, 4, 0}) {
     scene.importAgg() = agg;
     const auto t0 = std::chrono::steady_clock::now();
@@ -1339,14 +1460,14 @@ void runImportObject(GfxDevice& gfx, VoxelScene& scene, PerfLog& out) {
     const float bottomY = o->position.y - 0.5f * static_cast<float>(o->gridSize) * o->voxelSize;
     char line[512];
     std::snprintf(line, sizeof(line),
-                  "agg=%s grid=%d bottomY=%.3f anchorFines=%u faces=%u blocked=%u importMs=%.0f",
+                  "agg=%s grid=%d bottomY=%.3f groundAnchorFines=%u faces=%u blocked=%u importMs=%.0f",
                   agg == 0 ? "auto" : std::to_string(agg).c_str(), o->gridSize, bottomY, anchors.anchorFines,
                   anchors.contactFaces, anchors.blockedFaces, importMs);
     out.line(line);
     out.line("  status: " + scene.importStatus());
     const blast::StructureInstance* inst = scene.structures().find(scene.importedObjectId());
     if (inst == nullptr) {
-      allStood = false;
+      allFreeAndIntact = false;
       out.line("  not mounted");
       continue;
     }
@@ -1364,13 +1485,13 @@ void runImportObject(GfxDevice& gfx, VoxelScene& scene, PerfLog& out) {
                     st.maxTension, st.maxCompression, st.maxShear, st.strengthPa, st.fracturedBonds,
                     st.splitActors, st.solveMs);
       out.line(line);
-      if (s == seconds && (st.fracturedBonds > 0 || st.splitActors > 1)) {
-        allStood = false;
+      if (s == seconds && (st.worldBonds != 0 || st.fracturedBonds > 0 || st.splitActors > 1)) {
+        allFreeAndIntact = false;
       }
     }
   }
-  out.line(allStood ? "OK import-object: hut mounted and stood under self-weight at every agg"
-                    : "FAIL import-object: see lines above");
+  out.line(allFreeAndIntact ? "OK import-object: hut free-mounted with no ground bonds at every agg"
+                            : "FAIL import-object: see lines above");
 }
 
 int main(int argc, char** argv) {
@@ -1382,7 +1503,8 @@ int main(int argc, char** argv) {
     if (options.help) {
       std::cout << "Usage: vulkan_engine_voxel [--benchmark options | --e2-perf | --frame-fail]\n"
                    "  --frame-fail     Test four-column failure through landing\n"
-                   "  --import-object  E5.5: import the hut as a mounted object at agg 2/4/auto, report\n"
+                   "  --import-object  E5.5: import the hut as a free stress object with no ground bonds at agg 2/4/auto\n"
+                   "  --import-topple  Check that a resting hut tips after all but one off-centre foot are cut\n"
                    "  --e5-contact     E5.4: contact loads (beam on piers, notch, weight on roof), report\n"
                    "  --no-contact-loads   Pre-E5.4 loads (with --frame-fail etc.)\n"
                    "  --solve-budget MS    Stress solve ms per tick for all structures (0 = no limit, default 8)\n"
@@ -1418,11 +1540,14 @@ int main(int argc, char** argv) {
         .height = options.benchmark ? options.height : 720,
     });
 
+    if (options.importTopple) {
+      glfwHideWindow(window.handle());
+    }
     if (options.benchmark) {
       sizeBenchmarkWindow(window, options);
     }
 #ifdef _WIN32
-    if (!options.benchmark && !options.e2Perf) {
+    if (!options.benchmark && !options.e2Perf && !options.importTopple) {
       if (HWND hwnd = glfwGetWin32Window(window.handle())) {
         SetWindowPos(hwnd, HWND_TOPMOST, 160, 160, 0, 0, SWP_SHOWWINDOW | SWP_NOSIZE);
         SetForegroundWindow(hwnd);
@@ -1520,15 +1645,20 @@ int main(int argc, char** argv) {
       return 0;
     }
 
-    if (options.importObject) {
+    if (options.importObject || options.importTopple) {
       const std::filesystem::path reportPath =
-          std::filesystem::path(VE_ASSETS_DIR).parent_path() / "docs" / "import-object.txt";
+          std::filesystem::path(VE_ASSETS_DIR).parent_path() / "docs" /
+          (options.importTopple ? "import-topple.txt" : "import-object.txt");
       PerfLog log(reportPath);
       if (log.f == nullptr) {
         throw std::runtime_error("Cannot open " + reportPath.string());
       }
       try {
-        runImportObject(gfx, scene, log);
+        if (options.importTopple) {
+          runImportTopple(gfx, scene, log);
+        } else {
+          runImportObject(gfx, scene, log);
+        }
       } catch (const std::exception& ex) {
         log.line(std::string("ERROR: ") + ex.what());
         gfx.waitIdle();

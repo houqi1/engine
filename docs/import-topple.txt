@@ -1,0 +1,13 @@
+Imported as dynamic object  grid=6  fines=39564  size=8.90x8.20x8.70 m  resample 274 ms
+Mounted: 9028 nodes, 19334 bonds, extract 48 ms; free body: no world bonds
+Pre-solve: 1 passes, 0.0 s, converged
+settled: tilt=0.000 deg awake=0 comY=6.066 foot=[70,76]x[6,12]
+cut: removed=2318 awake=1 localCOM=(47.30,42.93) outside remaining foot
+t=1 tilt=0.048 deg angularSpeed=0.0478 awake=1 comY=6.200
+t=30 tilt=4.728 deg angularSpeed=0.2174 awake=1 comY=5.879
+t=60 tilt=5.286 deg angularSpeed=0.1720 awake=1 comY=5.823
+t=90 tilt=4.687 deg angularSpeed=0.1862 awake=1 comY=5.871
+t=120 tilt=5.324 deg angularSpeed=0.6462 awake=1 comY=5.836
+t=150 tilt=3.231 deg angularSpeed=0.2200 awake=1 comY=6.357
+t=180 tilt=6.873 deg angularSpeed=0.0357 awake=1 comY=5.889
+OK import-topple: zero world bonds, cut wakes body, one off-centre foot causes rigid-body tipping

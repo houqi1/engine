@@ -265,6 +265,7 @@ void VoxelScene::stopStructureTicks() {
 
 void VoxelScene::resetStructureSession() {
   structures_.clear();
+  stressPaintStamps_.clear();
   physics_.resetTickSession();
   stressCylinderId_ = {};
   stressCylinderCut_ = false;
@@ -388,6 +389,9 @@ void VoxelScene::commitStructureRemovals() {
         structures_.applyOccupancyRemoval(batch.id, local.empty() ? nullptr : local.data(),
                                           static_cast<uint32_t>(local.size()));
     if (err == blast::BlastError::Ok) {
+      // A rebuilt family may reuse its handle and restart its solve epoch.
+      // Invalidate even when those values happen to match the previous paint.
+      stressPaintStamps_.clear();
       continue;
     }
     std::cerr << "Structure rebuild failed: " << structures_.lastError() << "\n";
@@ -2110,10 +2114,12 @@ bool VoxelScene::mountCylinderFromOccupancy(GfxDevice& gfx) {
 }
 
 void VoxelScene::paintCylinderStress(GfxDevice& gfx) {
-  const blast::StructureInstance* inst = stressStructure();
-  if (inst == nullptr) {
-    return;
-  }
+  stressPaintStamps_.clear();
+  refreshAllStressColors(gfx);
+}
+
+void VoxelScene::paintStructureStress(const blast::StructureInstance& structure) {
+  const blast::StructureInstance* inst = &structure;
   std::unordered_map<uint32_t, float> nodeStress;
   const uint32_t nProbe = inst->probeCount;
   for (uint32_t sdk = 0; sdk < inst->bondMeta.size(); ++sdk) {
@@ -2164,18 +2170,40 @@ void VoxelScene::paintCylinderStress(GfxDevice& gfx) {
       }
     }
   };
-  const VoxelObjectId focus = structureFocusId();
-  paintObject(focus);
+  paintObject(inst->objectId);
   for (const blast::ActorBinding& b : inst->bindings) {
-    if (b.objectId.valid() && b.objectId != focus) {
+    if (b.objectId.valid() && b.objectId != inst->objectId) {
       paintObject(b.objectId);
     }
   }
   if (anchorDisplay_) {
     overlayAnchorFines(*inst);
   }
-  flushDirtyPages(gfx);
-  lastStressPaintSolveEpoch_ = inst->solveEpoch;
+}
+
+void VoxelScene::refreshAllStressColors(GfxDevice& gfx) {
+  const uint32_t count = structures_.instanceCount();
+  stressPaintStamps_.resize(count);
+  bool painted = false;
+  for (uint32_t i = 0; i < count; ++i) {
+    const blast::StructureInstance* inst = structures_.instanceAt(i);
+    if (inst == nullptr) {
+      continue;
+    }
+    StressPaintStamp& stamp = stressPaintStamps_[i];
+    if (stamp.handle == inst->handle && stamp.solveEpoch == inst->solveEpoch &&
+        stamp.topologyRevision == inst->topologyRevision &&
+        stamp.boundTopologyEpoch == inst->lastBoundTopologyEpoch && stamp.probeCount == inst->probeCount) {
+      continue;
+    }
+    // Also paint zero-bond pieces: they must not retain their pre-split stress colors.
+    paintStructureStress(*inst);
+    stamp = {inst->handle, inst->solveEpoch, inst->topologyRevision, inst->lastBoundTopologyEpoch, inst->probeCount};
+    painted = true;
+  }
+  if (painted) {
+    flushDirtyPages(gfx);
+  }
 }
 
 void VoxelScene::paintBondDamage(GfxDevice& gfx) {
@@ -2343,6 +2371,10 @@ void VoxelScene::paintAnchors(GfxDevice& gfx) {
 
 void VoxelScene::setAnchorDisplay(GfxDevice& gfx, bool on) {
   anchorDisplay_ = on;
+  if (stressCylinderDisplay_ && !bondDamageDisplay_) {
+    paintCylinderStress(gfx);
+    return;
+  }
   const blast::StructureInstance* inst = stressStructure();
   if (inst == nullptr) {
     return;
@@ -2372,30 +2404,29 @@ void VoxelScene::setAnchorDisplay(GfxDevice& gfx, bool on) {
 
 void VoxelScene::setBondDamageDisplay(GfxDevice& gfx, bool on) {
   bondDamageDisplay_ = on;
+  stressPaintStamps_.clear();
   if (on) {
     paintBondDamage(gfx);
+  } else if (stressCylinderDisplay_) {
+    paintCylinderStress(gfx);
   }
 }
 
 void VoxelScene::refreshStressColors(GfxDevice& gfx) {
-  const blast::StructureInstance* inst = stressStructure();
-  if (inst == nullptr || !structureFocusId().valid()) {
-    return;
-  }
   if (bondDamageDisplay_) {
+    const blast::StructureInstance* inst = stressStructure();
+    if (inst == nullptr) {
+      return;
+    }
     if (inst->debug.impactDamageEvents != lastBondDamagePaintEvents_ ||
         inst->solveEpoch != lastStressPaintSolveEpoch_) {
       paintBondDamage(gfx);
     }
     return;
   }
-  if (!stressCylinderDisplay_ || inst->probeCount == 0) {
-    return;
+  if (stressCylinderDisplay_) {
+    refreshAllStressColors(gfx);
   }
-  if (inst->solveEpoch == lastStressPaintSolveEpoch_) {
-    return;
-  }
-  paintCylinderStress(gfx);
 }
 
 bool VoxelScene::spawnStressCylinder(GfxDevice& gfx) {
@@ -2986,15 +3017,27 @@ void VoxelScene::setStressCylinderSolverIters(uint32_t iters) {
 
 void VoxelScene::setStressCylinderDisplay(GfxDevice& gfx, bool on) {
   stressCylinderDisplay_ = on;
-  VoxelObject* o = tryGetObject(structureFocusId());
-  if (o == nullptr) {
-    return;
-  }
+  stressPaintStamps_.clear();
   if (on) {
-    lastStressPaintSolveEpoch_ = 0;
     paintCylinderStress(gfx);
   } else {
-    o->useImportPalette = false;
+    auto restore = [&](VoxelObjectId id) {
+      if (VoxelObject* o = tryGetObject(id)) {
+        o->useImportPalette = false;
+      }
+    };
+    for (uint32_t i = 0; i < structures_.instanceCount(); ++i) {
+      const blast::StructureInstance* inst = structures_.instanceAt(i);
+      restore(inst->objectId);
+      for (const blast::ActorBinding& b : inst->bindings) {
+        restore(b.objectId);
+      }
+    }
+    if (bondDamageDisplay_) {
+      paintBondDamage(gfx);
+    } else if (anchorDisplay_) {
+      paintAnchors(gfx);
+    }
     fillGpuObjectRecords();
     uploadObjectTransforms(gfx, 0);
   }
@@ -3287,7 +3330,7 @@ bool VoxelScene::importMeshAsObject(GfxDevice& gfx, const std::string& path, con
     nestedFineVoxels_ = true;
   }
   if (importMount_ && !simulate_) {
-    setSimulate(gfx, true);  // resets all structures, so it must run before mounting
+    setSimulate(gfx, true);  // enable physics and reset structures before mounting
   }
   if (importMount_) {
     if (VoxelObject* test = tryGetObject(testObjectId_)) {
@@ -3317,7 +3360,7 @@ bool VoxelScene::importMeshAsObject(GfxDevice& gfx, const std::string& path, con
   o.enabled = true;
   o.slotOccupied = true;
   o.isScatter = false;
-  o.motionType = MotionType::Static;
+  o.motionType = MotionType::Dynamic;
   o.density = std::max(1.0f, importDensity_);
   o.topologyRevision = 1;
   o.useImportPalette = cfg.sampleColor;
@@ -3366,7 +3409,7 @@ bool VoxelScene::importMeshAsObject(GfxDevice& gfx, const std::string& path, con
   std::snprintf(geom, sizeof(geom), "grid=%d  fines=%zu  size=%.2fx%.2fx%.2f m  resample %.0f ms", gridSize,
                 placed.size(), ext.x * fineVs, ext.y * fineVs, ext.z * fineVs,
                 std::chrono::duration<float, std::milli>(t1 - t0).count());
-  importStatus_ = std::string("Imported as object  ") + geom;
+  importStatus_ = std::string("Imported as dynamic object  ") + geom;
   camera_.setOrbitTarget(origin + glm::vec3(half, 0.5f * static_cast<float>(ext.y) * fineVs, half));
 
   if (importMount_) {
@@ -3375,11 +3418,11 @@ bool VoxelScene::importMeshAsObject(GfxDevice& gfx, const std::string& path, con
     desc.material.ownStrengthPa = desc.material.strengthPa;
     desc.material.solverIters = 200;
     const VoxelObjectId id = importedObjectId_;
-    blast::StructureInstance* inst = mountObjectOnGround(id, importAgg_ == 4 ? 4 : 2, desc);
+    blast::StructureInstance* inst = mountObjectFree(id, importAgg_ == 4 ? 4 : 2, desc);
     if (inst != nullptr && importAgg_ == 0 && inst->graph.nodes.size() > kImportMaxNodes) {
       std::cout << "Import mount: " << inst->graph.nodes.size() << " nodes at agg 2, retrying agg 4\n";
       structures_.unmount(id);
-      inst = mountObjectOnGround(id, 4, desc);
+      inst = mountObjectFree(id, 4, desc);
       if (inst != nullptr && inst->graph.nodes.size() > kImportMaxNodes) {
         structureMountStatus_ = "refused: " + std::to_string(inst->graph.nodes.size()) +
                                 " nodes at agg 4 (budget " + std::to_string(kImportMaxNodes) + ")";
